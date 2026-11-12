@@ -1,5 +1,9 @@
 .env
-*.txt
+.env.*
+!.env.example
 output/
 __pycache__/
+*.py[cod]
 .venv/
+venv/
+*.txt

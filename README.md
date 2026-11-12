@@ -8,6 +8,21 @@ Reads 5 insurance cubes: **AH, FI, MR, MI, MV**. Source is an OIC XMLA `Execute`
 python -m pip install -r requirements.txt
 ```
 
+## Live Excel in one command (using local `.env`)
+
+Create `.env` in this folder (it is gitignored). Paste the `OIC_BEARER_TOKEN` and
+`OIC_COOKIE` from a fresh, authorized browser session. The collector loads `.env`
+automatically; you do **not** need to set PowerShell environment variables.
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+python oic_collector.py --mode live --output excel
+```
+
+Excel is saved to `output/oic_insurance_YYYYMMDD_HHMMSS.xlsx`.
+Use `--output both` if you also configure SQL credentials in `.env`.
+
 ## Test from the captured file (no network, no token, Excel only)
 
 ```powershell

@@ -37,6 +37,25 @@ FIELDS = [
 ]
 
 
+
+def load_dotenv_file():
+    """Load local .env values, preserving any existing shell environment variables."""
+    env_path = Path(__file__).with_name('.env')
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding='utf-8-sig').splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith('#') or '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key, value = key.strip(), value.strip()
+        if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 def local_name(tag):
     return tag.rsplit('}', 1)[-1]
 
@@ -326,6 +345,7 @@ END'''
 
 
 def main():
+    load_dotenv_file()
     parser = argparse.ArgumentParser(description='Extract OIC XMLA data to Excel and/or SQL Server (pytds only)')
     parser.add_argument('--mode', choices=['live','offline'], default='offline')
     parser.add_argument('--source-file', help='Captured .txt containing 5 XMLA responses (offline mode)')

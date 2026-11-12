@@ -1,0 +1,37 @@
+{
+  "AH": {
+    "name_th": "อุบัติเหตุและสุขภาพ",
+    "class": "AH",
+    "catalog": "PIVOT_202609_AH",
+    "mdx": "with set [DX_columns] as NonEmpty({[VW PV AH AGGREGATE FY].[FY YEAR].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[INMTH CLM PAID],[Measures].[ATMTH CLM LI]}) set [DX_rows] as Union(NonEmpty(CrossJoin({[DIM MAINSUB CLASS AH].[MAIN NAME TH].allMembers},{([DIM MAINSUB CLASS AH].[SUB NAME TH].[All])}), {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[INMTH CLM PAID],[Measures].[ATMTH CLM LI]}),NonEmpty(CrossJoin({[DIM MAINSUB CLASS AH].[MAIN NAME TH].allMembers},{[DIM MAINSUB CLASS AH].[SUB NAME TH].allMembers}), {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[INMTH CLM PAID],[Measures].[ATMTH CLM LI]})) SELECT CrossJoin([DX_columns],{[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[INMTH CLM PAID],[Measures].[ATMTH CLM LI]}) DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON columns,[DX_rows] DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON rows FROM [AH_AGGREGATE_FY]  CELL PROPERTIES VALUE, FORMAT_STRING, LANGUAGE, BACK_COLOR, FORE_COLOR, FONT_FLAGS",
+    "response_line": 116
+  },
+  "FI": {
+    "name_th": "ทรัพย์สิน",
+    "class": "FI",
+    "catalog": "PIVOT_202609_FI",
+    "mdx": "with set [DX_columns] as NonEmpty({[VW PV FI AGGREGATE FY].[YEAR].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED PREMIUM],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[SUM CLM PAID],[Measures].[SUM CLM OS],[Measures].[SUM CLM LI]}) set [DX_rows] as NonEmpty({[DIM CT SUBCLASS FI].[GROUP DESC TH].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED PREMIUM],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[SUM CLM PAID],[Measures].[SUM CLM OS],[Measures].[SUM CLM LI]}) SELECT CrossJoin([DX_columns],{[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED PREMIUM],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[SUM CLM PAID],[Measures].[SUM CLM OS],[Measures].[SUM CLM LI]}) DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON columns,[DX_rows] DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON rows FROM [FI_AGGREGATE_FY]  CELL PROPERTIES VALUE, FORMAT_STRING, LANGUAGE, BACK_COLOR, FORE_COLOR, FONT_FLAGS",
+    "response_line": 231
+  },
+  "MR": {
+    "name_th": "ทางทะเลและขนส่ง",
+    "class": "MR",
+    "catalog": "PIVOT_202609_MR",
+    "mdx": "with set [DX_columns] as NonEmpty({[VW PV MR AGGREGATE FY].[STATUS COMPANY PASS].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLAIM PAID],[Measures].[CLAIM OS],[Measures].[CLAIM LI]}) set [DX_rows] as NonEmpty({[DIM CT SUBCLASS MR].[SUBCLASS DESC TH].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLAIM PAID],[Measures].[CLAIM OS],[Measures].[CLAIM LI]}) SELECT CrossJoin([DX_columns],{[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLAIM PAID],[Measures].[CLAIM OS],[Measures].[CLAIM LI]}) DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON columns,[DX_rows] DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON rows FROM [MR_AGGREGATE_FY]  CELL PROPERTIES VALUE, FORMAT_STRING, LANGUAGE, BACK_COLOR, FORE_COLOR, FONT_FLAGS",
+    "response_line": 353
+  },
+  "MI": {
+    "name_th": "เบ็ดเตล็ด",
+    "class": "MI",
+    "catalog": "PIVOT_202609_MI",
+    "mdx": "with set [DX_columns] as NonEmpty({[VW PV MI AGGREGATE FY].[FY YEAR].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLM PAID],[Measures].[CLM OS],[Measures].[CLM LI]}) set [DX_rows] as Union(NonEmpty(CrossJoin({[DIM MAINSUB CLASS].[MAIN NAME TH].allMembers},{([DIM MAINSUB CLASS].[SUB NAME TH].[All])}), {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLM PAID],[Measures].[CLM OS],[Measures].[CLM LI]}),NonEmpty(CrossJoin({[DIM MAINSUB CLASS].[MAIN NAME TH].allMembers},{[DIM MAINSUB CLASS].[SUB NAME TH].allMembers}), {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLM PAID],[Measures].[CLM OS],[Measures].[CLM LI]})) SELECT CrossJoin([DX_columns],{[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLM PAID],[Measures].[CLM OS],[Measures].[CLM LI]}) DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON columns,[DX_rows] DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON rows FROM [MI_AGGREGATE_FY]  CELL PROPERTIES VALUE, FORMAT_STRING, LANGUAGE, BACK_COLOR, FORE_COLOR, FONT_FLAGS",
+    "response_line": 470
+  },
+  "MV": {
+    "name_th": "รถยนต์",
+    "class": "MO",
+    "catalog": "PIVOT_202609_MV",
+    "mdx": "with set [DX_columns] as NonEmpty({[VW PV MV AGGREGATE FY].[YEAR].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED PREMIUM],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLAIM PAID],[Measures].[CLAIM OS],[Measures].[CLAIM LI]}) set [DX_rows] as NonEmpty({[DIM CT SUBCLASS MV].[SUBCLASS DESC TH].allMembers}, {[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED PREMIUM],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLAIM PAID],[Measures].[CLAIM OS],[Measures].[CLAIM LI]}) SELECT CrossJoin([DX_columns],{[Measures].[ACT POLICY CNT],[Measures].[ACT PREMIUM AMT],[Measures].[EARNED PREMIUM],[Measures].[ACT SUM INS AMT],[Measures].[CLAIM CNT],[Measures].[CLAIM PAID],[Measures].[CLAIM OS],[Measures].[CLAIM LI]}) DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON columns,[DX_rows] DIMENSION PROPERTIES PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME, MEMBER_VALUE ON rows FROM [MV_AGGREGATE_FY]  CELL PROPERTIES VALUE, FORMAT_STRING, LANGUAGE, BACK_COLOR, FORE_COLOR, FONT_FLAGS",
+    "response_line": 585
+  }
+}

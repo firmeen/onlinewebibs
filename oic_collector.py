@@ -4389,6 +4389,7 @@ def launch_terminal_ui(args) -> None:
                                  creationflags=flags, stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
                 self.active_run = path
+                self.last_run_path = path
                 self.query_one("#start", Button).disabled = True
                 self.query_one("#stop", Button).disabled = False
                 self.query_one("#status", Static).update(f"RUNNING / {run_id}")
@@ -4400,7 +4401,12 @@ def launch_terminal_ui(args) -> None:
             if self.active_run is None:
                 return
             statuses = []
-            for wid in range(1, 5):
+            config_path = self.active_run / "query_config.json"
+            try:
+                workers = int(json.loads(config_path.read_text(encoding="utf-8"))["workers"])
+            except (OSError, ValueError, KeyError):
+                workers = 4
+            for wid in range(1, workers + 1):
                 path = self.active_run / f"worker_{wid:02d}" / "state.json"
                 if not path.is_file():
                     continue
@@ -4410,9 +4416,9 @@ def launch_terminal_ui(args) -> None:
                 except (OSError, ValueError):
                     pass
             self.query_one("#status", Static).update(
-                f"RUN {self.active_run.name} | {len(statuses)}/4 workers | "
+                f"RUN {self.active_run.name} | {len(statuses)}/{workers} workers | "
                 + ", ".join(statuses or ["STARTING"]))
-            if len(statuses) == 4 and all(status in (
+            if len(statuses) == workers and all(status in (
                 "COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED")
                 for status in statuses):
                 self.info(f"Run ended: {self.active_run.name} / {', '.join(statuses)}")

@@ -20,8 +20,9 @@ class QueryDesignerUITests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(table.row_count, 0)
             # Select one known hierarchy, move it with a keyboard shortcut.
             field = oic_query.PROFILES["MV"]["row1"]
-            app.selected_field = field
             table.focus()
+            await pilot.pause()
+            app.selected_field = field
             await pilot.press("a")
             self.assertIn(field, app.axis_x)
             self.assertNotIn(field, app.axis_y)

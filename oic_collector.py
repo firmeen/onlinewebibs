@@ -2090,6 +2090,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         from textual import work
         from textual.binding import Binding
+        from textual.css.query import NoMatches
         from textual.app import App, ComposeResult
         from textual.containers import Horizontal, Vertical
         from textual.widgets import (
@@ -2879,6 +2880,11 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         def refresh_auth_cards(self) -> None:
             if not self.is_mounted:
+                return
+            try:
+                self.query_one("#jwt_status", Static)
+                self.query_one("#cookie_status", Static)
+            except NoMatches:
                 return
 
             details = jwt_info(

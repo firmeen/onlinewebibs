@@ -263,7 +263,7 @@ def default_query(code: str, *, workers: int = 1) -> dict:
 def axis_set(fields: list[str], offset: int, size: int) -> str:
     if offset < 0 or size < 1:
         raise ValueError("Invalid pagination")
-    members = ["{" + field + ".AllMembers}" for field in fields]
+    members = [field + ".AllMembers" for field in fields]
     result = members[0]
     for other in members[1:]:
         result = f"CrossJoin({result},{other})"

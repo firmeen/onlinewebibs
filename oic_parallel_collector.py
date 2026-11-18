@@ -3986,7 +3986,18 @@ def selected_worker(args) -> int:
     except Exception as exc:
         errors += 1
         text_message = str(exc)
-        state["status"] = "SESSION_EXPIRED" if "SESSION_EXPIRED" in text_message else "PARTIAL" if manifest["chunks"] else "FAILED"
+        if "key" in locals():
+            previous = manifest["chunks"].get(key, {})
+            manifest["chunks"][key] = dict(previous, status="FAILED",
+                                          x_offset=x_offset, y_offset=y_offset,
+                                          response_file=resp_path.name,
+                                          request_file=req_path.name,
+                                          http_status=state.get("last_http"),
+                                          error=text_message[:300],
+                                          completed_at=utc_now())
+        has_success = any(c.get("status") == "OK" for c in manifest["chunks"].values())
+        state["status"] = ("SESSION_EXPIRED" if "SESSION_EXPIRED" in text_message
+                           else "PARTIAL" if has_success else "FAILED")
         state["last_message"] = text_message[:200]
         log(f"FAILED: {text_message}", worker_id, "ERROR")
     finally:
@@ -4119,7 +4130,7 @@ def selected_monitor(config: dict, run_dir: Path) -> int:
             write_json(run_dir / "master_manifest.json",
                        dict(run_id=config["run_id"], updated_at=utc_now(),
                             summary=totals, workers=workers))
-            if all(w.get("status") in terminal for w in workers):
+            if all(w.get("status") in terminal for w in workers) and elapsed_seconds(start) >= 8:
                 break
             time.sleep(1)
     try:

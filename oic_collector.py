@@ -2089,6 +2089,7 @@ def launch_terminal_ui(args) -> None:
         from rich.text import Text
 
         from textual import work
+        from textual.binding import Binding
         from textual.app import App, ComposeResult
         from textual.containers import Horizontal, Vertical
         from textual.widgets import (
@@ -2122,8 +2123,8 @@ def launch_terminal_ui(args) -> None:
             ("ctrl+s", "stop_collection", "Stop"),
             ("ctrl+o", "open_output", "Output"),
             ("ctrl+q", "quit", "Quit"),
-            ("a", "field_to_x", "X Axis", False),
-            ("s", "field_to_y", "Y Axis", False),
+            Binding("a", "field_to_x", "X Axis", show=False),
+            Binding("s", "field_to_y", "Y Axis", show=False),
         ]
 
         CSS = """
@@ -2413,6 +2414,7 @@ def launch_terminal_ui(args) -> None:
             self.axis_y = []
             self.selected_measures = []
             self.active_run = None
+            self.last_run_path = None
 
             self.busy = False
             self.stop_event = threading.Event()
@@ -2669,6 +2671,14 @@ def launch_terminal_ui(args) -> None:
                         with Horizontal(classes="axis_bar"):
                             yield Button("PREVIEW QUERY", id="query_preview")
                         yield Static("Select X and Y fields.", id="preview_text")
+                        with Horizontal(classes="axis_bar"):
+                            yield Label("WORKERS", classes="input_label")
+                            yield Input(value="4", id="worker_count", type="integer")
+                            yield Label("X CHUNK", classes="input_label")
+                            yield Input(value="1", id="x_chunk", type="integer")
+                            yield Label("Y CHUNK", classes="input_label")
+                            yield Input(value="20", id="y_chunk", type="integer")
+                            yield Button("RESUME", id="resume_run")
 
                 # PROGRESS
 
@@ -3505,6 +3515,8 @@ def launch_terminal_ui(args) -> None:
 
             elif button_id == "query_preview":
                 self.preview_selected_query()
+            elif button_id == "resume_run":
+                self.resume_selected_query()
             elif button_id == "refresh_catalog":
                 self.refresh_catalog_worker(self.selected_code, self.token_value(), self.cookie_value())
             elif button_id in ("x_up", "x_down", "x_remove", "y_up", "y_down", "y_remove"):
@@ -4301,7 +4313,10 @@ def launch_terminal_ui(args) -> None:
             config = dict(code=self.selected_code, catalog=profile["catalog"],
                           cube=profile["cube"], x=list(self.axis_x), y=list(self.axis_y),
                           measures=list(self.selected_measures), filters=[],
-                          workers=4, x_chunk=1, y_chunk=20, timeout=60, delay=1.0)
+                          workers=int(self.query_one("#worker_count", Input).value),
+                          x_chunk=int(self.query_one("#x_chunk", Input).value),
+                          y_chunk=int(self.query_one("#y_chunk", Input).value),
+                          timeout=60, delay=1.0)
             return validate_query(config, self.field_catalog)
 
         def preview_selected_query(self) -> None:

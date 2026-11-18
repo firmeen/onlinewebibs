@@ -4318,6 +4318,93 @@ def launch_terminal_ui(args) -> None:
                 self.query_one("#preview_text", Static).update(str(exc))
                 self.info(f"QUERY INVALID: {exc}", "warning")
 
+        # ====================================================
+        # LIVE METADATA / RUN CONTROL
+        # ====================================================
+
+        @work(thread=True, group="catalog-refresh", exclusive=True)
+        def refresh_catalog_worker(self, code: str, token: str, cookie: str) -> None:
+            try:
+                catalog = discover_fields(code, token, cookie)
+                self.call_from_thread(self.catalog_refreshed, code, catalog, None)
+            except Exception as exc:
+                self.call_from_thread(self.catalog_refreshed, code, None, str(exc))
+
+        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
+            if error:
+                self.info(f"Metadata refresh failed; cache retained: {error}", "warning")
+                return
+            if code != self.selected_code:
+                return
+            self.field_catalog = catalog
+            self.refresh_field_table()
+            self.info(f"Catalog: {len(catalog['fields'])} fields ({catalog['source']}).", "success")
+
+        def start_selected_query(self) -> None:
+            if self.active_run is not None:
+                self.info("A collection is already active; Stop or finish before restarting.", "warning")
+                return
+            if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
+                self.info("Validate Cookie and JWT before Start; backend readiness is separate.", "error")
+                return
+            if sys.platform != "win32" or not shutil.which("wt.exe"):
+                self.info("Windows Terminal (wt.exe) is required for the three-window workflow.", "error")
+                return
+            try:
+                config = self.query_config()
+                self.save_credentials()
+                run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+                config["run_id"] = run_id
+                config["created_at"] = datetime.now(timezone.utc).isoformat()
+                path = resolve_output_path(self.output_value()) / "oic_parallel" / run_id
+                path.mkdir(parents=True, exist_ok=False)
+                config_file = path / "query_config.json"
+                config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+                (path / "job_plan.json").write_text(json.dumps(
+                    {"run_id": run_id, "query_hash": query_hash(config),
+                     "x": config["x"], "y": config["y"], "measures": config["measures"],
+                     "workers": config["workers"], "partition": "x_page_mod_workers"},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+                script = BASE_DIR / "oic_parallel_collector.py"
+                if not script.is_file():
+                    raise RuntimeError("oic_parallel_collector.py not found")
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.Popen([sys.executable, str(script), "--query-config",
+                                  str(config_file), "--launch"], cwd=str(BASE_DIR),
+                                 creationflags=flags, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                self.active_run = path
+                self.query_one("#start", Button).disabled = True
+                self.query_one("#stop", Button).disabled = False
+                self.query_one("#status", Static).update(f"RUNNING / {run_id}")
+                self.info(f"Selected query launched: {run_id}", "success")
+            except Exception as exc:
+                self.info(f"Cannot start collection: {exc}", "error")
+
+        def poll_selected_run(self) -> None:
+            if self.active_run is None:
+                return
+            statuses = []
+            for wid in range(1, 5):
+                path = self.active_run / f"worker_{wid:02d}" / "state.json"
+                if not path.is_file():
+                    continue
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                    statuses.append(state.get("status", "STARTING"))
+                except (OSError, ValueError):
+                    pass
+            self.query_one("#status", Static).update(
+                f"RUN {self.active_run.name} | {len(statuses)}/4 workers | "
+                + ", ".join(statuses or ["STARTING"]))
+            if len(statuses) == 4 and all(status in (
+                "COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED")
+                for status in statuses):
+                self.info(f"Run ended: {self.active_run.name} / {', '.join(statuses)}")
+                self.active_run = None
+                self.query_one("#start", Button).disabled = False
+                self.query_one("#stop", Button).disabled = True
+
     # ========================================================
     # LAUNCH TEXTUAL APPLICATION
     # ========================================================

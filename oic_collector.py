@@ -4189,6 +4189,135 @@ def launch_terminal_ui(args) -> None:
                     exc,
                 )
 
+        # ====================================================
+        # QUERY DESIGNER / FIELD SELECTION
+        # ====================================================
+
+        def select_category(self, code: str) -> None:
+            if code not in QUERY_PROFILES:
+                return
+            self.selected_code = code
+            self.field_catalog = load_catalog(code)
+            defaults = default_query(code, workers=4)
+            self.axis_x = defaults["x"]
+            self.axis_y = defaults["y"]
+            self.selected_measures = defaults["measures"]
+            self.selected_field = None
+            self.refresh_field_table()
+            self.refresh_axes()
+            if code == "MR" and not self.axis_x:
+                self.info("MR YEAR needs live metadata verification.", "warning")
+
+        def on_select_changed(self, event: Select.Changed) -> None:
+            if event.select.id == "cube_select" and event.value in QUERY_PROFILES:
+                self.select_category(str(event.value))
+
+        def refresh_field_table(self) -> None:
+            table = self.query_one("#field_table", DataTable)
+            search = self.query_one("#field_search", Input).value.casefold().strip()
+            table.clear(columns=False)
+            self.field_rows = {}
+            for field in self.field_catalog["fields"]:
+                name = field["mdx"]
+                haystack = " ".join([field.get("display", ""), name, field.get("group", "")]).casefold()
+                if search and search not in haystack:
+                    continue
+                mark = "[X]" if name in self.axis_x else "[Y]" if name in self.axis_y else "[v]" if name in self.selected_measures else ""
+                table.add_row(mark + " " + field.get("display", name),
+                              field["type"], field.get("source", ""), key=name)
+                self.field_rows[name] = field
+            if self.selected_field not in self.field_rows:
+                self.selected_field = None
+
+        def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+            if event.data_table.id == "field_table":
+                self.selected_field = str(event.row_key.value)
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            if event.data_table.id != "field_table":
+                return
+            name = str(event.row_key.value)
+            self.selected_field = name
+            field = self.field_rows.get(name)
+            if field and field["type"] == "MEASURE":
+                if name in self.selected_measures:
+                    self.selected_measures.remove(name)
+                else:
+                    self.selected_measures.append(name)
+                self.refresh_field_table()
+                self.refresh_axes()
+
+        def action_field_to_x(self) -> None:
+            self.move_selected("X")
+
+        def action_field_to_y(self) -> None:
+            self.move_selected("Y")
+
+        def move_selected(self, axis: str) -> None:
+            if isinstance(self.focused, Input):
+                return
+            field = self.field_rows.get(self.selected_field or "")
+            if not field or field["type"] != "DIMENSION":
+                return
+            name = field["mdx"]
+            self.axis_x = [x for x in self.axis_x if x != name]
+            self.axis_y = [y for y in self.axis_y if y != name]
+            (self.axis_x if axis == "X" else self.axis_y).append(name)
+            self.refresh_field_table()
+            self.refresh_axes()
+
+        def refresh_axes(self) -> None:
+            labels = {f["mdx"]: f.get("display", f["mdx"]) for f in self.field_catalog["fields"]}
+            self.query_one("#axis_x", Select).set_options(
+                [(f"{i+1}. {labels.get(name, name)}", name)
+                 for i, name in enumerate(self.axis_x)])
+            self.query_one("#axis_y", Select).set_options(
+                [(f"{i+1}. {labels.get(name, name)}", name)
+                 for i, name in enumerate(self.axis_y)])
+            values = [labels.get(name, name) for name in self.selected_measures]
+            self.query_one("#values_list", Static).update(
+                "  |  ".join(values) if values else "Select at least one measure")
+            self.query_one("#preview_text", Static).update("Preview is local; no API call until Start.")
+
+        def modify_axis(self, action: str) -> None:
+            axis = self.axis_x if action.startswith("x") else self.axis_y
+            select = self.query_one("#axis_x" if action.startswith("x") else "#axis_y", Select)
+            name = select.value
+            if not isinstance(name, str) or name not in axis:
+                self.info("Select an axis field first.", "warning")
+                return
+            index = axis.index(name)
+            if action.endswith("remove"):
+                axis.remove(name)
+            else:
+                other = index - 1 if action.endswith("up") else index + 1
+                if 0 <= other < len(axis):
+                    axis[index], axis[other] = axis[other], axis[index]
+            self.refresh_field_table()
+            self.refresh_axes()
+
+        def query_config(self) -> dict:
+            profile = QUERY_PROFILES[self.selected_code]
+            config = dict(code=self.selected_code, catalog=profile["catalog"],
+                          cube=profile["cube"], x=list(self.axis_x), y=list(self.axis_y),
+                          measures=list(self.selected_measures), filters=[],
+                          workers=4, x_chunk=1, y_chunk=20, timeout=60, delay=1.0)
+            return validate_query(config, self.field_catalog)
+
+        def preview_selected_query(self) -> None:
+            try:
+                config = self.query_config()
+                mdx = selected_mdx(config)
+                message = (f"Cube: {config['cube']} | Workers: {config['workers']} "
+                           f"| Chunk: {config['x_chunk']} X × {config['y_chunk']} Y\n"
+                           f"X: {', '.join(config['x'])}\nY: {', '.join(config['y'])}\n"
+                           f"Values: {len(config['measures'])}; large CrossJoins may time out.\n"
+                           + mdx)
+                self.query_one("#preview_text", Static).update(message)
+            except ValueError as exc:
+                self.query_one("#preview_text", Static).update(str(exc))
+                self.info(f"QUERY INVALID: {exc}", "warning")
+
     # ========================================================
     # LAUNCH TEXTUAL APPLICATION
     # ========================================================

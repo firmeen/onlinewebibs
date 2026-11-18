@@ -61,6 +61,12 @@ import sys
 import threading
 import time
 import zipfile
+import uuid
+import subprocess
+import shutil
+
+from oic_query import (PROFILES as QUERY_PROFILES, load_catalog, discover_fields,
+                       default_query, validate_query, build_mdx as selected_mdx, query_hash)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -118,99 +124,12 @@ USER_AGENT = (
 # INSURANCE PROFILES
 # ============================================================
 
+# Shared multi-cube profiles, including MR's unconfirmed YEAR.
 PROFILES = {
-    "AH": {
-        "name": "อุบัติเหตุและสุขภาพ",
-        "class": "AH",
-        "catalog": "PIVOT_202609_AH",
-        "cube": "AH_AGGREGATE_FY",
-        "column": "[VW PV AH AGGREGATE FY].[FY YEAR]",
-        "row1": "[DIM MAINSUB CLASS AH].[MAIN NAME TH]",
-        "row2": "[DIM MAINSUB CLASS AH].[SUB NAME TH]",
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "EARNED",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "INMTH CLM PAID",
-            "ATMTH CLM LI",
-        ],
-    },
-    "FI": {
-        "name": "ทรัพย์สิน",
-        "class": "FI",
-        "catalog": "PIVOT_202609_FI",
-        "cube": "FI_AGGREGATE_FY",
-        "column": "[VW PV FI AGGREGATE FY].[YEAR]",
-        "row1": "[DIM CT SUBCLASS FI].[GROUP DESC TH]",
-        "row2": None,
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "EARNED PREMIUM",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "SUM CLM PAID",
-            "SUM CLM OS",
-            "SUM CLM LI",
-        ],
-    },
-    "MR": {
-        "name": "ทางทะเลและขนส่ง",
-        "class": "MR",
-        "catalog": "PIVOT_202609_MR",
-        "cube": "MR_AGGREGATE_FY",
-        "column": "[VW PV MR AGGREGATE FY].[STATUS COMPANY PASS]",
-        "row1": "[DIM CT SUBCLASS MR].[SUBCLASS DESC TH]",
-        "row2": None,
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "CLAIM PAID",
-            "CLAIM OS",
-            "CLAIM LI",
-        ],
-    },
-    "MI": {
-        "name": "เบ็ดเตล็ด",
-        "class": "MI",
-        "catalog": "PIVOT_202609_MI",
-        "cube": "MI_AGGREGATE_FY",
-        "column": "[VW PV MI AGGREGATE FY].[FY YEAR]",
-        "row1": "[DIM MAINSUB CLASS].[MAIN NAME TH]",
-        "row2": "[DIM MAINSUB CLASS].[SUB NAME TH]",
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "CLM PAID",
-            "CLM OS",
-            "CLM LI",
-        ],
-    },
-    "MV": {
-        "name": "รถยนต์",
-        "class": "MO",
-        "catalog": "PIVOT_202609_MV",
-        "cube": "MV_AGGREGATE_FY",
-        "column": "[VW PV MV AGGREGATE FY].[YEAR]",
-        "row1": "[DIM CT SUBCLASS MV].[SUBCLASS DESC TH]",
-        "row2": None,
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "EARNED PREMIUM",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "CLAIM PAID",
-            "CLAIM OS",
-            "CLAIM LI",
-        ],
-    },
+    code: dict(name=p["name"], **{"class": p["cls"]}, catalog=p["catalog"],
+               cube=p["cube"], column=p["year"] or "[VW PV MR AGGREGATE FY].[STATUS COMPANY PASS]",
+               row1=p["row1"], row2=p["row2"], measures=p["measures"])
+    for code, p in QUERY_PROFILES.items()
 }
 
 
@@ -2164,12 +2083,14 @@ def run_headless(args) -> int:
 # TERMINAL APPLICATION
 # ============================================================
 
-def launch_terminal_ui(args) -> None:
+def launch_terminal_ui(args, return_app: bool = False):
     try:
         from rich.markup import escape as rich_escape
         from rich.text import Text
 
         from textual import work
+        from textual.binding import Binding
+        from textual.css.query import NoMatches
         from textual.app import App, ComposeResult
         from textual.containers import Horizontal, Vertical
         from textual.widgets import (
@@ -2183,6 +2104,7 @@ def launch_terminal_ui(args) -> None:
             ProgressBar,
             RichLog,
             Static,
+            Select,
         )
 
     except ImportError as exc:
@@ -2202,6 +2124,8 @@ def launch_terminal_ui(args) -> None:
             ("ctrl+s", "stop_collection", "Stop"),
             ("ctrl+o", "open_output", "Output"),
             ("ctrl+q", "quit", "Quit"),
+            Binding("a", "field_to_x", "X Axis", show=False),
+            Binding("s", "field_to_y", "Y Axis", show=False),
         ]
 
         CSS = """
@@ -2461,6 +2385,18 @@ def launch_terminal_ui(args) -> None:
             padding: 0 1;
             background: #101a22;
         }
+
+        #categories, #table { display: none; }
+        #cube_select { width: 1fr; }
+        #designer_area { height: 1fr; min-height: 12; }
+        #field_panel { width: 1fr; padding: 0 1; }
+        #axis_panel { width: 1fr; padding: 0 1; }
+        #field_table { height: 1fr; }
+        .designer_title { height: 1; color: #c9b996; text-style: bold; }
+        .axis_bar { height: 3; }
+        .axis_bar Button { margin-right: 1; }
+        #values_list { height: 3; overflow-y: auto; }
+        #preview_text { height: 5; overflow-y: auto; color: #b9c9d2; }
         """
 
         # ====================================================
@@ -2471,6 +2407,15 @@ def launch_terminal_ui(args) -> None:
             super().__init__()
 
             self.config = {}
+            self.selected_code = "MV"
+            self.field_catalog = load_catalog("MV")
+            self.selected_field = None
+            self.field_rows = {}
+            self.axis_x = []
+            self.axis_y = []
+            self.selected_measures = []
+            self.active_run = None
+            self.last_run_path = None
 
             self.busy = False
             self.stop_event = threading.Event()
@@ -2660,6 +2605,10 @@ def launch_terminal_ui(args) -> None:
                             "INSURANCE CATEGORIES",
                             classes="input_label",
                         )
+                        yield Select(
+                            [(code + " — " + p["name"], code) for code, p in PROFILES.items()],
+                            value="MV", allow_blank=False, id="cube_select",
+                        )
 
                         with Horizontal(
                             id="categories"
@@ -2697,6 +2646,40 @@ def launch_terminal_ui(args) -> None:
                         cursor_type="row",
                         zebra_stripes=True,
                     )
+
+                # USER-SELECTED QUERY DESIGNER
+                with Horizontal(id="designer_area"):
+                    with Vertical(id="field_panel"):
+                        yield Static("FIELD EXPLORER  /  CLICK + A → X, S → Y", classes="designer_title")
+                        yield Input(placeholder="Search Thai / English / MDX...", id="field_search")
+                        yield DataTable(id="field_table", cursor_type="row", zebra_stripes=True)
+                        yield Button("REFRESH CATALOG", id="refresh_catalog")
+                    with Vertical(id="axis_panel"):
+                        yield Static("X  /  HORIZONTAL AXIS", classes="designer_title")
+                        yield Select([], allow_blank=True, id="axis_x")
+                        with Horizontal(classes="axis_bar"):
+                            yield Button("X ↑", id="x_up")
+                            yield Button("X ↓", id="x_down")
+                            yield Button("REMOVE X", id="x_remove")
+                        yield Static("Y  /  VERTICAL AXIS", classes="designer_title")
+                        yield Select([], allow_blank=True, id="axis_y")
+                        with Horizontal(classes="axis_bar"):
+                            yield Button("Y ↑", id="y_up")
+                            yield Button("Y ↓", id="y_down")
+                            yield Button("REMOVE Y", id="y_remove")
+                        yield Static("VALUES  /  CLICK MEASURES IN FIELD LIST", classes="designer_title")
+                        yield Static("", id="values_list")
+                        with Horizontal(classes="axis_bar"):
+                            yield Button("PREVIEW QUERY", id="query_preview")
+                        yield Static("Select X and Y fields.", id="preview_text")
+                        with Horizontal(classes="axis_bar"):
+                            yield Label("WORKERS", classes="input_label")
+                            yield Input(value="4", id="worker_count", type="integer")
+                            yield Label("X CHUNK", classes="input_label")
+                            yield Input(value="1", id="x_chunk", type="integer")
+                            yield Label("Y CHUNK", classes="input_label")
+                            yield Input(value="20", id="y_chunk", type="integer")
+                            yield Button("RESUME", id="resume_run")
 
                 # PROGRESS
 
@@ -2777,6 +2760,12 @@ def launch_terminal_ui(args) -> None:
                 "#stop",
                 Button,
             ).disabled = True
+            field_table = self.query_one("#field_table", DataTable)
+            field_table.add_column("FIELD", key="display", width=37)
+            field_table.add_column("TYPE", key="type", width=12)
+            field_table.add_column("SOURCE", key="source", width=17)
+            self.select_category("MV")
+            self.set_interval(1.0, self.poll_selected_run)
 
             # Load local configuration without making
             # any network requests.
@@ -2891,6 +2880,11 @@ def launch_terminal_ui(args) -> None:
 
         def refresh_auth_cards(self) -> None:
             if not self.is_mounted:
+                return
+            try:
+                self.query_one("#jwt_status", Static)
+                self.query_one("#cookie_status", Static)
+            except NoMatches:
                 return
 
             details = jwt_info(
@@ -3161,6 +3155,10 @@ def launch_terminal_ui(args) -> None:
             event: Input.Changed,
         ) -> None:
             input_id = event.input.id
+
+            if input_id == "field_search":
+                self.refresh_field_table()
+                return
 
             if input_id == "token":
                 current = normalize_token(
@@ -3521,19 +3519,21 @@ def launch_terminal_ui(args) -> None:
             elif button_id == "open":
                 self.action_open_output()
 
+            elif button_id == "query_preview":
+                self.preview_selected_query()
+            elif button_id == "resume_run":
+                self.resume_selected_query()
+            elif button_id == "refresh_catalog":
+                self.refresh_catalog_worker(self.selected_code, self.token_value(), self.cookie_value())
+            elif button_id in ("x_up", "x_down", "x_remove", "y_up", "y_down", "y_remove"):
+                self.modify_axis(button_id)
+
         # ====================================================
         # SELECTED INSURANCE CLASSES
         # ====================================================
 
         def selected_codes(self) -> list[str]:
-            return [
-                code
-                for code in PROFILES
-                if self.query_one(
-                    f"#code_{code}",
-                    Checkbox,
-                ).value
-            ]
+            return [self.selected_code]
 
         # ====================================================
         # COLLECTION ACTIONS
@@ -3545,11 +3545,14 @@ def launch_terminal_ui(args) -> None:
             )
 
         def action_start_collection(self) -> None:
-            self.start_job(
-                mode="collect"
-            )
+            self.start_selected_query()
 
         def action_stop_collection(self) -> None:
+            if self.active_run is not None:
+                (self.active_run / "stop.flag").touch()
+                self.info("Stop requested; workers finish their active request.", "warning")
+                self.query_one("#status", Static).update("STOP REQUESTED")
+                return
             if not self.busy:
                 return
 
@@ -4204,10 +4207,263 @@ def launch_terminal_ui(args) -> None:
                     exc,
                 )
 
+        # ====================================================
+        # QUERY DESIGNER / FIELD SELECTION
+        # ====================================================
+
+        def select_category(self, code: str) -> None:
+            if code not in QUERY_PROFILES:
+                return
+            self.selected_code = code
+            self.field_catalog = load_catalog(code)
+            defaults = default_query(code, workers=4)
+            self.axis_x = defaults["x"]
+            self.axis_y = defaults["y"]
+            self.selected_measures = defaults["measures"]
+            self.selected_field = None
+            self.refresh_field_table()
+            self.refresh_axes()
+            if code == "MR" and not self.axis_x:
+                self.info("MR YEAR needs live metadata verification.", "warning")
+
+        def on_select_changed(self, event: Select.Changed) -> None:
+            if event.select.id == "cube_select" and event.value in QUERY_PROFILES:
+                self.select_category(str(event.value))
+
+        def refresh_field_table(self) -> None:
+            table = self.query_one("#field_table", DataTable)
+            search = self.query_one("#field_search", Input).value.casefold().strip()
+            table.clear(columns=False)
+            self.field_rows = {}
+            for field in self.field_catalog["fields"]:
+                name = field["mdx"]
+                haystack = " ".join([field.get("display", ""), name, field.get("group", "")]).casefold()
+                if search and search not in haystack:
+                    continue
+                mark = "[X]" if name in self.axis_x else "[Y]" if name in self.axis_y else "[v]" if name in self.selected_measures else ""
+                table.add_row(mark + " " + field.get("display", name),
+                              field["type"], field.get("source", ""), key=name)
+                self.field_rows[name] = field
+            if self.selected_field not in self.field_rows:
+                self.selected_field = None
+
+        def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+            if event.data_table.id == "field_table":
+                self.selected_field = str(event.row_key.value)
+
+        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+            if event.data_table.id != "field_table":
+                return
+            name = str(event.row_key.value)
+            self.selected_field = name
+            field = self.field_rows.get(name)
+            if field and field["type"] == "MEASURE":
+                if name in self.selected_measures:
+                    self.selected_measures.remove(name)
+                else:
+                    self.selected_measures.append(name)
+                self.refresh_field_table()
+                self.refresh_axes()
+
+        def action_field_to_x(self) -> None:
+            self.move_selected("X")
+
+        def action_field_to_y(self) -> None:
+            self.move_selected("Y")
+
+        def move_selected(self, axis: str) -> None:
+            if isinstance(self.focused, Input):
+                return
+            field = self.field_rows.get(self.selected_field or "")
+            if not field or field["type"] != "DIMENSION":
+                return
+            name = field["mdx"]
+            self.axis_x = [x for x in self.axis_x if x != name]
+            self.axis_y = [y for y in self.axis_y if y != name]
+            (self.axis_x if axis == "X" else self.axis_y).append(name)
+            self.refresh_field_table()
+            self.refresh_axes()
+
+        def refresh_axes(self) -> None:
+            labels = {f["mdx"]: f.get("display", f["mdx"]) for f in self.field_catalog["fields"]}
+            self.query_one("#axis_x", Select).set_options(
+                [(f"{i+1}. {labels.get(name, name)}", name)
+                 for i, name in enumerate(self.axis_x)])
+            self.query_one("#axis_y", Select).set_options(
+                [(f"{i+1}. {labels.get(name, name)}", name)
+                 for i, name in enumerate(self.axis_y)])
+            values = [labels.get(name, name) for name in self.selected_measures]
+            self.query_one("#values_list", Static).update(
+                "  |  ".join(values) if values else "Select at least one measure")
+            self.query_one("#preview_text", Static).update("Preview is local; no API call until Start.")
+
+        def modify_axis(self, action: str) -> None:
+            axis = self.axis_x if action.startswith("x") else self.axis_y
+            select = self.query_one("#axis_x" if action.startswith("x") else "#axis_y", Select)
+            name = select.value
+            if not isinstance(name, str) or name not in axis:
+                self.info("Select an axis field first.", "warning")
+                return
+            index = axis.index(name)
+            if action.endswith("remove"):
+                axis.remove(name)
+            else:
+                other = index - 1 if action.endswith("up") else index + 1
+                if 0 <= other < len(axis):
+                    axis[index], axis[other] = axis[other], axis[index]
+            self.refresh_field_table()
+            self.refresh_axes()
+
+        def query_config(self) -> dict:
+            profile = QUERY_PROFILES[self.selected_code]
+            config = dict(code=self.selected_code, catalog=profile["catalog"],
+                          cube=profile["cube"], x=list(self.axis_x), y=list(self.axis_y),
+                          measures=list(self.selected_measures), filters=[],
+                          workers=int(self.query_one("#worker_count", Input).value),
+                          x_chunk=int(self.query_one("#x_chunk", Input).value),
+                          y_chunk=int(self.query_one("#y_chunk", Input).value),
+                          timeout=60, delay=1.0)
+            return validate_query(config, self.field_catalog)
+
+        def preview_selected_query(self) -> None:
+            try:
+                config = self.query_config()
+                mdx = selected_mdx(config)
+                message = (f"Cube: {config['cube']} | Workers: {config['workers']} "
+                           f"| Chunk: {config['x_chunk']} X × {config['y_chunk']} Y\n"
+                           f"X: {', '.join(config['x'])}\nY: {', '.join(config['y'])}\n"
+                           f"Values: {len(config['measures'])}; large CrossJoins may time out.\n"
+                           + mdx)
+                self.query_one("#preview_text", Static).update(message)
+            except ValueError as exc:
+                self.query_one("#preview_text", Static).update(str(exc))
+                self.info(f"QUERY INVALID: {exc}", "warning")
+
+        # ====================================================
+        # LIVE METADATA / RUN CONTROL
+        # ====================================================
+
+        @work(thread=True, group="catalog-refresh", exclusive=True)
+        def refresh_catalog_worker(self, code: str, token: str, cookie: str) -> None:
+            try:
+                catalog = discover_fields(code, token, cookie)
+                self.call_from_thread(self.catalog_refreshed, code, catalog, None)
+            except Exception as exc:
+                self.call_from_thread(self.catalog_refreshed, code, None, str(exc))
+
+        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
+            if error:
+                self.info(f"Metadata refresh failed; cache retained: {error}", "warning")
+                return
+            if code != self.selected_code:
+                return
+            self.field_catalog = catalog
+            self.refresh_field_table()
+            self.info(f"Catalog: {len(catalog['fields'])} fields ({catalog['source']}).", "success")
+
+        def start_selected_query(self) -> None:
+            if self.active_run is not None:
+                self.info("A collection is already active; Stop or finish before restarting.", "warning")
+                return
+            if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
+                self.info("Validate Cookie and JWT before Start; backend readiness is separate.", "error")
+                return
+            if sys.platform != "win32" or not shutil.which("wt.exe"):
+                self.info("Windows Terminal (wt.exe) is required for the three-window workflow.", "error")
+                return
+            try:
+                config = self.query_config()
+                self.save_credentials()
+                run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
+                config["run_id"] = run_id
+                config["created_at"] = datetime.now(timezone.utc).isoformat()
+                path = resolve_output_path(self.output_value()) / "oic_parallel" / run_id
+                path.mkdir(parents=True, exist_ok=False)
+                config_file = path / "query_config.json"
+                config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+                (path / "job_plan.json").write_text(json.dumps(
+                    {"run_id": run_id, "query_hash": query_hash(config),
+                     "x": config["x"], "y": config["y"], "measures": config["measures"],
+                     "workers": config["workers"], "partition": "x_page_mod_workers"},
+                    ensure_ascii=False, indent=2), encoding="utf-8")
+                script = BASE_DIR / "oic_parallel_collector.py"
+                if not script.is_file():
+                    raise RuntimeError("oic_parallel_collector.py not found")
+                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.Popen([sys.executable, str(script), "--query-config",
+                                  str(config_file), "--launch"], cwd=str(BASE_DIR),
+                                 creationflags=flags, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                self.active_run = path
+                self.last_run_path = path
+                self.query_one("#start", Button).disabled = True
+                self.query_one("#stop", Button).disabled = False
+                self.query_one("#status", Static).update(f"RUNNING / {run_id}")
+                self.info(f"Selected query launched: {run_id}", "success")
+            except Exception as exc:
+                self.info(f"Cannot start collection: {exc}", "error")
+
+        def resume_selected_query(self) -> None:
+            if self.active_run is not None:
+                self.info("Finish or stop the active run before resuming.", "warning")
+                return
+            path = self.last_run_path
+            if not path or not (path / "query_config.json").is_file():
+                self.info("No previous query run to resume.", "warning")
+                return
+            if self.cookie_state != "VALID":
+                self.info("Validate the Session before resuming.", "warning")
+                return
+            (path / "stop.flag").unlink(missing_ok=True)
+            script = BASE_DIR / "oic_parallel_collector.py"
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                subprocess.Popen([sys.executable, str(script), "--query-config",
+                                  str(path / "query_config.json"), "--launch"],
+                                 cwd=str(BASE_DIR), creationflags=flags,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.active_run = path
+                self.query_one("#start", Button).disabled = True
+                self.query_one("#stop", Button).disabled = False
+                self.info(f"Resuming {path.name}", "success")
+            except Exception as exc:
+                self.info(f"Resume failed: {exc}", "error")
+
+        def poll_selected_run(self) -> None:
+            if self.active_run is None:
+                return
+            statuses = []
+            config_path = self.active_run / "query_config.json"
+            try:
+                workers = int(json.loads(config_path.read_text(encoding="utf-8"))["workers"])
+            except (OSError, ValueError, KeyError):
+                workers = 4
+            for wid in range(1, workers + 1):
+                path = self.active_run / f"worker_{wid:02d}" / "state.json"
+                if not path.is_file():
+                    continue
+                try:
+                    state = json.loads(path.read_text(encoding="utf-8"))
+                    statuses.append(state.get("status", "STARTING"))
+                except (OSError, ValueError):
+                    pass
+            self.query_one("#status", Static).update(
+                f"RUN {self.active_run.name} | {len(statuses)}/{workers} workers | "
+                + ", ".join(statuses or ["STARTING"]))
+            if len(statuses) == workers and all(status in (
+                "COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED")
+                for status in statuses):
+                self.info(f"Run ended: {self.active_run.name} / {', '.join(statuses)}")
+                self.active_run = None
+                self.query_one("#start", Button).disabled = False
+                self.query_one("#stop", Button).disabled = True
+
     # ========================================================
     # LAUNCH TEXTUAL APPLICATION
     # ========================================================
 
+    if return_app:
+        return OICApp()
     OICApp().run()
 
 

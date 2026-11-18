@@ -2083,7 +2083,7 @@ def run_headless(args) -> int:
 # TERMINAL APPLICATION
 # ============================================================
 
-def launch_terminal_ui(args) -> None:
+def launch_terminal_ui(args, return_app: bool = False):
     try:
         from rich.markup import escape as rich_escape
         from rich.text import Text
@@ -4456,6 +4456,8 @@ def launch_terminal_ui(args) -> None:
     # LAUNCH TEXTUAL APPLICATION
     # ========================================================
 
+    if return_app:
+        return OICApp()
     OICApp().run()
 
 

@@ -109,6 +109,22 @@ def load_catalog(code: str) -> dict:
     if code not in PROFILES:
         raise ValueError("Unknown insurance category")
     fallback = seeded_catalog(code)
+    # Recover previously discovered fields even if OIC is offline.
+    probe = ROOT / "output" / "xmla_expand" / code / "manifest.json"
+    try:
+        previous = json.loads(probe.read_text(encoding="utf-8"))
+        for name in previous.get("discovered_hierarchies", []):
+            if not isinstance(name, str) or not IDENTIFIER.fullmatch(name):
+                continue
+            label = name.rsplit("[", 1)[-1].rstrip("]")
+            fallback["fields"].append(
+                dict(mdx=name, display=KNOWN_DIMENSION_NAMES.get(label, label),
+                     type="DIMENSION", source="PROBE", status="UNVERIFIED",
+                     group=name.split("].[", 1)[0][1:]))
+        fallback["fields"] = unique(fallback["fields"])
+        fallback["source"] = "PROBE"
+    except (OSError, ValueError, TypeError):
+        pass
     path = cache_path(code)
     try:
         cached = json.loads(path.read_text(encoding="utf-8"))

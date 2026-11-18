@@ -77,6 +77,26 @@ class SelectedParallelTests(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertTrue(Path(path).is_file())
 
+    def test_http_503_is_recorded_and_bounded(self):
+        class ErrorClient(FakeClient):
+            calls = 0
+
+            def execute(self, request_body, destination):
+                ErrorClient.calls += 1
+                destination.write_bytes(b"The service is unavailable.")
+                return {"http_status": 503, "response_bytes": 27}
+
+        with patch.object(parallel, "read_env", lambda: {"OIC_COOKIE": "test_cookie"}), \
+             patch.object(parallel, "OICClient", ErrorClient), \
+             patch.object(parallel.time, "sleep", lambda _: None):
+            self.assertEqual(self.worker(1), 1)
+        self.assertEqual(ErrorClient.calls, 2)
+        state = json.loads((self.root / "worker_01" / "state.json").read_text())
+        self.assertEqual(state["status"], "FAILED")
+        self.assertEqual(state["last_http"], 503)
+        manifest = json.loads((self.root / "worker_01" / "manifest.json").read_text())
+        self.assertEqual([c["status"] for c in manifest["chunks"].values()], ["FAILED"])
+
     def test_stop_flag_prevents_new_requests(self):
         (self.root / "stop.flag").touch()
         with patch.object(parallel, "read_env", lambda: {"OIC_COOKIE": "test_cookie"}), \

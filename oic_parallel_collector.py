@@ -115,6 +115,7 @@ import subprocess
 import sys
 import time
 import uuid
+import threading
 
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -240,6 +241,8 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/157.0.0.0 Safari/537.36"
 )
+
+from oic_query import PROFILES as QUERY_PROFILES, validate_query, build_soap as query_soap, parse_xmla as query_parse, excel_records as query_excel_records, query_hash
 
 console = Console(highlight=False)
 
@@ -1132,8 +1135,10 @@ class OICClient:
         timeout: int,
         max_response_mb: int,
         worker_id: int,
+        code: str = "MV",
     ):
 
+        self.profile = QUERY_PROFILES[code]
         self.worker_id = worker_id
 
         self.token = token.removeprefix(
@@ -1181,7 +1186,7 @@ class OICClient:
 
         return (
             f"{BASE_URL}{PAGE_PATH}"
-            f"?Class={CUBE['class']}"
+            f"?Class={self.profile['cls']}"
         )
 
     def refresh_token(self) -> None:
@@ -3829,11 +3834,361 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+# ============================================================
+# SELECTED-QUERY WORKFLOW — reuses OICClient, XMLA HTTP, logging,
+# Rich, Windows Terminal and file helpers from the legacy engine.
+# The old full-hierarchy CLI remains diagnostic, never the default.
+# ============================================================
+
+def selected_paths(config_path: Path):
+    config_path = config_path.resolve()
+    run_dir = config_path.parent
+    config = read_json(config_path)
+    if not isinstance(config, dict):
+        raise RuntimeError("Query config not found or invalid")
+    validate_query(config)
+    return config, run_dir
+
+
+def selected_worker(args) -> int:
+    config, run_dir = selected_paths(args.query_config)
+    code, worker_id = config["code"], args.worker_id
+    worker_count = int(config["workers"])
+    if not 1 <= worker_id <= worker_count:
+        raise RuntimeError("Invalid worker ID")
+    directory = run_dir / f"worker_{worker_id:02d}"
+    chunks_dir = directory / "chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = directory / "manifest.json"
+    state_path = directory / "state.json"
+    heartbeat_path = directory / "heartbeat.json"
+    existing = read_json(manifest_path, {})
+    manifest = existing if existing.get("run_id") == config["run_id"] and existing.get("query_hash") == query_hash(config) else {}
+    manifest.setdefault("chunks", {})
+    manifest["run_id"] = config["run_id"]
+    manifest["query_hash"] = query_hash(config)
+    manifest["worker_id"] = worker_id
+    manifest["updated_at"] = utc_now()
+    stop_file = run_dir / "stop.flag"
+    heartbeat_stop = threading.Event()
+    state = dict(run_id=config["run_id"], worker_id=worker_id, pid=os.getpid(),
+                 status="STARTING", current_request=None, request_started_at=None,
+                 last_http=None, last_message="Initializing", updated_at=utc_now())
+    def save_state():
+        state["updated_at"] = utc_now()
+        write_json(state_path, state)
+    def heartbeat():
+        while not heartbeat_stop.is_set():
+            write_json(heartbeat_path, dict(run_id=config["run_id"], worker_id=worker_id,
+                                            pid=os.getpid(), updated_at=utc_now()))
+            heartbeat_stop.wait(2)
+    save_state()
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    client = None
+    x_size, y_size = int(config["x_chunk"]), int(config["y_chunk"])
+    errors = 0
+    completed = False
+    try:
+        env = read_env()
+        cookie = env.get("OIC_COOKIE", "").strip()
+        if not cookie:
+            raise RuntimeError("SESSION_EXPIRED: OIC_COOKIE not configured")
+        client = OICClient(cookie=cookie, token=env.get("OIC_BEARER_TOKEN", ""),
+                           timeout=int(config.get("timeout", 60)),
+                           max_response_mb=100, worker_id=worker_id, code=code)
+        state["status"] = "RUNNING"
+        save_state()
+        # Deterministic X paging: a given X page belongs to exactly one worker.
+        x_offset = (worker_id - 1) * x_size
+        while not stop_file.exists():
+            y_offset = 0
+            if (run_dir / "pause.flag").exists():
+                state["status"] = "PAUSED"; save_state()
+                while (run_dir / "pause.flag").exists() and not stop_file.exists():
+                    time.sleep(1)
+                state["status"] = "RUNNING"; save_state()
+            if stop_file.exists():
+                break
+            x_returned = None
+            while not stop_file.exists():
+                key = f"{query_hash(config)}_x{x_offset:06d}_y{y_offset:06d}"
+                req_path = chunks_dir / f"{key}.request.xml"
+                resp_path = chunks_dir / f"{key}.response.xml"
+                record = manifest["chunks"].get(key, {})
+                data = None
+                if record.get("status") == "OK" and resp_path.is_file():
+                    try:
+                        data = query_parse(resp_path.read_bytes())
+                    except (ValueError, ET.ParseError, OSError):
+                        data = None
+                if data is None:
+                    req_path.write_bytes(query_soap(config, x_offset, y_offset))
+                    state.update(status="RUNNING", current_request=key,
+                                 request_started_at=utc_now(), last_message=f"Request {key}")
+                    save_state()
+                    log(f"REQUEST X={x_offset} Y={y_offset}", worker_id)
+                    http = None
+                    for attempt in range(2):
+                        try:
+                            http = client.execute(req_path.read_bytes(), resp_path)
+                            state["last_http"] = http["http_status"]
+                            if http["http_status"] == 200:
+                                data = query_parse(resp_path.read_bytes())
+                                break
+                            if http["http_status"] in (401, 403):
+                                raise RuntimeError(f"AUTH HTTP {http['http_status']}")
+                            if http["http_status"] not in (429, 500, 502, 503, 504) or attempt:
+                                raise RuntimeError(f"XMLA HTTP {http['http_status']}")
+                            state["status"] = "PAUSED"; save_state()
+                            time.sleep(5 + worker_id)
+                            state["status"] = "RUNNING"; save_state()
+                        except (requests.RequestException, ValueError, ET.ParseError, RuntimeError) as exc:
+                            if attempt == 1 or (http and http.get("http_status") not in (429, 500, 502, 503, 504)):
+                                raise
+                            log(f"Transient error: {exc}", worker_id, "WARN")
+                            time.sleep(5 + worker_id)
+                    if data is None:
+                        raise RuntimeError("Empty XMLA dataset after attempts")
+                    record = dict(status="OK", x_offset=x_offset, y_offset=y_offset,
+                                  request_file=req_path.name, response_file=resp_path.name,
+                                  x_count=len(data["axes"]["Axis0"]),
+                                  y_tuples=len(data["axes"]["Axis1"]),
+                                  cells=len(data["cells"]), http_status=200,
+                                  response_bytes=resp_path.stat().st_size,
+                                  completed_at=utc_now())
+                    manifest["chunks"][key] = record
+                    manifest["updated_at"] = utc_now()
+                    write_json(manifest_path, manifest)
+                    log(f"OK X={record['x_count']} Y={record['y_tuples']} cells={record['cells']}", worker_id, "OK")
+                # Measure crossjoin is on Y, so count unique Y tuples without Measure.
+                x_count = len(data["axes"]["Axis0"])
+                y_keys = {tuple(m["unique_name"] for m in row if m["hierarchy"] != "[Measures]")
+                          for row in data["axes"]["Axis1"]}
+                y_count = len(y_keys)
+                x_returned = x_count
+                state.update(current_request=None, request_started_at=None,
+                             last_message=f"OK X={x_offset} Y={y_offset} cells={len(data['cells'])}")
+                save_state()
+                if x_count == 0 or y_count < y_size:
+                    break
+                y_offset += y_size
+                time.sleep(float(config.get("delay", 1)))
+            if x_returned is None or x_returned < x_size:
+                completed = True
+                break
+            x_offset += x_size * worker_count
+            time.sleep(float(config.get("delay", 1)))
+        state["status"] = "STOPPED" if stop_file.exists() else "COMPLETED" if completed else "PARTIAL"
+    except KeyboardInterrupt:
+        state["status"] = "STOPPED"
+    except Exception as exc:
+        errors += 1
+        text_message = str(exc)
+        state["status"] = "SESSION_EXPIRED" if "SESSION_EXPIRED" in text_message else "PARTIAL" if manifest["chunks"] else "FAILED"
+        state["last_message"] = text_message[:200]
+        log(f"FAILED: {text_message}", worker_id, "ERROR")
+    finally:
+        if client:
+            client.close()
+        heartbeat_stop.set()
+        thread.join(timeout=3)
+        state["current_request"] = None
+        state["request_started_at"] = None
+        save_state()
+        manifest["status"] = state["status"]
+        manifest["updated_at"] = utc_now()
+        write_json(manifest_path, manifest)
+    return 1 if errors else 0
+
+
+def selected_summary(config: dict, run_dir: Path):
+    workers = []
+    totals = dict(chunks_ok=0, chunks_failed=0, cells=0, bytes=0)
+    terminal = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED"}
+    for wid in range(1, int(config["workers"]) + 1):
+        directory = run_dir / f"worker_{wid:02d}"
+        state = read_json(directory / "state.json", {}) or {}
+        heartbeat = read_json(directory / "heartbeat.json", {}) or {}
+        if state.get("run_id") != config["run_id"]:
+            state = dict(status="STARTING", worker_id=wid, run_id=config["run_id"])
+        elif state.get("status") not in terminal:
+            last = parse_time(heartbeat.get("updated_at"))
+            if not last or (datetime.now(timezone.utc) - last).total_seconds() > 10:
+                state["status"] = "STALE"
+        manifest = read_json(directory / "manifest.json", {}) or {}
+        if manifest.get("run_id") == config["run_id"]:
+            for chunk in manifest.get("chunks", {}).values():
+                if chunk.get("status") == "OK":
+                    totals["chunks_ok"] += 1
+                    totals["cells"] += int(chunk.get("cells") or 0)
+                    totals["bytes"] += int(chunk.get("response_bytes") or 0)
+                elif chunk.get("status") == "FAILED":
+                    totals["chunks_failed"] += 1
+        workers.append(state)
+    totals["workers_completed"] = sum(w.get("status") == "COMPLETED" for w in workers)
+    totals["workers_failed"] = sum(w.get("status") in {"PARTIAL", "FAILED", "SESSION_EXPIRED"} for w in workers)
+    totals["workers_terminal"] = sum(w.get("status") in terminal for w in workers)
+    return workers, totals
+
+
+def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
+    if Workbook is None:
+        raise RuntimeError("openpyxl required for Excel export")
+    excel_dir = run_dir / "excel"
+    excel_dir.mkdir(parents=True, exist_ok=True)
+    path = excel_dir / "selected_query.xlsx"
+    tmp = excel_dir / "selected_query.tmp.xlsx"
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet("Data_1")
+    x_count, y_count = len(config["x"]), len(config["y"])
+    headers = ["INSURANCE_CODE", "CUBE", "CATALOG"]
+    for axis, count in (("X", x_count), ("Y", y_count)):
+        for i in range(count):
+            headers += [f"{axis}{i+1}_HIERARCHY", f"{axis}{i+1}_CAPTION",
+                        f"{axis}{i+1}_UNIQUE_NAME", f"{axis}{i+1}_LEVEL"]
+    headers += ["MEASURE", "VALUE", "LAST_DATA_UPDATE", "RETRIEVED_AT"]
+    sheet.append(headers)
+    row_count, sheet_rows, sheet_number = 0, 1, 1
+    for wid in range(1, int(config["workers"]) + 1):
+        directory = run_dir / f"worker_{wid:02d}"
+        manifest = read_json(directory / "manifest.json", {}) or {}
+        if manifest.get("run_id") != config["run_id"] or manifest.get("query_hash") != query_hash(config):
+            continue
+        for name, chunk in sorted(manifest.get("chunks", {}).items()):
+            if chunk.get("status") != "OK":
+                continue
+            response = directory / "chunks" / chunk["response_file"]
+            if not response.is_file():
+                continue
+            data = query_parse(response.read_bytes())
+            for record in query_excel_records(config, data):
+                if sheet_rows >= EXCEL_MAX_ROWS:
+                    sheet_number += 1
+                    sheet = workbook.create_sheet(f"Data_{sheet_number}")
+                    sheet.append(headers)
+                    sheet_rows = 1
+                entry = [config["code"], config["cube"], config["catalog"]]
+                for values, names in ((record["X"], config["x"]), (record["Y"], config["y"])):
+                    for index, field in enumerate(names):
+                        matching = next((m for m in values if m["hierarchy"] == field), {})
+                        entry += [field, matching.get("caption"), matching.get("unique_name"), matching.get("level")]
+                raw = record["VALUE"]
+                try:
+                    number = float(raw)
+                    value = number if math.isfinite(number) else raw
+                except (TypeError, ValueError):
+                    value = raw
+                entry += [record["MEASURE"], value, record["LAST_DATA_UPDATE"], chunk.get("completed_at")]
+                sheet.append([excel_text(v) if isinstance(v, str) else v for v in entry])
+                row_count += 1
+                sheet_rows += 1
+    workers, totals = selected_summary(config, run_dir)
+    info = workbook.create_sheet("INFO")
+    for key, val in (("RUN_ID", config["run_id"]), ("QUERY_HASH", query_hash(config)),
+                     ("STATUS", "COMPLETED" if totals["workers_completed"] == config["workers"] else "PARTIAL"),
+                     ("OUTPUT_ROWS", row_count), ("NOTE", "OLAP aggregates; do not add All and detail totals")):
+        info.append([key, val])
+    workbook.save(tmp)
+    tmp.replace(path)
+    return str(path), row_count
+
+
+def selected_monitor(config: dict, run_dir: Path) -> int:
+    start = utc_now()
+    terminal = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED"}
+    with Live(console=console, refresh_per_second=1, screen=True, transient=False) as live:
+        while True:
+            workers, totals = selected_summary(config, run_dir)
+            table = Table(title=f"OIC SELECTED QUERY | {config['code']} | {config['run_id']}",
+                          box=rich_box.ROUNDED, expand=True)
+            for col in ("Worker", "Status", "Current Chunk", "Last HTTP", "Last Event"):
+                table.add_column(col)
+            for worker in workers:
+                table.add_row(str(worker.get("worker_id", "?")), worker.get("status", "STARTING"),
+                              str(worker.get("current_request") or "—"),
+                              str(worker.get("last_http") or "—"),
+                              str(worker.get("last_message") or "—")[:70])
+            status = (f"X: {', '.join(config['x'])}\nY: {', '.join(config['y'])}\n"
+                      f"Measures: {len(config['measures'])} | Workers: {config['workers']}\n"
+                      f"Chunks OK: {totals['chunks_ok']} | Cells: {totals['cells']:,} | "
+                      f"Bytes: {totals['bytes']:,} | Elapsed: {format_duration(elapsed_seconds(start))}\n"
+                      "Chunk total unknown until exploration finishes; percentages intentionally omitted.")
+            live.update(Group(Panel(status, title="RUN OVERVIEW"), table), refresh=True)
+            write_json(run_dir / "master_manifest.json",
+                       dict(run_id=config["run_id"], updated_at=utc_now(),
+                            summary=totals, workers=workers))
+            if all(w.get("status") in terminal for w in workers):
+                break
+            time.sleep(1)
+    try:
+        destination, rows = selected_export(config, run_dir)
+        log(f"EXCEL: {destination} ({rows:,} rows)", level="OK")
+    except Exception as exc:
+        log(f"EXCEL ERROR: {exc}", level="ERROR")
+    return 0
+
+
+def selected_launch(config: dict, run_dir: Path, config_path: Path) -> int:
+    wt = find_windows_terminal()
+    if os.name != "nt" or not wt:
+        raise RuntimeError("Windows Terminal wt.exe required; run workers manually on other systems")
+    def command(extra):
+        return [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
+                "--query-config", str(config_path), *extra]
+    # Exactly two new Windows Terminal windows. The Textual UI stays alive.
+    monitor_ps = "& " + powershell_quote(command([])[0]) + " " + " ".join(powershell_quote(a) for a in command([])[1:] + ["--monitor-only"])
+    subprocess.Popen([wt, "-w", "new", "new-tab", "--title", "OIC | Live Monitor",
+                      "--startingDirectory", str(HERE), "powershell.exe", "-NoLogo", "-NoExit",
+                      "-Command", monitor_ps], cwd=str(HERE))
+    worker_cmd = [wt, "-w", "new"]
+    for wid in range(1, int(config["workers"]) + 1):
+        if wid > 1:
+            worker_cmd.append(";")
+        ps = "& " + powershell_quote(command([])[0]) + " " + " ".join(powershell_quote(a) for a in command([])[1:] + ["--worker-id", str(wid)])
+        worker_cmd += ["new-tab", "--title", f"OIC | Worker {wid:02d}",
+                       "--startingDirectory", str(HERE), "powershell.exe",
+                       "-NoLogo", "-NoExit", "-Command", ps]
+    subprocess.Popen(worker_cmd, cwd=str(HERE))
+    return 0
+
+
+def selected_main(argv) -> int:
+    parser = argparse.ArgumentParser(description="Run an explicit user-selected OIC XMLA query")
+    parser.add_argument("--query-config", type=Path, required=True)
+    parser.add_argument("--launch", action="store_true")
+    parser.add_argument("--worker-id", type=int, default=0)
+    parser.add_argument("--monitor-only", action="store_true")
+    parser.add_argument("--export-only", action="store_true")
+    args = parser.parse_args(argv)
+    config, run_dir = selected_paths(args.query_config)
+    if args.worker_id:
+        return selected_worker(args)
+    if args.monitor_only:
+        return selected_monitor(config, run_dir)
+    if args.export_only:
+        path, rows = selected_export(config, run_dir)
+        log(f"EXPORTED {rows:,} rows to {path}", level="OK")
+        return 0
+    if args.launch:
+        return selected_launch(config, run_dir, args.query_config.resolve())
+    parser.error("Specify --launch, --worker-id, --monitor-only or --export-only")
+    return 2
+
+
 # ============================================================
 # MAIN
 # ============================================================
 
 def main() -> int:
+
+    if "--query-config" in sys.argv:
+        return selected_main(sys.argv[1:])
+
+    if len(sys.argv) == 1:
+        log("Use START_OIC.bat to select a query; full hierarchy collection is not the default.", level="WARN")
+        return 2
 
     parser = build_parser()
 

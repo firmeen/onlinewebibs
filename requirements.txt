@@ -1,3 +1,4 @@
 requests>=2.31,<3
 textual>=0.75
 rich>=13.7
+openpyxl>=3.1,<4

@@ -97,6 +97,16 @@ class SelectedParallelTests(unittest.TestCase):
         manifest = json.loads((self.root / "worker_01" / "manifest.json").read_text())
         self.assertEqual([c["status"] for c in manifest["chunks"].values()], ["FAILED"])
 
+    def test_reused_client_referer_covers_five_categories(self):
+        for code, profile in q.PROFILES.items():
+            client = parallel.OICClient(cookie="ASP.NET_SessionId=TEST",
+                                         token="", timeout=5, max_response_mb=1,
+                                         worker_id=1, code=code)
+            try:
+                self.assertTrue(client.referer().endswith("?Class=" + profile["cls"]))
+            finally:
+                client.close()
+
     def test_stop_flag_prevents_new_requests(self):
         (self.root / "stop.flag").touch()
         with patch.object(parallel, "read_env", lambda: {"OIC_COOKIE": "test_cookie"}), \

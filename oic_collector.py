@@ -4397,6 +4397,32 @@ def launch_terminal_ui(args) -> None:
             except Exception as exc:
                 self.info(f"Cannot start collection: {exc}", "error")
 
+        def resume_selected_query(self) -> None:
+            if self.active_run is not None:
+                self.info("Finish or stop the active run before resuming.", "warning")
+                return
+            path = self.last_run_path
+            if not path or not (path / "query_config.json").is_file():
+                self.info("No previous query run to resume.", "warning")
+                return
+            if self.cookie_state != "VALID":
+                self.info("Validate the Session before resuming.", "warning")
+                return
+            (path / "stop.flag").unlink(missing_ok=True)
+            script = BASE_DIR / "oic_parallel_collector.py"
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            try:
+                subprocess.Popen([sys.executable, str(script), "--query-config",
+                                  str(path / "query_config.json"), "--launch"],
+                                 cwd=str(BASE_DIR), creationflags=flags,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.active_run = path
+                self.query_one("#start", Button).disabled = True
+                self.query_one("#stop", Button).disabled = False
+                self.info(f"Resuming {path.name}", "success")
+            except Exception as exc:
+                self.info(f"Resume failed: {exc}", "error")
+
         def poll_selected_run(self) -> None:
             if self.active_run is None:
                 return

@@ -61,6 +61,12 @@ import sys
 import threading
 import time
 import zipfile
+import uuid
+import subprocess
+import shutil
+
+from oic_query import (PROFILES as QUERY_PROFILES, load_catalog, discover_fields,
+                       default_query, validate_query, build_mdx as selected_mdx, query_hash)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -118,99 +124,12 @@ USER_AGENT = (
 # INSURANCE PROFILES
 # ============================================================
 
+# Shared multi-cube profiles, including MR's unconfirmed YEAR.
 PROFILES = {
-    "AH": {
-        "name": "อุบัติเหตุและสุขภาพ",
-        "class": "AH",
-        "catalog": "PIVOT_202609_AH",
-        "cube": "AH_AGGREGATE_FY",
-        "column": "[VW PV AH AGGREGATE FY].[FY YEAR]",
-        "row1": "[DIM MAINSUB CLASS AH].[MAIN NAME TH]",
-        "row2": "[DIM MAINSUB CLASS AH].[SUB NAME TH]",
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "EARNED",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "INMTH CLM PAID",
-            "ATMTH CLM LI",
-        ],
-    },
-    "FI": {
-        "name": "ทรัพย์สิน",
-        "class": "FI",
-        "catalog": "PIVOT_202609_FI",
-        "cube": "FI_AGGREGATE_FY",
-        "column": "[VW PV FI AGGREGATE FY].[YEAR]",
-        "row1": "[DIM CT SUBCLASS FI].[GROUP DESC TH]",
-        "row2": None,
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "EARNED PREMIUM",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "SUM CLM PAID",
-            "SUM CLM OS",
-            "SUM CLM LI",
-        ],
-    },
-    "MR": {
-        "name": "ทางทะเลและขนส่ง",
-        "class": "MR",
-        "catalog": "PIVOT_202609_MR",
-        "cube": "MR_AGGREGATE_FY",
-        "column": "[VW PV MR AGGREGATE FY].[STATUS COMPANY PASS]",
-        "row1": "[DIM CT SUBCLASS MR].[SUBCLASS DESC TH]",
-        "row2": None,
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "CLAIM PAID",
-            "CLAIM OS",
-            "CLAIM LI",
-        ],
-    },
-    "MI": {
-        "name": "เบ็ดเตล็ด",
-        "class": "MI",
-        "catalog": "PIVOT_202609_MI",
-        "cube": "MI_AGGREGATE_FY",
-        "column": "[VW PV MI AGGREGATE FY].[FY YEAR]",
-        "row1": "[DIM MAINSUB CLASS].[MAIN NAME TH]",
-        "row2": "[DIM MAINSUB CLASS].[SUB NAME TH]",
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "CLM PAID",
-            "CLM OS",
-            "CLM LI",
-        ],
-    },
-    "MV": {
-        "name": "รถยนต์",
-        "class": "MO",
-        "catalog": "PIVOT_202609_MV",
-        "cube": "MV_AGGREGATE_FY",
-        "column": "[VW PV MV AGGREGATE FY].[YEAR]",
-        "row1": "[DIM CT SUBCLASS MV].[SUBCLASS DESC TH]",
-        "row2": None,
-        "measures": [
-            "ACT POLICY CNT",
-            "ACT PREMIUM AMT",
-            "EARNED PREMIUM",
-            "ACT SUM INS AMT",
-            "CLAIM CNT",
-            "CLAIM PAID",
-            "CLAIM OS",
-            "CLAIM LI",
-        ],
-    },
+    code: dict(name=p["name"], **{"class": p["cls"]}, catalog=p["catalog"],
+               cube=p["cube"], column=p["year"] or "[VW PV MR AGGREGATE FY].[STATUS COMPANY PASS]",
+               row1=p["row1"], row2=p["row2"], measures=p["measures"])
+    for code, p in QUERY_PROFILES.items()
 }
 
 
@@ -2183,6 +2102,7 @@ def launch_terminal_ui(args) -> None:
             ProgressBar,
             RichLog,
             Static,
+            Select,
         )
 
     except ImportError as exc:
@@ -2202,6 +2122,8 @@ def launch_terminal_ui(args) -> None:
             ("ctrl+s", "stop_collection", "Stop"),
             ("ctrl+o", "open_output", "Output"),
             ("ctrl+q", "quit", "Quit"),
+            ("a", "field_to_x", "X Axis", False),
+            ("s", "field_to_y", "Y Axis", False),
         ]
 
         CSS = """
@@ -2461,6 +2383,18 @@ def launch_terminal_ui(args) -> None:
             padding: 0 1;
             background: #101a22;
         }
+
+        #categories, #table { display: none; }
+        #cube_select { width: 1fr; }
+        #designer_area { height: 1fr; min-height: 12; }
+        #field_panel { width: 1fr; padding: 0 1; }
+        #axis_panel { width: 1fr; padding: 0 1; }
+        #field_table { height: 1fr; }
+        .designer_title { height: 1; color: #c9b996; text-style: bold; }
+        .axis_bar { height: 3; }
+        .axis_bar Button { margin-right: 1; }
+        #values_list { height: 3; overflow-y: auto; }
+        #preview_text { height: 5; overflow-y: auto; color: #b9c9d2; }
         """
 
         # ====================================================
@@ -2471,6 +2405,14 @@ def launch_terminal_ui(args) -> None:
             super().__init__()
 
             self.config = {}
+            self.selected_code = "MV"
+            self.field_catalog = load_catalog("MV")
+            self.selected_field = None
+            self.field_rows = {}
+            self.axis_x = []
+            self.axis_y = []
+            self.selected_measures = []
+            self.active_run = None
 
             self.busy = False
             self.stop_event = threading.Event()
@@ -2659,6 +2601,10 @@ def launch_terminal_ui(args) -> None:
                         yield Label(
                             "INSURANCE CATEGORIES",
                             classes="input_label",
+                        )
+                        yield Select(
+                            [(code + " — " + p["name"], code) for code, p in PROFILES.items()],
+                            value="MV", allow_blank=False, id="cube_select",
                         )
 
                         with Horizontal(

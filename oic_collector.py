@@ -2644,6 +2644,32 @@ def launch_terminal_ui(args) -> None:
                         zebra_stripes=True,
                     )
 
+                # USER-SELECTED QUERY DESIGNER
+                with Horizontal(id="designer_area"):
+                    with Vertical(id="field_panel"):
+                        yield Static("FIELD EXPLORER  /  CLICK + A → X, S → Y", classes="designer_title")
+                        yield Input(placeholder="Search Thai / English / MDX...", id="field_search")
+                        yield DataTable(id="field_table", cursor_type="row", zebra_stripes=True)
+                        yield Button("REFRESH CATALOG", id="refresh_catalog")
+                    with Vertical(id="axis_panel"):
+                        yield Static("X  /  HORIZONTAL AXIS", classes="designer_title")
+                        yield Select([], allow_blank=True, id="axis_x")
+                        with Horizontal(classes="axis_bar"):
+                            yield Button("X ↑", id="x_up")
+                            yield Button("X ↓", id="x_down")
+                            yield Button("REMOVE X", id="x_remove")
+                        yield Static("Y  /  VERTICAL AXIS", classes="designer_title")
+                        yield Select([], allow_blank=True, id="axis_y")
+                        with Horizontal(classes="axis_bar"):
+                            yield Button("Y ↑", id="y_up")
+                            yield Button("Y ↓", id="y_down")
+                            yield Button("REMOVE Y", id="y_remove")
+                        yield Static("VALUES  /  CLICK MEASURES IN FIELD LIST", classes="designer_title")
+                        yield Static("", id="values_list")
+                        with Horizontal(classes="axis_bar"):
+                            yield Button("PREVIEW QUERY", id="query_preview")
+                        yield Static("Select X and Y fields.", id="preview_text")
+
                 # PROGRESS
 
                 with Vertical(id="progress_panel"):
@@ -2723,6 +2749,12 @@ def launch_terminal_ui(args) -> None:
                 "#stop",
                 Button,
             ).disabled = True
+            field_table = self.query_one("#field_table", DataTable)
+            field_table.add_column("FIELD", key="display", width=37)
+            field_table.add_column("TYPE", key="type", width=12)
+            field_table.add_column("SOURCE", key="source", width=17)
+            self.select_category("MV")
+            self.set_interval(1.0, self.poll_selected_run)
 
             # Load local configuration without making
             # any network requests.
@@ -3108,6 +3140,10 @@ def launch_terminal_ui(args) -> None:
         ) -> None:
             input_id = event.input.id
 
+            if input_id == "field_search":
+                self.refresh_field_table()
+                return
+
             if input_id == "token":
                 current = normalize_token(
                     event.value
@@ -3467,19 +3503,19 @@ def launch_terminal_ui(args) -> None:
             elif button_id == "open":
                 self.action_open_output()
 
+            elif button_id == "query_preview":
+                self.preview_selected_query()
+            elif button_id == "refresh_catalog":
+                self.refresh_catalog_worker(self.selected_code, self.token_value(), self.cookie_value())
+            elif button_id in ("x_up", "x_down", "x_remove", "y_up", "y_down", "y_remove"):
+                self.modify_axis(button_id)
+
         # ====================================================
         # SELECTED INSURANCE CLASSES
         # ====================================================
 
         def selected_codes(self) -> list[str]:
-            return [
-                code
-                for code in PROFILES
-                if self.query_one(
-                    f"#code_{code}",
-                    Checkbox,
-                ).value
-            ]
+            return [self.selected_code]
 
         # ====================================================
         # COLLECTION ACTIONS
@@ -3491,11 +3527,14 @@ def launch_terminal_ui(args) -> None:
             )
 
         def action_start_collection(self) -> None:
-            self.start_job(
-                mode="collect"
-            )
+            self.start_selected_query()
 
         def action_stop_collection(self) -> None:
+            if self.active_run is not None:
+                (self.active_run / "stop.flag").touch()
+                self.info("Stop requested; workers finish their active request.", "warning")
+                self.query_one("#status", Static).update("STOP REQUESTED")
+                return
             if not self.busy:
                 return
 

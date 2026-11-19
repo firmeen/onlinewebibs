@@ -7,6 +7,7 @@ No network traffic occurs on import or while building previews.
 from __future__ import annotations
 
 import hashlib
+import time
 import json
 import re
 from datetime import datetime, timezone
@@ -77,28 +78,43 @@ def local_name(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def unique(fields: list[dict]) -> list[dict]:
-    return list({item["mdx"]: item for item in fields}.values())
+# UI and query semantics are intentionally separate: the id is a unique display
+# item; "mdx" is only populated when its executable mapping has evidence.
+WEBFORM = "https://onlinewebibs.oic.or.th/WebForm/Dashboard/Pivot/DynamicPivotCube.aspx"
+SCHEMA_VERSION = 2
+FIELD_COLUMNS = ("DATATABLE", "DATAFIELD", "CAPTION", "DATATYPE", "SUMMARYTYPE",
+                 "FORMAT", "AREA", "CALCULATE", "GROUP_DIMENSION", "DIMENSION", "SEQ")
+CATEGORY = {"มุมมอง": "DIMENSION", "ข้อมูล": "MEASURE"}
+
+
+def field_id(code: str, record: dict) -> str:
+    identity = [code] + [record.get(k) for k in
+        ("GROUP_DIMENSION", "DIMENSION", "DATATABLE", "DATAFIELD",
+         "CAPTION", "SUMMARYTYPE", "CALCULATE", "SEQ")]
+    return hashlib.sha256(json.dumps(identity, ensure_ascii=False,
+                                      sort_keys=True).encode("utf-8")).hexdigest()[:20]
 
 
 def seeded_catalog(code: str) -> dict:
     profile = PROFILES[code]
-    dimensions = [profile["year"], profile["row1"], profile["row2"]]
     fields = []
-    for name in dimensions:
-        if not name:
-            continue
-        label = name.rsplit("[", 1)[-1].rstrip("]")
-        fields.append(dict(mdx=name, display=KNOWN_DIMENSION_NAMES.get(label, label),
-                           type="DIMENSION", source="PROFILE", status="KNOWN_PROFILE",
-                           group=name.split("].[", 1)[0][1:]))
-    for name in profile["measures"]:
-        fields.append(dict(mdx=f"[Measures].[{name}]",
-                           display=KNOWN_MEASURE_NAMES.get(name, name),
-                           type="MEASURE", source="PROFILE", status="KNOWN_PROFILE",
-                           group="Measures"))
-    return dict(code=code, catalog=profile["catalog"], cube=profile["cube"],
-                source="PROFILE", refreshed_at=None, fields=unique(fields))
+    for index, name in enumerate(filter(None, (profile["year"], profile["row1"], profile["row2"]))):
+        caption = name.rsplit("[", 1)[-1].rstrip("]")
+        fields.append(dict(id=f"profile-d-{index}-{code}", mdx=name, display=caption,
+                           caption=caption, type="DIMENSION", group_dimension="มุมมอง",
+                           dimension="", source="PROFILE", status="PROFILE",
+                           mapping_status="PROFILE", seq=index))
+    for index, name in enumerate(profile["measures"]):
+        mdx = f"[Measures].[{name}]"
+        fields.append(dict(id=f"profile-m-{index}-{code}", mdx=mdx, display=name,
+                           caption=name, type="MEASURE", group_dimension="ข้อมูล",
+                           dimension="", source="PROFILE", status="PROFILE",
+                           mapping_status="PROFILE", seq=index))
+    return dict(code=code, web_class=profile["cls"], catalog=profile["catalog"],
+                cube=profile["cube"], source="PROFILE", refreshed_at=None,
+                fields=fields, view_count=len([f for f in fields if f["type"]=="DIMENSION"]),
+                data_count=len([f for f in fields if f["type"]=="MEASURE"]),
+                errors=[])
 
 
 def cache_path(code: str) -> Path:
@@ -109,34 +125,17 @@ def load_catalog(code: str) -> dict:
     if code not in PROFILES:
         raise ValueError("Unknown insurance category")
     fallback = seeded_catalog(code)
-    # Recover previously discovered fields even if OIC is offline.
-    probe = ROOT / "output" / "xmla_expand" / code / "manifest.json"
     try:
-        previous = json.loads(probe.read_text(encoding="utf-8"))
-        for name in previous.get("discovered_hierarchies", []):
-            if not isinstance(name, str) or not IDENTIFIER.fullmatch(name):
-                continue
-            label = name.rsplit("[", 1)[-1].rstrip("]")
-            fallback["fields"].append(
-                dict(mdx=name, display=KNOWN_DIMENSION_NAMES.get(label, label),
-                     type="DIMENSION", source="PROBE", status="UNVERIFIED",
-                     group=name.split("].[", 1)[0][1:]))
-        fallback["fields"] = unique(fallback["fields"])
-        fallback["source"] = "PROBE"
-    except (OSError, ValueError, TypeError):
-        pass
-    path = cache_path(code)
-    try:
-        cached = json.loads(path.read_text(encoding="utf-8"))
+        cached = json.loads(cache_path(code).read_text(encoding="utf-8"))
         if cached.get("code") != code or cached.get("cube") != fallback["cube"]:
             return fallback
-        fields = [f for f in cached.get("fields", []) if isinstance(f, dict) and
-                  f.get("type") in ("DIMENSION", "MEASURE") and
-                  valid_identifier(f.get("mdx", ""))]
+        if not isinstance(cached.get("fields"), list) or not cached["fields"]:
+            return fallback
+        fields = [f for f in cached["fields"] if isinstance(f, dict) and
+                  f.get("type") in ("DIMENSION", "MEASURE") and f.get("id")]
         if not fields:
             return fallback
-        # Preserve profile fields if offline discovery is incomplete.
-        cached["fields"] = unique(fallback["fields"] + fields)
+        cached["fields"] = fields
         cached["source"] = "CACHE"
         return cached
     except (OSError, ValueError, TypeError):
@@ -144,92 +143,200 @@ def load_catalog(code: str) -> dict:
 
 
 def save_catalog(catalog: dict) -> None:
-    code = catalog["code"]
+    if catalog["code"] not in PROFILES or catalog["cube"] != PROFILES[catalog["code"]]["cube"]:
+        raise ValueError("Invalid cube catalog")
     CATALOG_DIR.mkdir(parents=True, exist_ok=True)
-    path = cache_path(code)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    path = cache_path(catalog["code"])
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
 
 
 def valid_identifier(value: str) -> bool:
-    return bool(IDENTIFIER.fullmatch(value) or MEASURE_IDENTIFIER.fullmatch(value))
+    return isinstance(value, str) and bool(
+        IDENTIFIER.fullmatch(value) or MEASURE_IDENTIFIER.fullmatch(value))
+
+
+def normalize_getstructure(code: str, raw: object, *, templates: list | None = None,
+                           xmla: list | None = None) -> dict:
+    """Pure parsing. CAPTION is *always* copied verbatim; never translated.
+
+    Unmapped and calculated items remain visible but cannot be executed.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("GetStructure must be a nonempty array")
+    if code not in PROFILES:
+        raise ValueError("Unknown cube category")
+    profile = PROFILES[code]
+    template_index: dict[tuple, set[str]] = {}
+    for item in templates or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("CLASS") != code or item.get("CUBE_NAME") != profile["cube"]:
+            continue
+        detail = item.get("TEMPLATE_DETAIL")
+        try:
+            detail = json.loads(detail) if isinstance(detail, str) else detail
+        except (ValueError, TypeError):
+            continue
+        for part in detail if isinstance(detail, list) else []:
+            if not isinstance(part, dict):
+                continue
+            mdx = part.get("dataField", "")
+            if not valid_identifier(mdx):
+                continue
+            label = part.get("caption", "")
+            folder = part.get("displayFolder") or ""
+            area = part.get("area", "")
+            template_index.setdefault((label, folder, area), set()).add(mdx)
+            template_index.setdefault((label, "", area), set()).add(mdx)
+    xmla_index: dict[tuple[str,str],set[str]] = {}
+    for item in xmla or []:
+        if item.get("type") in ("DIMENSION", "MEASURE") and valid_identifier(item.get("mdx", "")):
+            key = (item["type"], item.get("display") or "")
+            xmla_index.setdefault(key, set()).add(item["mdx"])
+    result = []
+    for index, row in enumerate(raw):
+        if not isinstance(row, dict) or "GROUP_DIMENSION" not in row:
+            raise ValueError(f"Invalid GetStructure row {index}")
+        group = row.get("GROUP_DIMENSION") or ""
+        kind = CATEGORY.get(group)
+        if not kind:
+            continue
+        caption = row.get("CAPTION")
+        if not isinstance(caption, str) or not caption:
+            caption = (row.get("DATAFIELD") or row.get("DATATABLE") or "(unnamed)")
+        folder = row.get("DIMENSION") or ""
+        area = "data" if kind == "MEASURE" else "row"
+        candidates = set()
+        for pos in ([area] if kind == "MEASURE" else ["row", "column", "filter"]):
+            candidates |= template_index.get((caption, folder, pos), set())
+        # A fallback by exact caption is allowed only if unambiguous. Do not
+        # manufacture identifiers from DATATABLE/DATAFIELD.
+        if not candidates:
+            for pos in ([area] if kind == "MEASURE" else ["row", "column", "filter"]):
+                candidates |= template_index.get((caption, "", pos), set())
+        if not candidates:
+            candidates = xmla_index.get((kind, caption), set()).copy()
+        candidates = {mdx for mdx in candidates if
+                      (MEASURE_IDENTIFIER.fullmatch(mdx) if kind == "MEASURE"
+                       else IDENTIFIER.fullmatch(mdx))}
+        calculation = row.get("CALCULATE")
+        summary = str(row.get("SUMMARYTYPE") or "").lower()
+        # Calculations and display transformations are visible, but must not be
+        # silently replaced with a raw base measure.
+        derived = bool(calculation) or summary not in ("", "sum")
+        mdx = next(iter(candidates)) if len(candidates) == 1 and not derived else None
+        status = ("UNSUPPORTED" if derived else "MAPPED" if mdx else "UNVERIFIED")
+        retained = {key: row.get(key) for key in FIELD_COLUMNS}
+        result.append(dict(id=field_id(code, row), mdx=mdx, display=caption,
+                           caption=caption, type=kind, group_dimension=group,
+                           dimension=folder, source="GETSTRUCTURE",
+                           status=status, mapping_status=status, seq=row.get("SEQ"),
+                           details=retained))
+    if not result:
+        raise ValueError("No usable GetStructure rows")
+    return dict(code=code, web_class=profile["cls"], cube=profile["cube"],
+                catalog=profile["catalog"], source="LIVE", refreshed_at=datetime.now(timezone.utc).isoformat(),
+                fields=result, view_count=sum(f["type"]=="DIMENSION" for f in result),
+                data_count=sum(f["type"]=="MEASURE" for f in result), errors=[])
+
+
+def parse_webform_response(response) -> list:
+    if response.status_code != 200:
+        raise ValueError(f"WebForm HTTP {response.status_code}")
+    try:
+        wrapper = response.json()
+        if not isinstance(wrapper, dict) or "d" not in wrapper:
+            raise ValueError("WebForm returned no d property")
+        payload = wrapper["d"]
+        value = json.loads(payload) if isinstance(payload, str) else payload
+        if not isinstance(value, list):
+            raise ValueError("WebForm d is not a list")
+        return value
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ValueError("Invalid WebForm JSON response") from exc
 
 
 def make_discover_request(code: str, request_type: str) -> bytes:
-    if request_type not in ("MDSCHEMA_HIERARCHIES", "MDSCHEMA_LEVELS", "MDSCHEMA_MEASURES"):
+    if request_type not in ("MDSCHEMA_DIMENSIONS", "MDSCHEMA_HIERARCHIES",
+                            "MDSCHEMA_LEVELS", "MDSCHEMA_MEASURES", "MDSCHEMA_MEMBERS"):
         raise ValueError("Unsupported XMLA Discover request")
     p = PROFILES[code]
     root = ET.Element(f"{{{SOAP_NS}}}Envelope")
     body = ET.SubElement(root, f"{{{SOAP_NS}}}Body")
     discover = ET.SubElement(body, f"{{{XMLA_NS}}}Discover")
     ET.SubElement(discover, f"{{{XMLA_NS}}}RequestType").text = request_type
-    restrict = ET.SubElement(ET.SubElement(discover, f"{{{XMLA_NS}}}Restrictions"),
-                             f"{{{XMLA_NS}}}RestrictionList")
-    ET.SubElement(restrict, f"{{{XMLA_NS}}}CATALOG_NAME").text = p["catalog"]
-    ET.SubElement(restrict, f"{{{XMLA_NS}}}CUBE_NAME").text = p["cube"]
-    props = ET.SubElement(ET.SubElement(discover, f"{{{XMLA_NS}}}Properties"),
-                          f"{{{XMLA_NS}}}PropertyList")
-    ET.SubElement(props, f"{{{XMLA_NS}}}Catalog").text = p["catalog"]
-    ET.SubElement(props, f"{{{XMLA_NS}}}LocaleIdentifier").text = "9"
+    restrictions = ET.SubElement(ET.SubElement(discover, f"{{{XMLA_NS}}}Restrictions"),
+                                f"{{{XMLA_NS}}}RestrictionList")
+    ET.SubElement(restrictions, f"{{{XMLA_NS}}}CATALOG_NAME").text = p["catalog"]
+    ET.SubElement(restrictions, f"{{{XMLA_NS}}}CUBE_NAME").text = p["cube"]
+    properties = ET.SubElement(ET.SubElement(discover, f"{{{XMLA_NS}}}Properties"),
+                               f"{{{XMLA_NS}}}PropertyList")
+    ET.SubElement(properties, f"{{{XMLA_NS}}}Catalog").text = p["catalog"]
+    ET.SubElement(properties, f"{{{XMLA_NS}}}LocaleIdentifier").text = "9"
     return ET.tostring(root, encoding="utf-8")
 
 
 def discover_fields(code: str, token: str, cookie: str, *, timeout: int = 30) -> dict:
-    """Optional explicit refresh; never called while typing or building a preview."""
+    """Explicit/live catalog refresh; GetStructure drives every visible label."""
     import requests
-    token = token.removeprefix("Bearer ").strip()
-    if not token or not cookie:
-        raise ValueError("Authorized Cookie and JWT are required for live metadata")
-    base = seeded_catalog(code)
-    fields = base["fields"]
-    headers = {
-        "Authorization": "Bearer " + token, "Cookie": cookie,
-        "Content-Type": "text/xml", "Accept": "text/plain, */*; q=0.01",
-        "Origin": "https://onlinewebibs.oic.or.th",
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": ("https://onlinewebibs.oic.or.th/WebForm/Dashboard/Pivot/"
-                    f"DynamicPivotCube.aspx?Class={PROFILES[code]['cls']}"),
-    }
+    if code not in PROFILES:
+        raise ValueError("Unknown insurance category")
+    if not cookie:
+        raise ValueError("Valid Cookie required for WebForm metadata")
+    p = PROFILES[code]
+    referer = f"{WEBFORM}?Class={p['cls']}"
+    headers = {"Content-Type": "application/json; charset=utf-8",
+               "Accept": "application/json, text/javascript, */*; q=0.01",
+               "X-Requested-With": "XMLHttpRequest",
+               "Origin": "https://onlinewebibs.oic.or.th", "Referer": referer,
+               "Cookie": cookie.removeprefix("Cookie:").strip()}
     errors = []
     with requests.Session() as session:
-        for kind in ("MDSCHEMA_HIERARCHIES", "MDSCHEMA_MEASURES", "MDSCHEMA_LEVELS"):
-            try:
-                response = session.post(PROXY_URL, data=make_discover_request(code, kind),
-                                        headers=headers, timeout=(10, timeout),
-                                        allow_redirects=False)
-                if response.status_code != 200:
-                    raise ValueError(f"{kind}: HTTP {response.status_code}")
-                root = ET.fromstring(response.content)
-                faults = [e for e in root.iter() if local_name(e.tag) == "Fault"]
-                if faults:
-                    raise ValueError(f"{kind}: SOAP Fault")
-                rows = [e for e in root.iter() if local_name(e.tag) == "row"]
-                if not rows:
-                    raise ValueError(f"{kind}: no metadata rows")
-                for row in rows:
-                    attrs = {local_name(e.tag): (e.text or "") for e in row}
-                    if kind == "MDSCHEMA_HIERARCHIES":
-                        name = attrs.get("HIERARCHY_UNIQUE_NAME", "")
-                        if valid_identifier(name) and not name.startswith("[Measures]"):
-                            fields.append(dict(mdx=name, display=attrs.get("HIERARCHY_CAPTION") or
-                                               name.rsplit("[", 1)[-1].rstrip("]"),
-                                               type="DIMENSION", group=attrs.get("DIMENSION_UNIQUE_NAME", ""),
-                                               source="XMLA_HIERARCHIES", status="DISCOVERED"))
-                    if kind == "MDSCHEMA_MEASURES":
-                        name = attrs.get("MEASURE_UNIQUE_NAME", "")
-                        if MEASURE_IDENTIFIER.fullmatch(name):
-                            fields.append(dict(mdx=name, display=attrs.get("MEASURE_CAPTION") or
-                                               name.rsplit("[", 1)[-1].rstrip("]"),
-                                               type="MEASURE", group="Measures",
-                                               source="XMLA_MEASURES", status="DISCOVERED"))
-            except (requests.RequestException, ValueError, ET.ParseError) as exc:
-                errors.append(str(exc))
-    # Metadata discovery is not proof that executing every combination will work.
-    base.update(fields=unique(fields), source="LIVE" if len(errors) < 3 else "PROFILE",
-                refreshed_at=datetime.now(timezone.utc).isoformat(), errors=errors)
-    save_catalog(base)
-    return base
+        def post_webform(method: str, payload: dict) -> list:
+            response = session.post(f"{WEBFORM}/{method}", json=payload, headers=headers,
+                                    timeout=(10, timeout), allow_redirects=False)
+            return parse_webform_response(response)
+        # Never reuse an XMLA Bearer header for ASP.NET WebForm without proof.
+        structure = post_webform("GetStructure", {"Template": [code, p["cube"]]})
+        templates = []
+        try:
+            templates = post_webform("GET_MENUTEMPLATE_LIST", {"Template": [p["cls"]]})
+        except (ValueError, requests.RequestException) as exc:
+            errors.append(f"Templates: {exc}")
+        xmla = []
+        if token:
+            xml_headers = {"Authorization": "Bearer " + token.removeprefix("Bearer ").strip(),
+                           "Content-Type": "text/xml", "Accept": "text/plain, */*; q=0.01",
+                           "Origin": "https://onlinewebibs.oic.or.th", "Referer": referer,
+                           "Cookie": headers["Cookie"]}
+            for kind in ("MDSCHEMA_HIERARCHIES", "MDSCHEMA_MEASURES"):
+                try:
+                    response = session.post(PROXY_URL, data=make_discover_request(code, kind),
+                                            headers=xml_headers, timeout=(10, timeout),
+                                            allow_redirects=False)
+                    if response.status_code != 200:
+                        raise ValueError(f"HTTP {response.status_code}")
+                    root = ET.fromstring(response.content)
+                    if any(local_name(e.tag) == "Fault" for e in root.iter()):
+                        raise ValueError("SOAP Fault")
+                    for row in root.iter():
+                        if local_name(row.tag) != "row":
+                            continue
+                        attrs = {local_name(e.tag): (e.text or "") for e in row}
+                        mdx = attrs.get("HIERARCHY_UNIQUE_NAME") if kind.endswith("HIERARCHIES") else attrs.get("MEASURE_UNIQUE_NAME")
+                        display = attrs.get("HIERARCHY_CAPTION") if kind.endswith("HIERARCHIES") else attrs.get("MEASURE_CAPTION")
+                        typ = "DIMENSION" if kind.endswith("HIERARCHIES") else "MEASURE"
+                        if valid_identifier(mdx):
+                            xmla.append(dict(mdx=mdx, display=display, type=typ))
+                except (requests.RequestException, ValueError, ET.ParseError) as exc:
+                    errors.append(f"{kind}: {exc}")
+    catalog = normalize_getstructure(code, structure, templates=templates, xmla=xmla)
+    catalog["errors"] = errors
+    catalog["source"] = "LIVE"
+    save_catalog(catalog)
+    return catalog
 
 
 def validate_query(config: dict, catalog: dict | None = None) -> dict:

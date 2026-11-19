@@ -168,7 +168,7 @@ def normalize_getstructure(code: str, raw: object, *, templates: list | None = N
     if code not in PROFILES:
         raise ValueError("Unknown cube category")
     profile = PROFILES[code]
-    template_index: dict[tuple, set[str]] = {}
+    template_index: dict[tuple, set[tuple[str, bool]]] = {}
     for item in templates or []:
         if not isinstance(item, dict):
             continue
@@ -188,8 +188,11 @@ def normalize_getstructure(code: str, raw: object, *, templates: list | None = N
             label = part.get("caption", "")
             folder = part.get("displayFolder") or ""
             area = part.get("area", "")
-            template_index.setdefault((label, folder, area), set()).add(mdx)
-            template_index.setdefault((label, "", area), set()).add(mdx)
+            # Display transformations (percent-of-total, etc.) cannot be
+            # executed as their raw Measure without changing the meaning.
+            value = (mdx, bool(part.get("summaryDisplayMode")))
+            template_index.setdefault((label, folder, area), set()).add(value)
+            template_index.setdefault((label, "", area), set()).add(value)
     xmla_index: dict[tuple[str,str],set[str]] = {}
     for item in xmla or []:
         if item.get("type") in ("DIMENSION", "MEASURE") and valid_identifier(item.get("mdx", "")):
@@ -217,15 +220,16 @@ def normalize_getstructure(code: str, raw: object, *, templates: list | None = N
             for pos in ([area] if kind == "MEASURE" else ["row", "column", "filter"]):
                 candidates |= template_index.get((caption, "", pos), set())
         if not candidates:
-            candidates = xmla_index.get((kind, caption), set()).copy()
-        candidates = {mdx for mdx in candidates if
+            candidates = {(name, False) for name in xmla_index.get((kind, caption), set())}
+        transformations_only = bool(candidates) and all(derived for _, derived in candidates)
+        candidates = {mdx for mdx, mode in candidates if not mode and
                       (MEASURE_IDENTIFIER.fullmatch(mdx) if kind == "MEASURE"
                        else IDENTIFIER.fullmatch(mdx))}
         calculation = row.get("CALCULATE")
         summary = str(row.get("SUMMARYTYPE") or "").lower()
-        # Calculations and display transformations are visible, but must not be
-        # silently replaced with a raw base measure.
-        derived = bool(calculation) or summary not in ("", "sum")
+        # Calculations and display transformations cannot be replaced with
+        # their raw base measure; this would silently export wrong results.
+        derived = bool(calculation) or summary not in ("", "sum") or transformations_only
         mdx = next(iter(candidates)) if len(candidates) == 1 and not derived else None
         status = ("UNSUPPORTED" if derived else "MAPPED" if mdx else "UNVERIFIED")
         retained = {key: row.get(key) for key in FIELD_COLUMNS}

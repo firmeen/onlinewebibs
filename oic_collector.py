@@ -4620,7 +4620,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
     class OICQueryDesigner(App):
         TITLE = "OIC | Query Designer"
-        SUB_TITLE = "Five-Cube FY Field Catalog"
+        SUB_TITLE = "AH / FI / MR / MI / MV | FY / UY / AY"
         BINDINGS = [
             Binding("a", "field_to_x", "X / ROWS", show=False),
             Binding("s", "field_to_y", "Y / COLUMNS", show=False),
@@ -4658,6 +4658,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         #designer_header Select {
             width: 1fr;
         }
+        #designer_cube { width: 15; }
 
         #designer_status {
             width: 2fr;
@@ -4766,6 +4767,8 @@ def launch_terminal_ui(args, return_app: bool = False):
         #designer_footer Button {
             margin-right: 1;
         }
+        #duplicate_confirm { background: #665334; }
+        #duplicate_cancel { background: #633d40; }
 
         Button {
             background: #2c4c5d;
@@ -4786,11 +4789,14 @@ def launch_terminal_ui(args, return_app: bool = False):
             super().__init__()
             self.code = args.category if args.category in QUERY_PROFILES else "MV"
             self.selection_path = Path(args.selection_file).resolve()
-            self.catalog = load_catalog(self.code)
+            self.cube_type = "FY"
+            self.catalog = load_catalog(self.code, self.cube_type)
             self.fields = {}
             self.chosen = {"x": [], "y": [], "measures": []}
             self.by_category = {}
             self.highlighted_id = None
+            self.pending_duplicate = None
+            self._changing_cube = False
 
         def compose(self) -> ComposeResult:
             from textual.widgets import OptionList
@@ -4814,6 +4820,12 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="designer_category",
                     )
 
+                    yield Select(
+                        [(f"{kind} / {status}", kind)
+                         for kind, status in cube_options(self.code)],
+                        value=self.cube_type, allow_blank=False,
+                        id="designer_cube",
+                    )
                     yield Static(
                         "CATALOG: CACHE",
                         id="designer_status",
@@ -4969,7 +4981,15 @@ def launch_terminal_ui(args, return_app: bool = False):
                     )
 
                     yield Button(
-                        "CANCEL",
+                        "ADD ANYWAY",
+                        id="duplicate_confirm",
+                    )
+                    yield Button(
+                        "CANCEL DUPLICATE",
+                        id="duplicate_cancel",
+                    )
+                    yield Button(
+                        "CLOSE DESIGNER",
                         id="designer_cancel",
                     )
 
@@ -4979,8 +4999,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.selection_path.parent.mkdir(parents=True, exist_ok=True)
             self.selection_path.with_suffix(".lock").write_text(
                 str(os.getpid()), encoding="ascii")
+            self.query_one("#duplicate_confirm", Button).display = False
+            self.query_one("#duplicate_cancel", Button).display = False
             self._restore_previous_selection()
-            self.update_catalog(self.code)
+            self.update_catalog(self.code, self.cube_type)
 
         def on_unmount(self) -> None:
             lock = self.selection_path.with_suffix(".lock")
@@ -4993,45 +5015,91 @@ def launch_terminal_ui(args, return_app: bool = False):
         def _restore_previous_selection(self) -> None:
             try:
                 envelope = json.loads(self.selection_path.read_text(encoding="utf-8"))
-                previous = validate_query(envelope["query"])
+                items = envelope.get("queries", [])
+                if not items:
+                    return
+                previous = validate_query(items[-1]["query"])
                 if int(previous.get("schema_version", 1)) != SCHEMA_VERSION:
                     return
-                ids = previous["selection_ids"]
-                self.by_category[previous["code"]] = {
-                    key: list(ids.get(key, [])) for key in self.chosen
+                self.code = previous["code"]
+                self.cube_type = previous.get("cube_type", "FY")
+                self.by_category[(self.code, self.cube_type)] = {
+                    axis: list(previous["selection_ids"].get(axis, []))
+                    for axis in self.chosen
                 }
+                self._changing_cube = True
+                self.query_one("#designer_category", Select).value = self.code
+                control = self.query_one("#designer_cube", Select)
+                control.set_options([(f"{kind} / {status}", kind)
+                                     for kind, status in cube_options(self.code)])
+                control.value = self.cube_type
+                self._changing_cube = False
                 for name, key in (("workers", "designer_workers"),
                                   ("x_chunk", "designer_x_chunk"),
                                   ("y_chunk", "designer_y_chunk")):
                     self.query_one("#" + key, Input).value = str(previous[name])
             except (OSError, ValueError, TypeError, KeyError):
-                pass
+                self._changing_cube = False
 
-        def update_catalog(self, code: str) -> None:
+        def update_catalog(self, code: str, cube_type: str | None = None) -> None:
             self.code = code
-            self.catalog = load_catalog(code)
+            self.cube_type = cube_type or self.cube_type
+            self.catalog = load_catalog(code, self.cube_type)
             self.fields = {field["id"]: field for field in self.catalog["fields"]}
-            previous = self.by_category.get(code, {})
-            self.chosen = {axis: [item for item in previous.get(axis, [])
-                                  if item in self.fields and
-                                  self.fields[item].get("status") in ("MAPPED", "VERIFIED")]
-                           for axis in ("x", "y", "measures")}
+            previous = self.by_category.get((code, self.cube_type), {})
+            self.chosen = {
+                axis: [item for item in previous.get(axis, [])
+                       if item in self.fields and
+                       self.fields[item].get("status") in ("MAPPED", "VERIFIED")]
+                for axis in ("x", "y", "measures")
+            }
             self.highlighted_id = None
             self.refresh_tree()
             self.refresh_layout()
+            availability = cube_status(code, self.cube_type)["status"]
             self.query_one("#designer_status", Static).update(
-                f"CATALOG {code}: {self.catalog.get('view_count', 0)} views / "
-                f"{self.catalog.get('data_count', 0)} data  ·  {self.catalog['source']}"
-            )
+                f"CATALOG {code}/{self.cube_type}: {availability} | "
+                f"{self.catalog.get('view_count', 0)} views / "
+                f"{self.catalog.get('data_count', 0)} measures "
+                f"({self.catalog['source']})")
 
         def on_select_changed(self, event: Select.Changed) -> None:
-            if event.select.id != "designer_category":
+            if self._changing_cube:
                 return
-            code = event.value
-            if code in QUERY_PROFILES and code != self.code:
-                self.by_category[self.code] = {
-                    key: list(value) for key, value in self.chosen.items()}
-                self.update_catalog(str(code))
+            if event.select.id not in ("designer_category", "designer_cube"):
+                return
+            next_code = (str(event.value) if event.select.id == "designer_category"
+                         else self.code)
+            next_type = (str(event.value) if event.select.id == "designer_cube"
+                         else "FY" if next_code != self.code else self.cube_type)
+            if next_code not in QUERY_PROFILES or next_type not in CUBE_TYPES:
+                return
+            if (next_code, next_type) == (self.code, self.cube_type):
+                return
+            self.by_category[(self.code, self.cube_type)] = {
+                axis: list(value) for axis, value in self.chosen.items()
+            }
+            if next_code != self.code:
+                self._changing_cube = True
+                select = self.query_one("#designer_cube", Select)
+                select.set_options([(f"{kind} / {status}", kind)
+                                    for kind, status in cube_options(next_code)])
+                select.value = next_type
+                self._changing_cube = False
+            self.update_catalog(next_code, next_type)
+            self.cancel_duplicate()
+
+        @work(thread=True, group="designer-discovery", exclusive=True)
+        def refresh_catalog_worker(self) -> None:
+            code, cube_type = self.code, self.cube_type
+            env = read_env()
+            try:
+                result = discover_fields(code, env.get("OIC_BEARER_TOKEN", ""),
+                                         env.get("OIC_COOKIE", ""),
+                                         cube_type=cube_type)
+                self.call_from_thread(self.catalog_refreshed, code, cube_type, result, None)
+            except Exception as exc:
+                self.call_from_thread(self.catalog_refreshed, code, cube_type, None, str(exc)[:200])
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "catalog_search":
@@ -5149,7 +5217,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             else:
                 self.query_one("#field_description", Static).update(
                     f"{field['caption']} · {field.get('status')} · "
-                    "A → X/ROWS   S → Y/COLUMNS"
+                    f"{field.get('mapping_reason', 'Select A=ROWS / S=COLUMNS')}"
                 )
 
         def action_field_to_x(self) -> None:
@@ -5184,7 +5252,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             ):
                 self.show_error(
                     f"{field['caption']}: "
-                    f"mapping not available ({field.get('status')})"
+                    f"mapping not available ({field.get('status')}): "
+                    f"{field.get('mapping_reason', 'No verified MDX identifier')}"
                 )
                 return
 
@@ -5243,7 +5312,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             ):
                 self.show_error(
                     f"{field['caption']}: "
-                    f"{field.get('status')} — selection disabled"
+                    f"{field.get('status')} — "
+                    f"{field.get('mapping_reason', 'mapping not verified')}"
                 )
                 return
 
@@ -5300,7 +5370,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             if current_ids == items:
                 return
 
-            widget.set_options(
+            widget.clear_options()
+            widget.add_options(
                 [
                     Option(
                         f"{index + 1}. "
@@ -5399,7 +5470,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 select_id=target,
             )
         def build_query(self) -> dict:
-            profile = QUERY_PROFILES[self.code]
+            profile = cube_profile(self.code, self.cube_type)
 
             selections = {
                 axis: list(self.chosen[axis])
@@ -5451,6 +5522,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             config = {
                 "schema_version": SCHEMA_VERSION,
                 "code": self.code,
+                "cube_type": self.cube_type,
                 "cube": profile["cube"],
                 "catalog": profile["catalog"],
                 "x": [
@@ -5498,7 +5570,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     "#designer_preview",
                     Static,
                 ).update(
-                    f"CODE: {query['code']} / {query['cube']}\n"
+                    f"CODE: {query['code']} / {query.get('cube_type', 'FY')} / {query['cube']}\n"
                     f"X ROWS (Axis1): {len(query['x'])}   "
                     f"Y COLUMNS (Axis0): {len(query['y'])}   "
                     f"VALUES: {len(query['measures'])}\n"
@@ -5516,60 +5588,91 @@ def launch_terminal_ui(args, return_app: bool = False):
         def show_error(self, message: str) -> None:
             self.query_one("#designer_preview", Static).update("VALIDATION: " + message[:450])
 
-        def apply_selection(self) -> None:
+        def cancel_duplicate(self) -> None:
+            self.pending_duplicate = None
+            self.query_one("#duplicate_confirm", Button).display = False
+            self.query_one("#duplicate_cancel", Button).display = False
+
+        def apply_selection(self, force_duplicate: bool = False) -> None:
             try:
+                from oic_parallel_collector import build_selected_task_plan
                 config = self.build_query()
-
-                envelope = {
-                    "revision": uuid.uuid4().hex,
-                    "query": config,
+                selection = self.selection_path
+                try:
+                    envelope = json.loads(selection.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    envelope = {"revision": None, "queries": []}
+                entries = list(envelope.get("queries", []))
+                if not isinstance(entries, list):
+                    raise ValueError("Invalid applied query file")
+                identity = {
+                    key: config.get(key)
+                    for key in ("code", "cube", "x", "y", "measures", "filters")
                 }
-
-                self.selection_path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                temp = self.selection_path.with_suffix(".tmp")
-
-                temp.write_text(
-                    json.dumps(
-                        envelope,
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-
-                temp.replace(self.selection_path)
-
-                saved = json.loads(
-                    self.selection_path.read_text(
-                        encoding="utf-8",
-                    )
-                )
-
-                if saved["revision"] != envelope["revision"]:
-                    raise RuntimeError(
-                        "Saved selection revision mismatch"
-                    )
-
-                validate_query(saved["query"])
-
-                self.exit()
-
+                fingerprint = json.dumps(identity, ensure_ascii=False, sort_keys=True)
+                duplicate = next((item for item in entries if
+                                  json.dumps({
+                                      key: item["query"].get(key)
+                                      for key in identity
+                                  }, ensure_ascii=False, sort_keys=True) == fingerprint),
+                                 None)
+                if duplicate and not force_duplicate:
+                    self.pending_duplicate = fingerprint
+                    self.query_one("#duplicate_confirm", Button).display = True
+                    self.query_one("#duplicate_cancel", Button).display = True
+                    self.show_error(
+                        f"DUPLICATE: {duplicate['query_id']} has the same category, cube, "
+                        "axes, measures and filters. ADD ANYWAY or CANCEL DUPLICATE.")
+                    return
+                if duplicate and force_duplicate and self.pending_duplicate != fingerprint:
+                    self.cancel_duplicate()
+                    self.show_error("Query changed after duplicate warning. Press APPLY again.")
+                    return
+                next_id = max((int(item["query_id"][1:])
+                               for item in entries
+                               if str(item.get("query_id", "")).startswith("Q")
+                               and str(item["query_id"])[1:].isdigit()), default=0) + 1
+                config["query_id"] = f"Q{next_id:03d}"
+                plan = build_selected_task_plan(config)
+                entry = {
+                    "query_id": config["query_id"],
+                    "query": config,
+                    "task_plan": plan,
+                    "applied_at": datetime.now(timezone.utc).isoformat(),
+                }
+                entries.append(entry)
+                saved = {"revision": uuid.uuid4().hex, "queries": entries}
+                selection.parent.mkdir(parents=True, exist_ok=True)
+                temp = selection.with_name(selection.name + "." + uuid.uuid4().hex + ".tmp")
+                temp.write_text(json.dumps(saved, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+                temp.replace(selection)
+                self.cancel_duplicate()
+                self.query_one("#designer_preview", Static).update(
+                    f"APPLIED {entry['query_id']} / {config['code']}/{config.get('cube_type','FY')} "
+                    f"/ {config['cube']}\n"
+                    f"Prepared {len(plan['assignments'])} worker allocations. "
+                    "Task count is DYNAMIC until member discovery.\n"
+                    f"APPLIED QUERIES: {len(entries)}. Designer remains open.")
             except Exception as exc:
-                self.show_error(
-                    f"APPLY FAILED: {type(exc).__name__}: {exc}"
-                )
+                self.show_error(f"APPLY FAILED: {type(exc).__name__}: {exc}")
 
-        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
+        def catalog_refreshed(self, code: str, cube_type: str,
+                              catalog: dict | None, error: str | None):
             if error:
-                self.show_error("Catalog refresh failed; existing cache kept: " + error)
-            elif code == self.code:
-                previous = {k: list(v) for k, v in self.chosen.items()}
-                self.by_category[code] = previous
-                self.update_catalog(code)
+                self.show_error("Catalog refresh failed; cache kept: " + error)
+                return
+            if code == self.code and cube_type == self.cube_type:
+                self.by_category[(code, cube_type)] = {
+                    axis: list(v) for axis, v in self.chosen.items()
+                }
+                self._changing_cube = True
+                control = self.query_one("#designer_cube", Select)
+                control.set_options([(f"{kind} / {status}", kind)
+                                     for kind, status in cube_options(code)])
+                control.value = cube_type
+                self._changing_cube = False
+                self.update_catalog(code, cube_type)
 
         def action_cancel(self) -> None:
             self.exit()
@@ -5611,6 +5714,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             elif operation == "designer_apply":
                 self.apply_selection()
 
+            elif operation == "duplicate_confirm":
+                self.apply_selection(force_duplicate=True)
+            elif operation == "duplicate_cancel":
+                self.cancel_duplicate()
             elif operation == "designer_cancel":
                 self.action_cancel()
 

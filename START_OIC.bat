@@ -18,15 +18,18 @@ if not exist "oic_collector.py" (
 )
 
 REM --------------------------------------------------
-REM Open Windows Terminal in fullscreen
+REM Launch the main UI in maximized PowerShell (never Windows Terminal)
 REM --------------------------------------------------
 
 if /I not "%~1"=="--inside" (
-    where wt.exe >nul 2>&1
-    if not errorlevel 1 (
-        wt.exe -w new --fullscreen -d "%CD%" cmd.exe /c "call ""%~f0"" --inside"
-        if not errorlevel 1 exit /b 0
+    where powershell.exe >nul 2>&1
+    if errorlevel 1 (
+        echo [ERROR] Windows PowerShell is required.
+        pause
+        exit /b 1
     )
+    powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$bat = ('%~f0').Replace([string][char]39, ([string][char]39 + [char]39)); $script = '& ' + [char]39 + $bat + [char]39 + ' --inside'; $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)); Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList ('-NoLogo -NoProfile -NoExit -EncodedCommand ' + $enc) -WorkingDirectory '%CD%' -WindowStyle Maximized"
+    exit /b %ERRORLEVEL%
 )
 
 REM --------------------------------------------------

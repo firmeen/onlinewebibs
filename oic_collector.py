@@ -4698,6 +4698,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.show_error("The hierarchy is already selected under another display item")
                 return
             self.chosen[axis].append(item)
+            # When accounting YEAR is placed on Columns, paginate one year
+            # per request unless the user already customized that chunk size.
+            if (axis == "y" and field["mdx"] == QUERY_PROFILES[self.code].get("year")
+                    and self.query_one("#designer_y_chunk", Input).value == "20"):
+                self.query_one("#designer_y_chunk", Input).value = "1"
             self.refresh_tree()
             self.refresh_layout()
 

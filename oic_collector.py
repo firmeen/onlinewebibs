@@ -2151,6 +2151,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         #workspace {
             height: 1fr;
             padding: 0 2 1 2;
+            overflow-y: auto;
         }
 
         #brand {
@@ -5707,9 +5708,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                     envelope = json.loads(selection.read_text(encoding="utf-8"))
                 except FileNotFoundError:
                     envelope = {"revision": None, "queries": []}
-                entries = list(envelope.get("queries", []))
-                if not isinstance(entries, list):
+                raw_entries = envelope.get("queries", [])
+                if not isinstance(raw_entries, list):
                     raise ValueError("Invalid applied query file")
+                entries = list(raw_entries)
                 identity = {
                     key: config.get(key)
                     for key in ("code", "cube", "x", "y", "measures", "filters")

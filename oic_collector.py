@@ -4514,41 +4514,162 @@ def launch_terminal_ui(args, return_app: bool = False):
         BINDINGS = [
             Binding("a", "field_to_x", "X / ROWS", show=False),
             Binding("s", "field_to_y", "Y / COLUMNS", show=False),
+            Binding("d", "field_to_values", "VALUES", show=False),
             Binding("escape", "cancel", "Cancel", show=True),
         ]
+
         CSS = """
-        Screen { background: #0d141b; color: #dce5e9; }
-        Header, Footer { background: #17232e; }
-        #designer_root { height: 1fr; padding: 0 2 1 2; }
-        #designer_title { height: 3; background: #17232e; padding: 1 2;
-                          color: #c9b996; text-style: bold; }
-        #designer_header { height: 3; }
-        #designer_header Select { width: 1fr; }
-        #designer_status { width: 2fr; padding: 0 1; }
-        #designer_panels { height: 1fr; min-height: 15; }
-        #catalog_left { width: 1fr; margin-right: 1; padding: 0 1;
-                        border: solid #304352; background: #111c25; }
-        #query_right { width: 1fr; padding: 0 1;
-                       border: solid #304352; background: #111c25; }
-        #catalog_search { height: 3; }
-        #catalog_tree { height: 1fr; overflow-y: auto; }
-        #field_description { height: 3; color: #a8bac6; }
-        .designer_section { height: 1; color: #c9b996; text-style: bold; }
-        .designer_axis { height: 3; }
-        .designer_axis Select { width: 1fr; }
-        .designer_axis Button { min-width: 6; margin-left: 1; }
-        #designer_add_controls { height: 3; }
-        #designer_add_controls Button { margin-right: 1; }
-        #designer_preview { height: 1fr; min-height: 5;
-                            overflow-y: auto; color: #b7c9d4; }
-        #designer_settings { height: 3; }
-        #designer_settings Input { width: 1fr; }
-        #designer_settings Label { width: auto; padding: 1 1; }
-        #designer_footer { height: 3; }
-        #designer_footer Button { margin-right: 1; }
-        Button { background: #2c4c5d; color: #e6ebed; }
-        Button:focus { background: #416778; }
-        Input { background: #16232e; color: #e5ebed; }
+        Screen {
+            background: #0d141b;
+            color: #dce5e9;
+        }
+
+        Header, Footer {
+            background: #17232e;
+        }
+
+        #designer_root {
+            height: 1fr;
+            padding: 0 2 1 2;
+        }
+
+        #designer_title {
+            height: 3;
+            background: #17232e;
+            padding: 1 2;
+            color: #c9b996;
+            text-style: bold;
+        }
+
+        #designer_header {
+            height: 3;
+        }
+
+        #designer_header Select {
+            width: 1fr;
+        }
+
+        #designer_status {
+            width: 2fr;
+            padding: 0 1;
+        }
+
+        #designer_panels {
+            height: 1fr;
+            min-height: 15;
+        }
+
+        #catalog_left {
+            width: 1fr;
+            margin-right: 1;
+            padding: 0 1;
+            border: solid #304352;
+            background: #111c25;
+        }
+
+        #query_right {
+            width: 1fr;
+            padding: 0 1;
+            border: solid #304352;
+            background: #111c25;
+        }
+
+        #catalog_search {
+            height: 3;
+        }
+
+        #catalog_tree {
+            height: 1fr;
+            overflow-y: auto;
+        }
+
+        #field_description {
+            height: 3;
+            color: #a8bac6;
+        }
+
+        .designer_section {
+            height: 1;
+            color: #c9b996;
+            text-style: bold;
+        }
+
+        .designer_axis {
+            height: 1fr;
+            min-height: 4;
+            margin-bottom: 1;
+        }
+
+        .designer_axis OptionList {
+            width: 1fr;
+            height: 1fr;
+            border: solid #304352;
+            background: #13202b;
+        }
+
+        .designer_axis_actions {
+            width: 7;
+            height: 1fr;
+            margin-left: 1;
+        }
+
+        .designer_axis_actions Button {
+            width: 7;
+            min-width: 7;
+            height: 2;
+            min-height: 2;
+        }
+
+        #designer_add_controls {
+            height: 3;
+        }
+
+        #designer_add_controls Button {
+            min-width: 8;
+            margin-right: 1;
+        }
+
+        #designer_preview {
+            height: 5;
+            min-height: 3;
+            overflow-y: auto;
+            color: #b7c9d4;
+        }
+
+        #designer_settings {
+            height: 3;
+        }
+
+        #designer_settings Input {
+            width: 1fr;
+        }
+
+        #designer_settings Label {
+            width: auto;
+            padding: 1 1;
+        }
+
+        #designer_footer {
+            height: 3;
+        }
+
+        #designer_footer Button {
+            margin-right: 1;
+        }
+
+        Button {
+            background: #2c4c5d;
+            color: #e6ebed;
+        }
+
+        Button:focus {
+            background: #416778;
+        }
+
+        Input {
+            background: #16232e;
+            color: #e5ebed;
+        }
         """
 
         def __init__(self):
@@ -4562,61 +4683,186 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.highlighted_id = None
 
         def compose(self) -> ComposeResult:
+            from textual.widgets import OptionList
+
             yield Header(show_clock=True)
+
             with Vertical(id="designer_root"):
-                yield Static("OIC QUERY DESIGNER   /   X = ROWS   •   Y = COLUMNS",
-                             id="designer_title")
+                yield Static(
+                    "OIC QUERY DESIGNER   /   X = ROWS   •   Y = COLUMNS",
+                    id="designer_title",
+                )
+
                 with Horizontal(id="designer_header"):
-                    yield Select([(f"{code} — {p['name']}", code)
-                                  for code, p in QUERY_PROFILES.items()],
-                                 value=self.code, allow_blank=False,
-                                 id="designer_category")
-                    yield Static("CATALOG: CACHE", id="designer_status")
+                    yield Select(
+                        [
+                            (f"{code} — {profile['name']}", code)
+                            for code, profile in QUERY_PROFILES.items()
+                        ],
+                        value=self.code,
+                        allow_blank=False,
+                        id="designer_category",
+                    )
+
+                    yield Static(
+                        "CATALOG: CACHE",
+                        id="designer_status",
+                    )
+
                 with Horizontal(id="designer_panels"):
+
                     with Vertical(id="catalog_left"):
-                        yield Static("FIELD EXPLORER  /  OIC CAPTION", classes="designer_section")
-                        yield Input(placeholder="Search CAPTION / GROUP / DATAFIELD / MDX",
-                                    id="catalog_search")
-                        yield Tree("OIC FIELD CATALOG", id="catalog_tree")
-                        yield Static("Click a view → A (Rows) / S (Columns). "
-                                     "Click data to toggle Values.", id="field_description")
+                        yield Static(
+                            "FIELD EXPLORER / OIC CAPTION",
+                            classes="designer_section",
+                        )
+
+                        yield Input(
+                            placeholder="Search CAPTION / GROUP / DATAFIELD / MDX",
+                            id="catalog_search",
+                        )
+
+                        yield Tree(
+                            "OIC FIELD CATALOG",
+                            id="catalog_tree",
+                        )
+
+                        yield Static(
+                            "A = ROWS / S = COLUMNS / D = VALUES",
+                            id="field_description",
+                        )
+
                         with Horizontal(id="designer_add_controls"):
-                            yield Button("+ X / ROWS", id="add_to_x")
-                            yield Button("+ Y / COLUMNS", id="add_to_y")
-                            yield Button("RELOAD CATALOG", id="reload_designer_catalog")
+                            yield Button(
+                                "+ X",
+                                id="add_to_x",
+                            )
+
+                            yield Button(
+                                "+ Y",
+                                id="add_to_y",
+                            )
+
+                            yield Button(
+                                "+ VALUES",
+                                id="add_to_values",
+                            )
+
+                            yield Button(
+                                "RELOAD",
+                                id="reload_designer_catalog",
+                            )
+
                     with Vertical(id="query_right"):
-                        yield Static("X / ROWS  (Axis1)", classes="designer_section")
+
+                        yield Static(
+                            "X / ROWS (Axis1)",
+                            classes="designer_section",
+                        )
+
                         with Horizontal(classes="designer_axis"):
-                            yield Select([], allow_blank=True, id="designer_x")
-                            yield Button("↑", id="x_up")
-                            yield Button("↓", id="x_down")
-                            yield Button("×", id="x_remove")
-                        yield Static("Y / COLUMNS  (Axis0)", classes="designer_section")
+                            yield OptionList(
+                                id="designer_x",
+                                compact=True,
+                                markup=False,
+                            )
+
+                            with Vertical(classes="designer_axis_actions"):
+                                yield Button("↑", id="x_up")
+                                yield Button("↓", id="x_down")
+                                yield Button("×", id="x_remove")
+
+                        yield Static(
+                            "Y / COLUMNS (Axis0)",
+                            classes="designer_section",
+                        )
+
                         with Horizontal(classes="designer_axis"):
-                            yield Select([], allow_blank=True, id="designer_y")
-                            yield Button("↑", id="y_up")
-                            yield Button("↓", id="y_down")
-                            yield Button("×", id="y_remove")
-                        yield Static("VALUES / MEASURES", classes="designer_section")
+                            yield OptionList(
+                                id="designer_y",
+                                compact=True,
+                                markup=False,
+                            )
+
+                            with Vertical(classes="designer_axis_actions"):
+                                yield Button("↑", id="y_up")
+                                yield Button("↓", id="y_down")
+                                yield Button("×", id="y_remove")
+
+                        yield Static(
+                            "VALUES / MEASURES",
+                            classes="designer_section",
+                        )
+
                         with Horizontal(classes="designer_axis"):
-                            yield Select([], allow_blank=True, id="designer_values")
-                            yield Button("REMOVE", id="value_remove")
-                        yield Static("FILTERS: Not supported without validated mappings",
-                                     classes="designer_section")
+                            yield OptionList(
+                                id="designer_values",
+                                compact=True,
+                                markup=False,
+                            )
+
+                            with Vertical(classes="designer_axis_actions"):
+                                yield Button("↑", id="value_up")
+                                yield Button("↓", id="value_down")
+                                yield Button("×", id="value_remove")
+
+                        yield Static(
+                            "FILTERS: Not supported without validated mappings",
+                            classes="designer_section",
+                        )
+
                         with Horizontal(id="designer_settings"):
                             yield Label("WORKERS")
-                            yield Input(value="4", id="designer_workers", type="integer")
+
+                            yield Input(
+                                value="4",
+                                id="designer_workers",
+                                type="integer",
+                            )
+
                             yield Label("X CHUNK")
-                            yield Input(value="1", id="designer_x_chunk", type="integer")
+
+                            yield Input(
+                                value="1",
+                                id="designer_x_chunk",
+                                type="integer",
+                            )
+
                             yield Label("Y CHUNK")
-                            yield Input(value="20", id="designer_y_chunk", type="integer")
-                        yield Static("QUERY PREVIEW / LOCAL ONLY", classes="designer_section")
-                        yield Static("Choose mapped fields, then Preview.",
-                                     id="designer_preview")
+
+                            yield Input(
+                                value="20",
+                                id="designer_y_chunk",
+                                type="integer",
+                            )
+
+                        yield Static(
+                            "QUERY PREVIEW / LOCAL ONLY",
+                            classes="designer_section",
+                        )
+
+                        yield Static(
+                            "Choose mapped fields, then Preview.",
+                            id="designer_preview",
+                        )
+
                 with Horizontal(id="designer_footer"):
-                    yield Button("PREVIEW", id="designer_preview_button")
-                    yield Button("APPLY SELECTION", id="designer_apply", variant="success")
-                    yield Button("CANCEL", id="designer_cancel")
+                    yield Button(
+                        "PREVIEW",
+                        id="designer_preview_button",
+                    )
+
+                    yield Button(
+                        "APPLY SELECTION",
+                        id="designer_apply",
+                        variant="success",
+                    )
+
+                    yield Button(
+                        "CANCEL",
+                        id="designer_cancel",
+                    )
+
             yield Footer()
 
         def on_mount(self) -> None:
@@ -4682,42 +4928,98 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.refresh_tree()
 
         def refresh_tree(self) -> None:
-            search = self.query_one("#catalog_search", Input).value.casefold().strip()
+            search = (
+                self.query_one("#catalog_search", Input)
+                .value.casefold()
+                .strip()
+            )
+
             tree = self.query_one("#catalog_tree", Tree)
+
             tree.root.remove_children()
+
             groups = {}
             folders = {}
             visible = 0
+
             for field in self.catalog["fields"]:
-                caption = field.get("caption", field.get("display", ""))
-                terms = " ".join(str(field.get(k) or "") for k in
-                                 ("caption", "group_dimension", "dimension", "mdx"))
-                terms += " " + " ".join(str(field.get("details", {}).get(k) or "")
-                                         for k in ("DATAFIELD", "DATATABLE"))
+                caption = field.get(
+                    "caption",
+                    field.get("display", ""),
+                )
+
+                terms = " ".join(
+                    str(field.get(key) or "")
+                    for key in (
+                        "caption",
+                        "group_dimension",
+                        "dimension",
+                        "mdx",
+                    )
+                )
+
+                terms += " " + " ".join(
+                    str(field.get("details", {}).get(key) or "")
+                    for key in (
+                        "DATAFIELD",
+                        "DATATABLE",
+                    )
+                )
+
                 if search and search not in terms.casefold():
                     continue
+
                 group = field.get("group_dimension") or (
-                    "ข้อมูล" if field["type"] == "MEASURE" else "มุมมอง")
+                    "ข้อมูล"
+                    if field["type"] == "MEASURE"
+                    else "มุมมอง"
+                )
+
                 if group not in groups:
-                    groups[group] = tree.root.add(group, expand=True)
+                    groups[group] = tree.root.add(
+                        group,
+                        expand=True,
+                    )
+
                 parent = groups[group]
                 folder = field.get("dimension") or ""
+
                 if folder:
                     folder_key = (group, folder)
+
                     if folder_key not in folders:
-                        folders[folder_key] = parent.add(folder, expand=True)
+                        folders[folder_key] = parent.add(
+                            folder,
+                            expand=True,
+                        )
+
                     parent = folders[folder_key]
-                mark = ("[X] " if field["id"] in self.chosen["x"] else
-                        "[Y] " if field["id"] in self.chosen["y"] else
-                        "[✓] " if field["id"] in self.chosen["measures"] else "")
-                disabled = "  [UNSUPPORTED]" if field.get("status") == "UNSUPPORTED" else (
-                    "  [UNVERIFIED]" if field.get("status") not in ("MAPPED", "VERIFIED") else "")
-                parent.add_leaf(mark + caption + disabled, data=field["id"])
+
+                status = field.get("status")
+
+                if status == "UNSUPPORTED":
+                    suffix = "  [UNSUPPORTED]"
+                elif status not in ("MAPPED", "VERIFIED"):
+                    suffix = "  [UNVERIFIED]"
+                else:
+                    suffix = ""
+
+                parent.add_leaf(
+                    caption + suffix,
+                    data=field["id"],
+                )
+
                 visible += 1
+
             tree.root.expand()
-            self.query_one("#field_description", Static).update(
-                f"{visible} visible / {len(self.catalog['fields'])} total · "
-                "Click a view + A/S or click data to select Values"
+
+            self.query_one(
+                "#field_description",
+                Static,
+            ).update(
+                f"{visible} visible / "
+                f"{len(self.catalog['fields'])} total"
+                " · A = ROWS / S = COLUMNS / D = VALUES"
             )
 
         def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
@@ -4746,110 +5048,360 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_field_to_y(self) -> None:
             self.move_field("y")
 
+        def action_field_to_values(self) -> None:
+            if isinstance(self.focused, Input):
+                return
+
+            item = self.highlighted_id
+            field = self.fields.get(item)
+
+            if field and field["type"] == "MEASURE":
+                self.toggle_value(item)
+
         def move_field(self, axis: str) -> None:
             if isinstance(self.focused, Input):
                 return
+
             item = self.highlighted_id
             field = self.fields.get(item)
+
             if not field or field["type"] != "DIMENSION":
                 return
-            if field.get("status") not in ("MAPPED", "VERIFIED") or not field.get("mdx"):
-                self.show_error(f"{field['caption']}: mapping not available ({field.get('status')})")
+
+            if (
+                field.get("status") not in ("MAPPED", "VERIFIED")
+                or not field.get("mdx")
+            ):
+                self.show_error(
+                    f"{field['caption']}: "
+                    f"mapping not available ({field.get('status')})"
+                )
                 return
-            self.chosen["x"] = [x for x in self.chosen["x"] if x != item]
-            self.chosen["y"] = [y for y in self.chosen["y"] if y != item]
-            if any(self.fields[x].get("mdx") == field["mdx"] for x in
-                   self.chosen["x"] + self.chosen["y"]):
-                self.show_error("The hierarchy is already selected under another display item")
+
+            if item in self.chosen[axis]:
                 return
+
+            for selected in self.chosen["x"] + self.chosen["y"]:
+                if (
+                    selected != item
+                    and self.fields[selected].get("mdx") == field["mdx"]
+                ):
+                    self.show_error(
+                        "The hierarchy is already selected "
+                        "under another display item"
+                    )
+                    return
+
+            other_axis = "y" if axis == "x" else "x"
+
+            if item in self.chosen[other_axis]:
+                self.chosen[other_axis].remove(item)
+                self.refresh_axis(other_axis)
+
             self.chosen[axis].append(item)
-            # When accounting YEAR is placed on Columns, paginate one year
-            # per request unless the user already customized that chunk size.
-            if (axis == "y" and field["mdx"] == QUERY_PROFILES[self.code].get("year")
-                    and self.query_one("#designer_y_chunk", Input).value == "20"):
-                self.query_one("#designer_y_chunk", Input).value = "1"
-            self.refresh_tree()
-            self.refresh_layout()
+
+            if (
+                axis == "y"
+                and field["mdx"] == QUERY_PROFILES[self.code].get("year")
+                and self.query_one(
+                    "#designer_y_chunk",
+                    Input,
+                ).value == "20"
+            ):
+                self.query_one(
+                    "#designer_y_chunk",
+                    Input,
+                ).value = "1"
+
+            self.refresh_axis(
+                axis,
+                select_id=item,
+            )
 
         def toggle_value(self, item: str) -> None:
-            field = self.fields[item]
+            field = self.fields.get(item)
+
+            if not field or field["type"] != "MEASURE":
+                return
+
             if item in self.chosen["measures"]:
                 self.chosen["measures"].remove(item)
-            elif field.get("status") not in ("MAPPED", "VERIFIED") or not field.get("mdx"):
-                self.show_error(f"{field['caption']}: {field.get('status')} — selection disabled")
+
+            elif (
+                field.get("status") not in ("MAPPED", "VERIFIED")
+                or not field.get("mdx")
+            ):
+                self.show_error(
+                    f"{field['caption']}: "
+                    f"{field.get('status')} — selection disabled"
+                )
                 return
-            elif any(self.fields[m].get("mdx") == field["mdx"]
-                     for m in self.chosen["measures"]):
-                self.show_error("This base Measure is already selected")
+
+            elif any(
+                self.fields[selected].get("mdx") == field["mdx"]
+                for selected in self.chosen["measures"]
+            ):
+                self.show_error(
+                    "This base Measure is already selected"
+                )
                 return
+
             else:
                 self.chosen["measures"].append(item)
-            self.refresh_tree()
-            self.refresh_layout()
+
+            self.refresh_axis(
+                "measures",
+                select_id=item,
+            )
+
+        def refresh_axis(
+            self,
+            axis: str,
+            select_id: str | None = None,
+        ) -> None:
+            from textual.widgets import OptionList
+            from textual.widgets.option_list import Option
+
+            control = {
+                "x": "designer_x",
+                "y": "designer_y",
+                "measures": "designer_values",
+            }[axis]
+
+            widget = self.query_one(
+                f"#{control}",
+                OptionList,
+            )
+
+            items = self.chosen[axis]
+
+            previous = widget.highlighted_option
+            previous_id = (
+                previous.id
+                if previous is not None
+                else None
+            )
+
+            current_ids = [
+                option.id
+                for option in widget.options
+            ]
+
+            if current_ids == items:
+                return
+
+            widget.set_options(
+                [
+                    Option(
+                        f"{index + 1}. "
+                        f"{self.fields[item]['caption']}",
+                        id=item,
+                    )
+                    for index, item in enumerate(items)
+                ]
+            )
+
+            if not items:
+                widget.highlighted = None
+                return
+
+            target = (
+                select_id
+                if select_id in items
+                else previous_id
+                if previous_id in items
+                else items[-1]
+            )
+
+            widget.highlighted = items.index(target)
 
         def refresh_layout(self) -> None:
-            for axis, control in (("x", "designer_x"),
-                                  ("y", "designer_y"),
-                                  ("measures", "designer_values")):
-                items = self.chosen[axis]
-                self.query_one("#" + control, Select).set_options([
-                    (f"{index + 1}. {self.fields[item]['caption']}", item)
-                    for index, item in enumerate(items)
-                ])
+            for axis in ("x", "y", "measures"):
+                self.refresh_axis(axis)
 
         def modify_axis(self, operation: str) -> None:
-            axis = "measures" if operation == "value_remove" else operation[0]
-            control = {"x": "designer_x", "y": "designer_y",
-                       "measures": "designer_values"}[axis]
-            value = self.query_one("#" + control, Select).value
-            items = self.chosen[axis]
-            if value not in items:
-                self.show_error("Select a field in that axis first")
-                return
-            index = items.index(value)
-            if operation.endswith("remove"):
-                items.remove(value)
-            else:
-                next_index = index - 1 if operation.endswith("up") else index + 1
-                if 0 <= next_index < len(items):
-                    items[index], items[next_index] = items[next_index], items[index]
-            self.refresh_tree()
-            self.refresh_layout()
+            from textual.widgets import OptionList
 
+            axis = (
+                "measures"
+                if operation.startswith("value_")
+                else operation[0]
+            )
+
+            control = {
+                "x": "designer_x",
+                "y": "designer_y",
+                "measures": "designer_values",
+            }[axis]
+
+            widget = self.query_one(
+                f"#{control}",
+                OptionList,
+            )
+
+            selected = widget.highlighted_option
+
+            if selected is None:
+                self.show_error(
+                    "Select a field in that axis first"
+                )
+                return
+
+            item = selected.id
+            items = self.chosen[axis]
+
+            if item not in items:
+                self.show_error(
+                    "Select a field in that axis first"
+                )
+                return
+
+            index = items.index(item)
+
+            if operation.endswith("remove"):
+                items.pop(index)
+
+                target = (
+                    items[min(index, len(items) - 1)]
+                    if items
+                    else None
+                )
+
+            else:
+                next_index = (
+                    index - 1
+                    if operation.endswith("up")
+                    else index + 1
+                )
+
+                if not 0 <= next_index < len(items):
+                    return
+
+                items[index], items[next_index] = (
+                    items[next_index],
+                    items[index],
+                )
+
+                target = item
+
+            self.refresh_axis(
+                axis,
+                select_id=target,
+            )
         def build_query(self) -> dict:
             profile = QUERY_PROFILES[self.code]
-            selections = {axis: list(items) for axis, items in self.chosen.items()}
-            fields = [self.fields[item] for item in dict.fromkeys(
-                selections["x"] + selections["y"] + selections["measures"])]
-            config = dict(schema_version=SCHEMA_VERSION, code=self.code,
-                          cube=profile["cube"], catalog=profile["catalog"],
-                          x=[self.fields[item]["mdx"] for item in selections["x"]],
-                          y=[self.fields[item]["mdx"] for item in selections["y"]],
-                          measures=[self.fields[item]["mdx"] for item in selections["measures"]],
-                          selection_ids=selections,
-                          selected_fields=[dict(id=f["id"], mdx=f["mdx"],
-                                                caption=f["caption"], type=f["type"],
-                                                status=f["status"]) for f in fields],
-                          filters=[], workers=int(self.query_one("#designer_workers", Input).value),
-                          x_chunk=int(self.query_one("#designer_x_chunk", Input).value),
-                          y_chunk=int(self.query_one("#designer_y_chunk", Input).value),
-                          timeout=60, delay=1.0)
-            return validate_query(config)
 
+            selections = {
+                axis: list(self.chosen[axis])
+                for axis in ("x", "y", "measures")
+            }
+
+            if not selections["x"]:
+                raise ValueError("Select at least one X / ROWS field")
+
+            if not selections["y"]:
+                raise ValueError("Select at least one Y / COLUMNS field")
+
+            if not selections["measures"]:
+                raise ValueError("Select at least one VALUES / MEASURES field")
+
+            selected_ids = list(dict.fromkeys(
+                selections["x"]
+                + selections["y"]
+                + selections["measures"]
+            ))
+
+            selected_fields = []
+
+            for item in selected_ids:
+                field = self.fields.get(item)
+
+                if field is None:
+                    raise ValueError(
+                        f"Selected field not found: {item}"
+                    )
+
+                if (
+                    field.get("status") not in ("MAPPED", "VERIFIED")
+                    or not field.get("mdx")
+                ):
+                    raise ValueError(
+                        f"Field cannot be applied: "
+                        f"{field.get('caption', item)}"
+                    )
+
+                selected_fields.append({
+                    "id": field["id"],
+                    "mdx": field["mdx"],
+                    "caption": field["caption"],
+                    "type": field["type"],
+                    "status": field["status"],
+                })
+
+            config = {
+                "schema_version": SCHEMA_VERSION,
+                "code": self.code,
+                "cube": profile["cube"],
+                "catalog": profile["catalog"],
+                "x": [
+                    self.fields[item]["mdx"]
+                    for item in selections["x"]
+                ],
+                "y": [
+                    self.fields[item]["mdx"]
+                    for item in selections["y"]
+                ],
+                "measures": [
+                    self.fields[item]["mdx"]
+                    for item in selections["measures"]
+                ],
+                "selection_ids": selections,
+                "selected_fields": selected_fields,
+                "filters": [],
+                "workers": int(
+                    self.query_one(
+                        "#designer_workers", Input
+                    ).value
+                ),
+                "x_chunk": int(
+                    self.query_one(
+                        "#designer_x_chunk", Input
+                    ).value
+                ),
+                "y_chunk": int(
+                    self.query_one(
+                        "#designer_y_chunk", Input
+                    ).value
+                ),
+                "timeout": 60,
+                "delay": 1.0,
+            }
+
+            return validate_query(config)
+        
         def preview_query(self) -> None:
             try:
                 query = self.build_query()
                 mdx = selected_mdx(query)
-                self.query_one("#designer_preview", Static).update(
+
+                self.query_one(
+                    "#designer_preview",
+                    Static,
+                ).update(
                     f"CODE: {query['code']} / {query['cube']}\n"
                     f"X ROWS (Axis1): {len(query['x'])}   "
                     f"Y COLUMNS (Axis0): {len(query['y'])}   "
                     f"VALUES: {len(query['measures'])}\n"
                     f"Workers: {query['workers']}  "
                     f"Chunks: {query['x_chunk']} × {query['y_chunk']}\n"
-                    "NOTE: CrossJoin queries may be expensive.\n" + mdx)
-            except (ValueError, TypeError) as exc:
-                self.show_error(str(exc))
+                    f"NOTE: CrossJoin queries may be expensive.\n"
+                    f"{mdx}"
+                )
+
+            except Exception as exc:
+                self.show_error(
+                    f"PREVIEW FAILED: {type(exc).__name__}: {exc}"
+                )
 
         def show_error(self, message: str) -> None:
             self.query_one("#designer_preview", Static).update("VALIDATION: " + message[:450])
@@ -4857,25 +5409,49 @@ def launch_terminal_ui(args, return_app: bool = False):
         def apply_selection(self) -> None:
             try:
                 config = self.build_query()
-                envelope = {"revision": uuid.uuid4().hex, "query": config}
-                temp = self.selection_path.with_suffix(".tmp")
-                temp.write_text(json.dumps(envelope, ensure_ascii=False, indent=2),
-                                encoding="utf-8")
-                temp.replace(self.selection_path)
-                self.exit()
-            except (OSError, ValueError, TypeError) as exc:
-                self.show_error(str(exc))
 
-        @work(thread=True, group="designer-metadata-refresh", exclusive=True)
-        def refresh_catalog_worker(self) -> None:
-            code = self.code
-            env = read_env()
-            try:
-                catalog = discover_fields(code, env.get("OIC_BEARER_TOKEN", ""),
-                                          env.get("OIC_COOKIE", ""))
-                self.call_from_thread(self.catalog_refreshed, code, catalog, None)
+                envelope = {
+                    "revision": uuid.uuid4().hex,
+                    "query": config,
+                }
+
+                self.selection_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                temp = self.selection_path.with_suffix(".tmp")
+
+                temp.write_text(
+                    json.dumps(
+                        envelope,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+                temp.replace(self.selection_path)
+
+                saved = json.loads(
+                    self.selection_path.read_text(
+                        encoding="utf-8",
+                    )
+                )
+
+                if saved["revision"] != envelope["revision"]:
+                    raise RuntimeError(
+                        "Saved selection revision mismatch"
+                    )
+
+                validate_query(saved["query"])
+
+                self.exit()
+
             except Exception as exc:
-                self.call_from_thread(self.catalog_refreshed, code, None, str(exc)[:150])
+                self.show_error(
+                    f"APPLY FAILED: {type(exc).__name__}: {exc}"
+                )
 
         def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
             if error:
@@ -4888,21 +5464,43 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_cancel(self) -> None:
             self.exit()
 
-        def on_button_pressed(self, event: Button.Pressed) -> None:
+        def on_button_pressed(
+            self,
+            event: Button.Pressed,
+        ) -> None:
             operation = event.button.id
+
             if operation == "add_to_x":
                 self.move_field("x")
+
             elif operation == "add_to_y":
                 self.move_field("y")
-            elif operation in ("x_up", "x_down", "x_remove",
-                               "y_up", "y_down", "y_remove", "value_remove"):
+
+            elif operation == "add_to_values":
+                self.action_field_to_values()
+
+            elif operation in (
+                "x_up",
+                "x_down",
+                "x_remove",
+                "y_up",
+                "y_down",
+                "y_remove",
+                "value_up",
+                "value_down",
+                "value_remove",
+            ):
                 self.modify_axis(operation)
+
             elif operation == "reload_designer_catalog":
                 self.refresh_catalog_worker()
+
             elif operation == "designer_preview_button":
                 self.preview_query()
+
             elif operation == "designer_apply":
                 self.apply_selection()
+
             elif operation == "designer_cancel":
                 self.action_cancel()
 

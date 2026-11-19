@@ -3723,8 +3723,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "OIC XMLA Parallel Collector "
-            "with Rich Live Monitor and "
-            "Windows Terminal worker tabs"
+            "with Rich Live Monitor and PowerShell workers"
         ),
         formatter_class=(
             argparse.RawDescriptionHelpFormatter
@@ -3745,7 +3744,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--launch",
         action="store_true",
         help=(
-            "Launch workers as tabs "
+            "Launch background workers "
             "and display Rich monitor"
         ),
     )
@@ -4433,15 +4432,22 @@ def run_batch(batch_dir: Path) -> int:
     if not entries or batch.get("run_id") != batch_dir.name:
         raise RuntimeError("Invalid or missing batch configuration")
     output_root = Path(batch["output_root"]).resolve()
+    earlier = read_json(batch_dir / "batch_manifest.json", {}) or {}
+    earlier_entries = {item["query_id"]: item for item in earlier.get("queries", [])
+                       if isinstance(item, dict) and item.get("query_id")}
     stop = batch_dir / "stop.flag"
     force = batch_dir / "force_stop.flag"
+    for entry in entries:
+        previous = earlier_entries.get(entry["query_id"], {})
+        if previous.get("status") == "COMPLETED" and previous.get("excel_path") and Path(previous["excel_path"]).is_file():
+            entry.update(previous)
     _batch_snapshot(batch_dir, status="STARTING", current=None, entries=entries)
     python = str(Path(sys.executable).resolve())
     script = str(Path(__file__).resolve())
-    launch_terminal_window(
-        [[python, script, "--batch-monitor", str(batch_dir)]],
-        title="OIC | Live Monitor", cwd=HERE, keep_open=False)
     try:
+        launch_terminal_window(
+            [[python, script, "--batch-monitor", str(batch_dir)]],
+            title="OIC | Live Monitor", cwd=HERE, keep_open=False)
         for entry in entries:
             qid = entry["query_id"]
             qdir = batch_dir / qid
@@ -4452,9 +4458,7 @@ def run_batch(batch_dir: Path) -> int:
                 entry.update(status="FAILED", error="Apply-time plan does not match configuration")
                 _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
                 continue
-            old = read_json(batch_dir / "batch_manifest.json", {}) or {}
-            previous = next((e for e in old.get("queries", [])
-                             if e.get("query_id") == qid), {})
+            previous = earlier_entries.get(qid, {})
             if (previous.get("status") == "COMPLETED"
                     and previous.get("excel_path")
                     and Path(previous["excel_path"]).is_file()):

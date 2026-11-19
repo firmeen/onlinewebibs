@@ -1921,6 +1921,18 @@ def validate_query(
             "Workers must be between 1 and 6"
         )
 
+    execution_mode = config.get("execution_mode", "CHUNKED")
+    if execution_mode not in ("DIRECT", "CHUNKED"):
+        raise ValueError("Unsupported query execution mode")
+    if execution_mode == "DIRECT" and (
+        version != SCHEMA_VERSION or workers != 1
+    ):
+        raise ValueError("Direct XMLA requires schema v2 and exactly one worker")
+    if execution_mode == "DIRECT":
+        response_limit = int(config.get("max_response_mb", 100))
+        if not 1 <= response_limit <= 1024:
+            raise ValueError("Direct XMLA response limit must be between 1 and 1024 MB")
+
     if not 1 <= x_chunk <= 20:
         raise ValueError(
             "X chunk size must be between 1 and 20"

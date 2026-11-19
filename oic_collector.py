@@ -4332,26 +4332,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.update_catalog_summary()
 
         # ====================================================
-        # LIVE METADATA / RUN CONTROL
+        # SELECTED DATA EXTRACTION / WINDOW HANDOFF
         # ====================================================
-
-        @work(thread=True, group="catalog-refresh", exclusive=True)
-        def refresh_catalog_worker(self, code: str, token: str, cookie: str) -> None:
-            try:
-                catalog = discover_fields(code, token, cookie)
-                self.call_from_thread(self.catalog_refreshed, code, catalog, None)
-            except Exception as exc:
-                self.call_from_thread(self.catalog_refreshed, code, None, str(exc))
-
-        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
-            if error:
-                self.info(f"Metadata refresh failed; cache retained: {error}", "warning")
-                return
-            if code != self.selected_code:
-                return
-            self.field_catalog = catalog
-            self.refresh_field_table()
-            self.info(f"Catalog: {len(catalog['fields'])} fields ({catalog['source']}).", "success")
 
         def start_selected_query(self) -> None:
             if self.active_run is not None:
@@ -4372,12 +4354,19 @@ def launch_terminal_ui(args, return_app: bool = False):
                 path = resolve_output_path(self.output_value()) / "oic_parallel" / run_id
                 path.mkdir(parents=True, exist_ok=False)
                 config_file = path / "query_config.json"
-                config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-                (path / "job_plan.json").write_text(json.dumps(
-                    {"run_id": run_id, "query_hash": query_hash(config),
-                     "x": config["x"], "y": config["y"], "measures": config["measures"],
-                     "workers": config["workers"], "partition": "x_page_mod_workers"},
+                pending = config_file.with_suffix(".tmp")
+                pending.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+                pending.replace(config_file)
+                job_plan = path / "job_plan.json"
+                plan_temp = job_plan.with_suffix(".tmp")
+                plan_temp.write_text(json.dumps(
+                    {"run_id": run_id, "schema_version": config["schema_version"],
+                     "query_hash": query_hash(config),
+                     "x_rows": config["x"], "y_columns": config["y"],
+                     "measures": config["measures"],
+                     "workers": config["workers"], "partition": "x_row_page_mod_workers"},
                     ensure_ascii=False, indent=2), encoding="utf-8")
+                plan_temp.replace(job_plan)
                 script = BASE_DIR / "oic_parallel_collector.py"
                 if not script.is_file():
                     raise RuntimeError("oic_parallel_collector.py not found")

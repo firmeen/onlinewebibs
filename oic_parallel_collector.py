@@ -4062,9 +4062,12 @@ def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
     headers = ["INSURANCE_CODE", "CUBE", "CATALOG"]
     for axis, count in (("X", x_count), ("Y", y_count)):
         for i in range(count):
-            headers += [f"{axis}{i+1}_HIERARCHY", f"{axis}{i+1}_CAPTION",
-                        f"{axis}{i+1}_UNIQUE_NAME", f"{axis}{i+1}_LEVEL"]
-    headers += ["MEASURE", "VALUE", "LAST_DATA_UPDATE", "RETRIEVED_AT"]
+            headers += [f"{axis}{i+1}_HIERARCHY", f"{axis}{i+1}_FIELD_CAPTION",
+                        f"{axis}{i+1}_MEMBER_CAPTION", f"{axis}{i+1}_UNIQUE_NAME",
+                        f"{axis}{i+1}_LEVEL"]
+    headers += ["MEASURE", "MEASURE_CAPTION", "VALUE", "LAST_DATA_UPDATE", "RETRIEVED_AT"]
+    display_map = {f.get("mdx"): f.get("caption", f.get("mdx"))
+                   for f in config.get("selected_fields", []) if isinstance(f, dict)}
     sheet.append(headers)
     row_count, sheet_rows, sheet_number = 0, 1, 1
     for wid in range(1, int(config["workers"]) + 1):
@@ -4089,14 +4092,16 @@ def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
                 for values, names in ((record["X"], config["x"]), (record["Y"], config["y"])):
                     for index, field in enumerate(names):
                         matching = next((m for m in values if m["hierarchy"] == field), {})
-                        entry += [field, matching.get("caption"), matching.get("unique_name"), matching.get("level")]
+                        entry += [field, display_map.get(field, field), matching.get("caption"),
+                                  matching.get("unique_name"), matching.get("level")]
                 raw = record["VALUE"]
                 try:
                     number = float(raw)
                     value = number if math.isfinite(number) else raw
                 except (TypeError, ValueError):
                     value = raw
-                entry += [record["MEASURE"], value, record["LAST_DATA_UPDATE"], chunk.get("completed_at")]
+                entry += [record["MEASURE"], display_map.get(record["MEASURE"], record["MEASURE"]),
+                          value, record["LAST_DATA_UPDATE"], chunk.get("completed_at")]
                 sheet.append([excel_text(v) if isinstance(v, str) else v for v in entry])
                 row_count += 1
                 sheet_rows += 1

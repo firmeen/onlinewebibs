@@ -4432,129 +4432,246 @@ def selected_worker(args) -> int:
                            max_response_mb=int(config.get("max_response_mb", 100)), worker_id=worker_id, code=code)
         state["status"] = "RUNNING"
         save_state()
-        # Deterministic X paging: a given X page belongs to exactly one worker.
-        x_offset = assignment["first_x_offset"]
-        while not stop_file.exists():
-            y_offset = assignment["first_y_offset"]
-            if (run_dir / "pause.flag").exists():
-                state["status"] = "PAUSED"; save_state()
-                while (run_dir / "pause.flag").exists() and not stop_file.exists():
-                    time.sleep(1)
-                state["status"] = "RUNNING"; save_state()
-            if stop_file.exists():
-                break
-            x_returned = None
-            while not stop_file.exists():
-                key = f"{query_hash(config)}_x{x_offset:06d}_y{y_offset:06d}"
-                req_path = chunks_dir / f"{key}.request.xml"
-                resp_path = chunks_dir / f"{key}.response.xml"
-                record = manifest["chunks"].get(key, {})
-                data = None
-                if record.get("status") == "OK" and resp_path.is_file():
-                    try:
+        if config.get("execution_mode") == "DIRECT":
+            # The Query Designer already compiled this exact request at Apply.
+            # No member enumeration, X/Y offset probes, or server discovery.
+            x_offset = y_offset = 0
+            profile = read_json(run_dir / "request_profile.json")
+            if not isinstance(profile, dict):
+                raise ValueError("Missing immutable direct request_profile.json")
+            expected = {
+                "version": 1, "query_id": run_dir.name,
+                "query_hash": query_hash(config),
+                "code": code, "class": QUERY_PROFILES[code]["cls"],
+                "catalog": config["catalog"], "cube": config["cube"],
+                "execution_mode": "DIRECT",
+                "mdx": build_direct_mdx(config),
+            }
+            if profile != expected:
+                raise ValueError("Direct request profile differs from applied query")
+            if worker_id != 1:
+                raise ValueError("A direct request must have exactly one worker")
+
+            key = f"{query_hash(config)}_direct"
+            req_path = chunks_dir / f"{key}.request.xml"
+            resp_path = chunks_dir / f"{key}.response.xml"
+            statement = query_soap(config, statement=profile["mdx"])
+            record = manifest["chunks"].get(key, {})
+            data = None
+
+            # Resume from an exact, validated XML response without another HTTP call.
+            if record.get("status") == "OK" and req_path.is_file() and resp_path.is_file():
+                try:
+                    if req_path.read_bytes() == statement:
                         data = query_parse(resp_path.read_bytes())
-                    except (ValueError, ET.ParseError, OSError):
-                        data = None
-                if data is None:
-                    req_path.write_bytes(query_soap(config, x_offset, y_offset))
-                    state.update(status="RUNNING", current_request=key,
-                                 request_started_at=utc_now(), last_message=f"Request {key}")
-                    save_state()
-                    log(f"REQUEST X={x_offset} Y={y_offset}", worker_id)
-                    http = None
-                    retry_history = []
-                    transient = {408, 425, 429, 500, 502, 503, 504}
-                    max_attempts = max(1, int(config.get("retries", 1)) + 1)
-                    for attempt in range(1, max_attempts + 1):
-                        if stop_file.exists():
-                            break
-                        try:
-                            http = client.execute(req_path.read_bytes(), resp_path)
-                            state["last_http"] = http["http_status"]
-                            code_http = int(http["http_status"])
-                            if code_http == 200:
-                                data = query_parse(resp_path.read_bytes())
-                                break
-                            if code_http in (401, 403):
-                                raise RuntimeError(f"SESSION_EXPIRED: HTTP {code_http} after JWT refresh")
-                            if code_http not in transient:
-                                raise ValueError(f"XMLA HTTP {code_http}")
-                            raise requests.HTTPError(f"XMLA HTTP {code_http}")
-                        except (requests.RequestException, ValueError, ET.ParseError, RuntimeError) as exc:
-                            code_http = http.get("http_status") if http else None
-                            retryable = (code_http in transient or isinstance(
-                                exc, (requests.Timeout, requests.ConnectionError, requests.HTTPError,
-                                      requests.exceptions.ChunkedEncodingError)))
-                            if "SESSION_EXPIRED" in str(exc).upper():
-                                retryable = False
-                            delay = min(30.0, float(2 ** min(attempt, 5))) + random.uniform(0, 0.4)
-                            if code_http in (429, 503) and http:
-                                raw_retry = str(http.get("retry_after") or "")
-                                if raw_retry.isdecimal():
-                                    delay = min(60.0, float(raw_retry))
-                            retry_history.append({"attempt": attempt, "timestamp": utc_now(),
-                                                  "http_status": code_http,
-                                                  "error_type": type(exc).__name__,
-                                                  "message": str(exc)[:160], "retryable": retryable,
-                                                  "next_retry_delay": delay if retryable and attempt < max_attempts else None})
-                            record["retry_history"] = retry_history
-                            write_json(manifest_path, manifest)
-                            if not retryable or attempt == max_attempts or stop_file.exists():
-                                if stop_file.exists():
-                                    break
-                                raise
-                            state.update(status="RETRYING", last_message=f"Retry {attempt}/{max_attempts}: {exc}")
-                            save_state()
-                            log(f"RETRYING {attempt}/{max_attempts}: {exc}", worker_id, "WARN")
-                            deadline = time.monotonic() + delay
-                            while not stop_file.exists() and time.monotonic() < deadline:
-                                time.sleep(min(.25, max(0, deadline - time.monotonic())))
-                            state["status"] = "RUNNING"
-                            save_state()
+                        log("RESUME DIRECT / verified cached response", worker_id, "OK")
+                except (ValueError, ET.ParseError, OSError):
+                    data = None
+
+            if data is None and not stop_file.exists():
+                req_path.write_bytes(statement)
+                state.update(status="RUNNING", current_request=key,
+                             request_started_at=utc_now(),
+                             last_message="XMLA DIRECT / complete applied query")
+                save_state()
+                log("DIRECT XMLA / one complete request", worker_id)
+                attempts = max(1, int(config.get("retries", 2)) + 1)
+                transient = {408, 425, 429, 500, 502, 503, 504}
+                history = []
+                for attempt in range(1, attempts + 1):
                     if stop_file.exists():
                         break
-                    if data is None:
-                        raise RuntimeError("Empty XMLA dataset after attempts")
-                    record = dict(status="OK", x_offset=x_offset, y_offset=y_offset,
-                                  request_file=req_path.name, response_file=resp_path.name,
-                                  x_count=len(data["axes"]["Axis0"]),
-                                  y_tuples=len(data["axes"]["Axis1"]),
-                                  cells=len(data["cells"]), http_status=200,
-                                  response_bytes=resp_path.stat().st_size,
-                                  retry_history=retry_history, completed_at=utc_now())
+                    http = None
+                    try:
+                        http = client.execute(statement, resp_path)
+                        code_http = int(http["http_status"])
+                        state["last_http"] = code_http
+                        save_state()
+                        if code_http == 200:
+                            data = query_parse(resp_path.read_bytes())
+                            break
+                        if code_http in (401, 403):
+                            raise RuntimeError(f"SESSION_EXPIRED: HTTP {code_http} after JWT refresh")
+                        if code_http in transient:
+                            raise requests.HTTPError(f"XMLA HTTP {code_http}")
+                        raise ValueError(f"XMLA HTTP {code_http}")
+                    except (requests.RequestException, ValueError, ET.ParseError, RuntimeError) as exc:
+                        code_http = http.get("http_status") if http else None
+                        retryable = (code_http in transient or isinstance(
+                            exc, (requests.Timeout, requests.ConnectionError, requests.HTTPError,
+                                  requests.exceptions.ChunkedEncodingError)))
+                        if "SESSION_EXPIRED" in str(exc).upper():
+                            retryable = False
+                        delay = min(30.0, float(2 ** min(attempt, 5))) + random.uniform(0, 0.4)
+                        if code_http in (429, 503) and http:
+                            retry_after = str(http.get("retry_after") or "")
+                            if retry_after.isdecimal():
+                                delay = min(60.0, float(retry_after))
+                        history.append({"attempt": attempt, "timestamp": utc_now(),
+                                        "http_status": code_http, "error_type": type(exc).__name__,
+                                        "message": str(exc)[:160], "retryable": retryable})
+                        record["retry_history"] = history
+                        manifest["chunks"][key] = record
+                        write_json(manifest_path, manifest)
+                        if not retryable or attempt == attempts or stop_file.exists():
+                            if stop_file.exists():
+                                break
+                            raise
+                        state.update(status="RETRYING", last_message=f"DIRECT RETRY {attempt}/{attempts}: {exc}")
+                        save_state()
+                        deadline = time.monotonic() + delay
+                        while not stop_file.exists() and time.monotonic() < deadline:
+                            time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+                        state["status"] = "RUNNING"
+                        save_state()
+
+                if data is not None:
+                    record = {
+                        "status": "OK", "mode": "DIRECT",
+                        "x_offset": 0, "y_offset": 0,
+                        "request_file": req_path.name, "response_file": resp_path.name,
+                        "x_count": len(data["axes"]["Axis1"]),
+                        "y_tuples": len(data["axes"]["Axis0"]),
+                        "cells": len(data["cells"]), "http_status": 200,
+                        "response_bytes": resp_path.stat().st_size,
+                        "retry_history": history, "completed_at": utc_now(),
+                    }
                     manifest["chunks"][key] = record
                     manifest["updated_at"] = utc_now()
                     write_json(manifest_path, manifest)
-                    log(f"OK X={record['x_count']} Y={record['y_tuples']} cells={record['cells']}", worker_id, "OK")
-                # Schema v2 puts Measures on Axis1 with X/ROWS; v1 preserved.
-                row_keys = {tuple(m["unique_name"] for m in row
-                                  if m["hierarchy"] != "[Measures]")
-                            for row in data["axes"]["Axis1"]}
-                if int(config.get("schema_version", 1)) == 2:
-                    x_count = len(row_keys)
-                    y_count = len(data["axes"]["Axis0"])
-                else:
-                    x_count = len(data["axes"]["Axis0"])
-                    y_count = len(row_keys)
-                x_returned = x_count
+
+            if data is not None:
+                completed = True
                 state.update(current_request=None, request_started_at=None,
-                             last_message=f"OK X={x_offset} Y={y_offset} cells={len(data['cells'])}")
+                             last_message=f"DIRECT OK / {len(data['cells'])} cells")
                 save_state()
-                if x_count == 0 or y_count < y_size:
-                    break
-                y_offset += assignment["y_stride"]
+                log(f"DIRECT OK / {len(data['cells'])} cells", worker_id, "OK")
+            elif not stop_file.exists():
+                raise RuntimeError("Direct XMLA request did not produce a valid dataset")
+        else:
+            # Deterministic X paging: a given X page belongs to exactly one worker.
+            x_offset = assignment["first_x_offset"]
+            while not stop_file.exists():
+                y_offset = assignment["first_y_offset"]
+                if (run_dir / "pause.flag").exists():
+                    state["status"] = "PAUSED"; save_state()
+                    while (run_dir / "pause.flag").exists() and not stop_file.exists():
+                        time.sleep(1)
+                    state["status"] = "RUNNING"; save_state()
                 if stop_file.exists():
                     break
-                if stop_file.is_file():
+                x_returned = None
+                while not stop_file.exists():
+                    key = f"{query_hash(config)}_x{x_offset:06d}_y{y_offset:06d}"
+                    req_path = chunks_dir / f"{key}.request.xml"
+                    resp_path = chunks_dir / f"{key}.response.xml"
+                    record = manifest["chunks"].get(key, {})
+                    data = None
+                    if record.get("status") == "OK" and resp_path.is_file():
+                        try:
+                            data = query_parse(resp_path.read_bytes())
+                        except (ValueError, ET.ParseError, OSError):
+                            data = None
+                    if data is None:
+                        req_path.write_bytes(query_soap(config, x_offset, y_offset))
+                        state.update(status="RUNNING", current_request=key,
+                                     request_started_at=utc_now(), last_message=f"Request {key}")
+                        save_state()
+                        log(f"REQUEST X={x_offset} Y={y_offset}", worker_id)
+                        http = None
+                        retry_history = []
+                        transient = {408, 425, 429, 500, 502, 503, 504}
+                        max_attempts = max(1, int(config.get("retries", 1)) + 1)
+                        for attempt in range(1, max_attempts + 1):
+                            if stop_file.exists():
+                                break
+                            try:
+                                http = client.execute(req_path.read_bytes(), resp_path)
+                                state["last_http"] = http["http_status"]
+                                code_http = int(http["http_status"])
+                                if code_http == 200:
+                                    data = query_parse(resp_path.read_bytes())
+                                    break
+                                if code_http in (401, 403):
+                                    raise RuntimeError(f"SESSION_EXPIRED: HTTP {code_http} after JWT refresh")
+                                if code_http not in transient:
+                                    raise ValueError(f"XMLA HTTP {code_http}")
+                                raise requests.HTTPError(f"XMLA HTTP {code_http}")
+                            except (requests.RequestException, ValueError, ET.ParseError, RuntimeError) as exc:
+                                code_http = http.get("http_status") if http else None
+                                retryable = (code_http in transient or isinstance(
+                                    exc, (requests.Timeout, requests.ConnectionError, requests.HTTPError,
+                                          requests.exceptions.ChunkedEncodingError)))
+                                if "SESSION_EXPIRED" in str(exc).upper():
+                                    retryable = False
+                                delay = min(30.0, float(2 ** min(attempt, 5))) + random.uniform(0, 0.4)
+                                if code_http in (429, 503) and http:
+                                    raw_retry = str(http.get("retry_after") or "")
+                                    if raw_retry.isdecimal():
+                                        delay = min(60.0, float(raw_retry))
+                                retry_history.append({"attempt": attempt, "timestamp": utc_now(),
+                                                      "http_status": code_http,
+                                                      "error_type": type(exc).__name__,
+                                                      "message": str(exc)[:160], "retryable": retryable,
+                                                      "next_retry_delay": delay if retryable and attempt < max_attempts else None})
+                                record["retry_history"] = retry_history
+                                write_json(manifest_path, manifest)
+                                if not retryable or attempt == max_attempts or stop_file.exists():
+                                    if stop_file.exists():
+                                        break
+                                    raise
+                                state.update(status="RETRYING", last_message=f"Retry {attempt}/{max_attempts}: {exc}")
+                                save_state()
+                                log(f"RETRYING {attempt}/{max_attempts}: {exc}", worker_id, "WARN")
+                                deadline = time.monotonic() + delay
+                                while not stop_file.exists() and time.monotonic() < deadline:
+                                    time.sleep(min(.25, max(0, deadline - time.monotonic())))
+                                state["status"] = "RUNNING"
+                                save_state()
+                        if stop_file.exists():
+                            break
+                        if data is None:
+                            raise RuntimeError("Empty XMLA dataset after attempts")
+                        record = dict(status="OK", x_offset=x_offset, y_offset=y_offset,
+                                      request_file=req_path.name, response_file=resp_path.name,
+                                      x_count=len(data["axes"]["Axis0"]),
+                                      y_tuples=len(data["axes"]["Axis1"]),
+                                      cells=len(data["cells"]), http_status=200,
+                                      response_bytes=resp_path.stat().st_size,
+                                      retry_history=retry_history, completed_at=utc_now())
+                        manifest["chunks"][key] = record
+                        manifest["updated_at"] = utc_now()
+                        write_json(manifest_path, manifest)
+                        log(f"OK X={record['x_count']} Y={record['y_tuples']} cells={record['cells']}", worker_id, "OK")
+                    # Schema v2 puts Measures on Axis1 with X/ROWS; v1 preserved.
+                    row_keys = {tuple(m["unique_name"] for m in row
+                                      if m["hierarchy"] != "[Measures]")
+                                for row in data["axes"]["Axis1"]}
+                    if int(config.get("schema_version", 1)) == 2:
+                        x_count = len(row_keys)
+                        y_count = len(data["axes"]["Axis0"])
+                    else:
+                        x_count = len(data["axes"]["Axis0"])
+                        y_count = len(row_keys)
+                    x_returned = x_count
+                    state.update(current_request=None, request_started_at=None,
+                                 last_message=f"OK X={x_offset} Y={y_offset} cells={len(data['cells'])}")
+                    save_state()
+                    if x_count == 0 or y_count < y_size:
+                        break
+                    y_offset += assignment["y_stride"]
+                    if stop_file.exists():
+                        break
+                    if stop_file.is_file():
+                        break
+                    time.sleep(float(config.get("delay", 1)))
+                if x_returned is None or x_returned < x_size:
+                    completed = True
+                    break
+                x_offset += assignment["x_stride"]
+                if stop_file.exists():
                     break
                 time.sleep(float(config.get("delay", 1)))
-            if x_returned is None or x_returned < x_size:
-                completed = True
-                break
-            x_offset += assignment["x_stride"]
-            if stop_file.exists():
-                break
-            time.sleep(float(config.get("delay", 1)))
         state["status"] = "STOPPED" if stop_file.exists() else "COMPLETED" if completed else "PARTIAL"
     except KeyboardInterrupt:
         state["status"] = "STOPPED"

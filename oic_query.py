@@ -1921,6 +1921,18 @@ def validate_query(
             "Workers must be between 1 and 6"
         )
 
+    execution_mode = config.get("execution_mode", "CHUNKED")
+    if execution_mode not in ("DIRECT", "CHUNKED"):
+        raise ValueError("Unsupported query execution mode")
+    if execution_mode == "DIRECT" and (
+        version != SCHEMA_VERSION or workers != 1
+    ):
+        raise ValueError("Direct XMLA requires schema v2 and exactly one worker")
+    if execution_mode == "DIRECT":
+        response_limit = int(config.get("max_response_mb", 100))
+        if not 1 <= response_limit <= 1024:
+            raise ValueError("Direct XMLA response limit must be between 1 and 1024 MB")
+
     if not 1 <= x_chunk <= 20:
         raise ValueError(
             "X chunk size must be between 1 and 20"
@@ -2088,6 +2100,44 @@ def build_mdx(
     )
 
 
+
+# ============================================================
+# DIRECT XMLA QUERY (NO OFFSET OR CHUNK PAGINATION)
+# ============================================================
+
+def build_direct_mdx(config: dict) -> str:
+    """Compile a complete selected query in the main collector's NonEmpty style.
+
+    Keep measures on Axis1 for schema v2 / excel_records compatibility.
+    No Subset, speculative member counts, network discovery, or page probes.
+    """
+    validate_query(config)
+    if int(config.get("schema_version", 1)) != SCHEMA_VERSION:
+        raise ValueError("Direct queries require the applied v2 axis schema")
+
+    def all_members(fields: list[str]) -> str:
+        expression = fields[0] + ".AllMembers"
+        for field in fields[1:]:
+            expression = f"CrossJoin({expression},{field}.AllMembers)"
+        return expression
+
+    measures = "{" + ",".join(config["measures"]) + "}"
+    columns = f"NonEmpty({all_members(config['y'])},{measures})"
+    rows = f"NonEmpty({all_members(config['x'])},{measures})"
+    return (
+        f"WITH SET [DX_columns] AS {columns} "
+        f"SET [DX_rows] AS {rows} "
+        "SELECT [DX_columns] "
+        "DIMENSION PROPERTIES "
+        "PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME,MEMBER_VALUE ON COLUMNS, "
+        f"CrossJoin([DX_rows],{measures}) "
+        "DIMENSION PROPERTIES "
+        "PARENT_UNIQUE_NAME,HIERARCHY_UNIQUE_NAME,MEMBER_VALUE ON ROWS "
+        f"FROM [{config['cube']}] "
+        "CELL PROPERTIES VALUE,FORMAT_STRING,LANGUAGE"
+    )
+
+
 # ============================================================
 # XMLA SOAP BUILDER
 # ============================================================
@@ -2096,8 +2146,10 @@ def build_soap(
     config: dict,
     x_offset: int = 0,
     y_offset: int = 0,
+    *,
+    statement: str | None = None,
 ) -> bytes:
-    mdx = build_mdx(
+    mdx = statement if statement is not None else build_mdx(
         config,
         x_offset,
         y_offset,
@@ -2141,6 +2193,9 @@ def build_soap(
         "Timeout": "3600",
         "LocaleIdentifier": "9",
     }
+    if statement is not None:
+        # Match the working main collector XMLA Execute properties.
+        values["SspropInitAppName"] = "Microsoft SQL Server Management Studio"
 
     for key, value in values.items():
         ET.SubElement(

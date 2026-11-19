@@ -66,7 +66,7 @@ import subprocess
 import shutil
 
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
-                       validate_query, build_mdx as selected_mdx, query_hash)
+                       validate_query, build_direct_mdx, query_hash)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -404,6 +404,9 @@ def applied_validate(document: dict) -> dict:
         if entry.get("fingerprint") != applied_fingerprint(entry["config"]):
             raise ValueError("Applied query fingerprint mismatch")
         verify_apply_plan(entry["config"], entry["query_id"], entry.get("task_plan"))
+        if entry["config"].get("execution_mode") == "DIRECT":
+            if entry.get("request_profile") != make_direct_profile(entry["config"], entry["query_id"]):
+                raise ValueError("Applied direct profile differs from compiled query")
     if any(int(q[1:]) >= sequence for q in seen):
         raise ValueError("Next query sequence would reuse an identity")
     return document
@@ -424,12 +427,41 @@ def applied_fingerprint(config: dict) -> str:
     return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def make_apply_plan(config: dict, query_id: str) -> dict:
-    """Precompute worker ownership of unbounded X pages without doing I/O."""
+
+def make_direct_profile(config: dict, query_id: str) -> dict:
+    """Freeze one complete request at Apply; no discovery or chunk planning at Start."""
     validate_query(config)
+    if config.get("execution_mode") != "DIRECT" or int(config["workers"]) != 1:
+        raise ValueError("Direct requests require one execution worker")
+    return {
+        "version": 1, "query_id": query_id,
+        "query_hash": query_hash(config),
+        "code": config["code"],
+        "class": QUERY_PROFILES[config["code"]]["cls"],
+        "catalog": config["catalog"],
+        "cube": config["cube"],
+        "execution_mode": "DIRECT",
+        "mdx": build_direct_mdx(config),
+    }
+
+
+def make_apply_plan(config: dict, query_id: str) -> dict:
+    """Produce one full XMLA request for DIRECT; preserve legacy chunk plans."""
+    validate_query(config)
+    if config.get("execution_mode") == "DIRECT":
+        if int(config["workers"]) != 1:
+            raise ValueError("Direct execution must have one worker")
+        return {
+            "version": 2, "query_id": query_id,
+            "query_hash": query_hash(config),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "PLANNED", "partition": "direct_request",
+            "workers": 1, "total_chunks": 1,
+            "assignments": [{"worker_id": 1, "request_id": query_id + "-direct"}],
+        }
     count = int(config["workers"])
     size = int(config["x_chunk"])
-    plan = {
+    return {
         "version": 1, "query_id": query_id, "query_hash": query_hash(config),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "PLANNED", "partition": "x_page_stride",
@@ -442,16 +474,14 @@ def make_apply_plan(config: dict, query_id: str) -> dict:
             for wid in range(1, count + 1)
         ],
     }
-    return plan
 
 
 def verify_apply_plan(config: dict, query_id: str, plan: dict) -> None:
-    if not isinstance(plan, dict) or plan.get("version") != 1:
-        raise ValueError(f"{query_id}: missing or invalid task plan")
+    if not isinstance(plan, dict):
+        raise ValueError(f"{query_id}: missing task plan")
     expected = make_apply_plan(config, query_id)
-    for key in ("query_id", "query_hash", "status", "partition", "workers",
-                "x_chunk", "y_chunk", "total_chunks", "assignments"):
-        if plan.get(key) != expected[key]:
+    for key, value in expected.items():
+        if key != "created_at" and plan.get(key) != value:
             raise ValueError(f"{query_id}: task plan mismatch: {key}")
 
 
@@ -530,6 +560,8 @@ def applied_update(path: Path, operation: str, *, config=None,
                             "catalog": config["catalog"],
                             "fingerprint": fingerprint,
                             "task_plan": make_apply_plan(config, new_id),
+                            "request_profile": (make_direct_profile(config, new_id)
+                                                if config.get("execution_mode") == "DIRECT" else None),
                             "config": config})
             data["next_query_sequence"] += 1
             result = new_id
@@ -2983,7 +3015,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             ).disabled = True
             self.query_one("#force_stop", Button).disabled = True
             applied_table = self.query_one("#applied_queries", DataTable)
-            for heading in ("ID", "CATEGORY / CUBE", "X", "Y", "VALUES", "WORKERS", "CHUNKS", "PLAN"):
+            for heading in ("ID", "CATEGORY / CUBE", "X", "Y", "VALUES", "MODE", "REQUESTS", "PLAN"):
                 applied_table.add_column(heading)
             self.select_category("MV")
             self.set_interval(1.0, self.poll_selected_run)
@@ -4489,8 +4521,9 @@ def launch_terminal_ui(args, return_app: bool = False):
                 table.add_row(entry["query_id"],
                               f"{config['code']} / {config['cube']}",
                               str(len(config["x"])), str(len(config["y"])),
-                              str(len(config["measures"])), str(config["workers"]),
-                              f"{config['x_chunk']}/{config['y_chunk']}",
+                              str(len(config["measures"])),
+                              "DIRECT" if config.get("execution_mode") == "DIRECT" else "CHUNKED",
+                              "1" if config.get("execution_mode") == "DIRECT" else "PAGED",
                               entry["task_plan"]["status"], key=entry["query_id"])
             identities = [entry["query_id"] for entry in self.applied_queries]
             self.selected_query_id = previous if previous in identities else (identities[0] if identities else None)
@@ -4710,8 +4743,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             if self.active_run is not None:
                 self.info("Batch collection is already active", "warning")
                 return
-            if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
-                self.info("Validate Cookie and JWT before Start", "error")
+            if not self.cookie_value().strip():
+                self.info("Enter OIC_COOKIE before starting; the worker refreshes JWT via GenToken", "error")
                 return
             if sys.platform != "win32":
                 self.info("PowerShell collection requires Windows", "error")
@@ -4725,7 +4758,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                 for entry in document["queries"]:
                     config = validate_query(dict(entry["config"]))
                     verify_apply_plan(config, entry["query_id"], entry["task_plan"])
-                    queries.append((entry["query_id"], config, entry["task_plan"]))
+                    if config.get("execution_mode") == "DIRECT":
+                        if entry.get("request_profile") != make_direct_profile(config, entry["query_id"]):
+                            raise ValueError("Direct request profile mismatch")
+                    queries.append((entry["query_id"], config, entry["task_plan"],
+                                    entry.get("request_profile")))
                 from oic_parallel_collector import launch_terminal_window, find_powershell
                 find_powershell()
                 script = BASE_DIR / "oic_parallel_collector.py"
@@ -4738,11 +4775,13 @@ def launch_terminal_ui(args, return_app: bool = False):
                 batch_dir = root / "Runs" / run_id
                 batch_dir.mkdir(parents=True, exist_ok=False)
                 items = []
-                for query_id, config, plan in queries:
+                for query_id, config, plan, request_profile in queries:
                     config["run_id"] = run_id  # excluded from oic_query.query_hash
                     name = f"{query_id}/query_config.json"
                     local_json_atomic(batch_dir / name, config)
                     local_json_atomic(batch_dir / query_id / "task_plan.json", plan)
+                    if request_profile is not None:
+                        local_json_atomic(batch_dir / query_id / "request_profile.json", request_profile)
                     items.append(dict(query_id=query_id, code=config["code"], cube=config["cube"],
                                       config_path=name, plan_path=f"{query_id}/task_plan.json",
                                       status="PENDING", started_at=None,
@@ -4792,8 +4831,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             if self.active_run is not None:
                 self.info("A batch is already active", "warning")
                 return
-            if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
-                self.info("Validate Cookie and JWT before Resume", "warning")
+            if not self.cookie_value().strip():
+                self.info("Enter OIC_COOKIE before resuming; the worker refreshes JWT via GenToken", "warning")
                 return
             root = resolve_output_path(self.output_value()) / "Runs"
             path = self.last_run_path
@@ -5206,30 +5245,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                             classes="designer_section",
                         )
 
-                        with Horizontal(id="designer_settings"):
-                            yield Label("WORKERS")
-
-                            yield Input(
-                                value="4",
-                                id="designer_workers",
-                                type="integer",
-                            )
-
-                            yield Label("X CHUNK")
-
-                            yield Input(
-                                value="1",
-                                id="designer_x_chunk",
-                                type="integer",
-                            )
-
-                            yield Label("Y CHUNK")
-
-                            yield Input(
-                                value="20",
-                                id="designer_y_chunk",
-                                type="integer",
-                            )
+                        yield Static(
+                            "DIRECT XMLA / ONE REQUEST PER QUERY",
+                            classes="designer_section",
+                        )
 
                         yield Static(
                             "QUERY PREVIEW / LOCAL ONLY",
@@ -5286,10 +5305,6 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.by_category[self.code] = {
                         key: list(ids.get(key, [])) for key in self.chosen
                     }
-                    for name, key in (("workers", "designer_workers"),
-                                      ("x_chunk", "designer_x_chunk"),
-                                      ("y_chunk", "designer_y_chunk")):
-                        self.query_one("#" + key, Input).value = str(previous[name])
                     break
             except (ValueError, TypeError, KeyError) as exc:
                 self.show_error(f"Applied list cannot be restored: {exc}")
@@ -5755,23 +5770,14 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "selection_ids": selections,
                 "selected_fields": selected_fields,
                 "filters": [],
-                "workers": int(
-                    self.query_one(
-                        "#designer_workers", Input
-                    ).value
-                ),
-                "x_chunk": int(
-                    self.query_one(
-                        "#designer_x_chunk", Input
-                    ).value
-                ),
-                "y_chunk": int(
-                    self.query_one(
-                        "#designer_y_chunk", Input
-                    ).value
-                ),
-                "timeout": 60,
-                "delay": 1.0,
+                "execution_mode": "DIRECT",
+                "workers": 1,
+                "x_chunk": 1,
+                "y_chunk": 20,
+                "timeout": 180,
+                "retries": 2,
+                "max_response_mb": 256,
+                "delay": 0.0,
             }
 
             return validate_query(config)
@@ -5779,7 +5785,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         def preview_query(self) -> None:
             try:
                 query = self.build_query()
-                mdx = selected_mdx(query)
+                mdx = build_direct_mdx(query)
 
                 self.query_one(
                     "#designer_preview",
@@ -5789,9 +5795,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                     f"X ROWS (Axis1): {len(query['x'])}   "
                     f"Y COLUMNS (Axis0): {len(query['y'])}   "
                     f"VALUES: {len(query['measures'])}\n"
-                    f"Workers: {query['workers']}  "
-                    f"Chunks: {query['x_chunk']} × {query['y_chunk']}\n"
-                    f"NOTE: CrossJoin queries may be expensive.\n"
+                    f"DIRECT: 1 complete XMLA request (no pagination)\n"
+                    f"NOTE: Large CrossJoin queries may exceed OIC limits.\n"
                     f"{mdx}"
                 )
 
@@ -5809,8 +5814,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                 identity, changed = applied_update(self.selection_path, "append", config=config)
                 if changed:
                     self.query_one("#designer_preview", Static).update(
-                        f"APPLIED {identity} / {config['code']} / PLAN READY "
-                        f"({config['workers']} workers). Add another query without closing.")
+                        f"APPLIED {identity} / {config['code']} / DIRECT PROFILE READY "
+                        "(1 XMLA request). Add another query without closing.")
                     self.by_category[self.code] = {
                         key: list(values) for key, values in self.chosen.items()}
                 else:

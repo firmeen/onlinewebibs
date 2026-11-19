@@ -4186,136 +4186,150 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
 
         # ====================================================
-        # QUERY DESIGNER / FIELD SELECTION
+        # MAIN WINDOW: CONFIG BRIDGE AND CATALOG DISCOVERY
         # ====================================================
+
+        def selection_file(self) -> Path:
+            return resolve_output_path(self.output_value()) / "query_selection.json"
 
         def select_category(self, code: str) -> None:
             if code not in QUERY_PROFILES:
                 return
             self.selected_code = code
-            self.field_catalog = load_catalog(code)
-            defaults = default_query(code, workers=4)
-            self.axis_x = defaults["x"]
-            self.axis_y = defaults["y"]
-            self.selected_measures = defaults["measures"]
-            self.selected_field = None
-            self.refresh_field_table()
-            self.refresh_axes()
-            if code == "MR" and not self.axis_x:
-                self.info("MR YEAR needs live metadata verification.", "warning")
+            self.update_query_summary()
 
         def on_select_changed(self, event: Select.Changed) -> None:
             if event.select.id == "cube_select" and event.value in QUERY_PROFILES:
                 self.select_category(str(event.value))
 
-        def refresh_field_table(self) -> None:
-            table = self.query_one("#field_table", DataTable)
-            search = self.query_one("#field_search", Input).value.casefold().strip()
-            table.clear(columns=False)
-            self.field_rows = {}
-            for field in self.field_catalog["fields"]:
-                name = field["mdx"]
-                haystack = " ".join([field.get("display", ""), name, field.get("group", "")]).casefold()
-                if search and search not in haystack:
-                    continue
-                mark = "[X]" if name in self.axis_x else "[Y]" if name in self.axis_y else "[v]" if name in self.selected_measures else ""
-                table.add_row(mark + " " + field.get("display", name),
-                              field["type"], field.get("source", ""), key=name)
-                self.field_rows[name] = field
-            if self.selected_field not in self.field_rows:
-                self.selected_field = None
-
-        def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-            if event.data_table.id == "field_table":
-                self.selected_field = str(event.row_key.value)
-
-        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-            if event.data_table.id != "field_table":
+        def update_query_summary(self) -> None:
+            if not self.is_mounted:
                 return
-            name = str(event.row_key.value)
-            self.selected_field = name
-            field = self.field_rows.get(name)
-            if field and field["type"] == "MEASURE":
-                if name in self.selected_measures:
-                    self.selected_measures.remove(name)
-                else:
-                    self.selected_measures.append(name)
-                self.refresh_field_table()
-                self.refresh_axes()
-
-        def action_field_to_x(self) -> None:
-            self.move_selected("X")
-
-        def action_field_to_y(self) -> None:
-            self.move_selected("Y")
-
-        def move_selected(self, axis: str) -> None:
-            if isinstance(self.focused, Input):
+            config = self.applied_config
+            if not config or config.get("code") != self.selected_code:
+                self.query_one("#selected_query_summary", Static).update(
+                    f"{self.selected_code} / NO APPLIED QUERY\n"
+                    "Open Query Designer to select Rows, Columns and Values."
+                )
                 return
-            field = self.field_rows.get(self.selected_field or "")
-            if not field or field["type"] != "DIMENSION":
-                return
-            name = field["mdx"]
-            self.axis_x = [x for x in self.axis_x if x != name]
-            self.axis_y = [y for y in self.axis_y if y != name]
-            (self.axis_x if axis == "X" else self.axis_y).append(name)
-            self.refresh_field_table()
-            self.refresh_axes()
-
-        def refresh_axes(self) -> None:
-            labels = {f["mdx"]: f.get("display", f["mdx"]) for f in self.field_catalog["fields"]}
-            self.query_one("#axis_x", Select).set_options(
-                [(f"{i+1}. {labels.get(name, name)}", name)
-                 for i, name in enumerate(self.axis_x)])
-            self.query_one("#axis_y", Select).set_options(
-                [(f"{i+1}. {labels.get(name, name)}", name)
-                 for i, name in enumerate(self.axis_y)])
-            values = [labels.get(name, name) for name in self.selected_measures]
-            self.query_one("#values_list", Static).update(
-                "  |  ".join(values) if values else "Select at least one measure")
-            self.query_one("#preview_text", Static).update("Preview is local; no API call until Start.")
-
-        def modify_axis(self, action: str) -> None:
-            axis = self.axis_x if action.startswith("x") else self.axis_y
-            select = self.query_one("#axis_x" if action.startswith("x") else "#axis_y", Select)
-            name = select.value
-            if not isinstance(name, str) or name not in axis:
-                self.info("Select an axis field first.", "warning")
-                return
-            index = axis.index(name)
-            if action.endswith("remove"):
-                axis.remove(name)
-            else:
-                other = index - 1 if action.endswith("up") else index + 1
-                if 0 <= other < len(axis):
-                    axis[index], axis[other] = axis[other], axis[index]
-            self.refresh_field_table()
-            self.refresh_axes()
+            self.query_one("#selected_query_summary", Static).update(
+                f"APPLIED {config['code']} / {config['cube']}\n"
+                f"X ROWS: {len(config['x'])}  |  Y COLUMNS: {len(config['y'])}  |  "
+                f"VALUES: {len(config['measures'])}\n"
+                f"WORKERS: {config['workers']}  |  "
+                f"CHUNKS: {config['x_chunk']} ROWS × {config['y_chunk']} COLUMNS"
+            )
 
         def query_config(self) -> dict:
-            profile = QUERY_PROFILES[self.selected_code]
-            config = dict(code=self.selected_code, catalog=profile["catalog"],
-                          cube=profile["cube"], x=list(self.axis_x), y=list(self.axis_y),
-                          measures=list(self.selected_measures), filters=[],
-                          workers=int(self.query_one("#worker_count", Input).value),
-                          x_chunk=int(self.query_one("#x_chunk", Input).value),
-                          y_chunk=int(self.query_one("#y_chunk", Input).value),
-                          timeout=60, delay=1.0)
-            return validate_query(config, self.field_catalog)
+            if not self.applied_config:
+                raise ValueError("Apply a query in Query Designer before Start")
+            if self.applied_config.get("code") != self.selected_code:
+                raise ValueError("Category changed; open Query Designer and Apply this category")
+            return validate_query(dict(self.applied_config))
 
-        def preview_selected_query(self) -> None:
+        def poll_applied_selection(self) -> None:
             try:
-                config = self.query_config()
-                mdx = selected_mdx(config)
-                message = (f"Cube: {config['cube']} | Workers: {config['workers']} "
-                           f"| Chunk: {config['x_chunk']} X × {config['y_chunk']} Y\n"
-                           f"X: {', '.join(config['x'])}\nY: {', '.join(config['y'])}\n"
-                           f"Values: {len(config['measures'])}; large CrossJoins may time out.\n"
-                           + mdx)
-                self.query_one("#preview_text", Static).update(message)
-            except ValueError as exc:
-                self.query_one("#preview_text", Static).update(str(exc))
-                self.info(f"QUERY INVALID: {exc}", "warning")
+                envelope = json.loads(self.selection_file().read_text(encoding="utf-8"))
+                revision = envelope["revision"]
+                if revision == self.selection_revision:
+                    return
+                config = validate_query(envelope["query"])
+                if int(config.get("schema_version", 0)) != SCHEMA_VERSION:
+                    raise ValueError("Old query configuration cannot be applied with reversed axes")
+            except FileNotFoundError:
+                return
+            except (KeyError, ValueError, TypeError, OSError) as exc:
+                self.info(f"Applied selection rejected: {exc}", "warning")
+                return
+            self.applied_config = config
+            self.selection_revision = revision
+            self.selected_code = config["code"]
+            self.query_one("#cube_select", Select).value = config["code"]
+            self.update_query_summary()
+            self.info(f"Designer applied {config['code']} ({len(config['selected_fields'])} fields).", "success")
+
+        def open_query_designer(self) -> None:
+            if sys.platform != "win32":
+                self.info("Dedicated Query Designer requires Windows Terminal.", "error")
+                return
+            wt = shutil.which("wt.exe")
+            if not wt:
+                self.info("Windows Terminal (wt.exe) was not found.", "error")
+                return
+            selection = self.selection_file().resolve()
+            lock_path = selection.with_suffix(".lock")
+            if lock_path.exists():
+                try:
+                    pid = int(lock_path.read_text(encoding="ascii"))
+                    import ctypes
+                    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+                    if handle:
+                        ctypes.windll.kernel32.CloseHandle(handle)
+                        self.info("Query Designer is already open.", "warning")
+                        return
+                except (OSError, ValueError):
+                    pass
+                lock_path.unlink(missing_ok=True)
+            selection.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                subprocess.Popen(
+                    [wt, "-w", "new", "new-tab", "--title", "OIC | Query Designer",
+                     "--startingDirectory", str(BASE_DIR),
+                     str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
+                     "--designer", "--selection-file", str(selection),
+                     "--category", self.selected_code],
+                    cwd=str(BASE_DIR)
+                )
+                self.info("Opening dedicated Query Designer window.", "success")
+            except OSError as exc:
+                self.info(f"Designer launch failed: {exc}", "error")
+
+        def update_catalog_summary(self) -> None:
+            status = "  |  ".join(f"{code}: {self.catalog_statuses.get(code,'—')}"
+                                  for code in QUERY_PROFILES)
+            self.query_one("#catalog_status", Static).update("FY FIELD CATALOGS\n" + status)
+
+        @work(thread=True, group="five-cube-discovery", exclusive=True)
+        def discover_all_catalogs(self, force: bool = False) -> None:
+            if self.catalog_running or self.cookie_state != "VALID":
+                return
+            self.catalog_running = True
+            self.catalog_started = True
+            sequence = self.auth_sequence
+            cookie, token = self.cookie_value(), self.token_value()
+            for code in QUERY_PROFILES:
+                if sequence != self.auth_sequence:
+                    break
+                existing = load_catalog(code)
+                if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
+                    try:
+                        updated = datetime.fromisoformat(existing["refreshed_at"])
+                        if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
+                            self.call_from_thread(self.catalog_discovery_event, code,
+                                                  existing, None)
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    catalog = discover_fields(code, token, cookie)
+                    self.call_from_thread(self.catalog_discovery_event, code, catalog, None)
+                except Exception as exc:
+                    error = str(exc)[:110]
+                    self.call_from_thread(self.catalog_discovery_event, code, None, error)
+                    if "SESSION_EXPIRED" in error or "401" in error or "403" in error:
+                        break
+            self.catalog_running = False
+
+        def catalog_discovery_event(self, code: str, catalog: dict | None,
+                                    error: str | None) -> None:
+            if error:
+                self.catalog_statuses[code] = "ERROR / CACHE KEPT"
+                self.info(f"{code} metadata: {error}", "warning")
+            else:
+                self.catalog_statuses[code] = (
+                    f"{catalog['view_count']}+{catalog['data_count']}")
+                self.info(f"{code}: {len(catalog['fields'])} field items cached.", "success")
+            self.update_catalog_summary()
 
         # ====================================================
         # LIVE METADATA / RUN CONTROL

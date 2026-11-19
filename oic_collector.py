@@ -2081,6 +2081,221 @@ def run_headless(args) -> int:
         return 1
 
 
+
+# ============================================================
+# APPLIED QUERY STORAGE — CANONICAL + LEGACY COMPATIBILITY
+# ============================================================
+# Historical local branches stored each entry in "config" and optionally
+# "plan". This branch stores "query" and "task_plan". Both are accepted,
+# but only the canonical format is written after backing up the original.
+
+from contextlib import contextmanager
+
+APPLIED_STORAGE_VERSION = 2
+
+
+@contextmanager
+def applied_list_write_lock(path: Path):
+    """Serialize Main App and Designer read/modify/write transactions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".write.lock")
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\\0")
+            handle.flush()
+        acquired = False
+        start = time.monotonic()
+        try:
+            while not acquired:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except (OSError, BlockingIOError):
+                    if time.monotonic() - start >= 10:
+                        raise TimeoutError("Applied Query List is busy; retry APPLY")
+                    time.sleep(0.08)
+            yield
+        finally:
+            if acquired:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _applied_query_number(value) -> int | None:
+    if not isinstance(value, str) or not re.fullmatch(r"Q[0-9]{3,}", value):
+        return None
+    return int(value[1:])
+
+
+def applied_query_identity(config: dict) -> str:
+    """Order-sensitive fingerprint; ignores worker count and run history."""
+    values = {
+        key: config.get(key, [] if key in ("x", "y", "measures", "filters") else None)
+        for key in ("code", "cube", "x", "y", "measures", "filters")
+    }
+    return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def read_applied_queries(path: Path) -> tuple[dict, bool]:
+    """Read old 'config'/'plan' and current 'query'/'task_plan' schemas.
+
+    Never modify the file during reading. An invalid legacy record is
+    reported with its index rather than discarded or silently overwritten.
+    """
+    from oic_parallel_collector import build_selected_task_plan
+
+    try:
+        original = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {
+            "storage_version": APPLIED_STORAGE_VERSION,
+            "revision": uuid.uuid4().hex,
+            "next_query_sequence": 1,
+            "queries": [],
+        }, False
+
+    if isinstance(original, list):
+        raw_queries = original
+        document = {}
+    elif isinstance(original, dict):
+        document = original
+        raw_queries = document.get("queries")
+        if raw_queries is None and isinstance(document.get("query"), dict):
+            raw_queries = [document]
+        if not isinstance(raw_queries, list):
+            raise ValueError("Invalid applied_queries.json: expected a queries array")
+    else:
+        raise ValueError("Invalid applied_queries.json: expected an object or array")
+
+    reserved = set()
+    for raw_entry in raw_queries:
+        if not isinstance(raw_entry, dict):
+            continue
+        possible_query = raw_entry.get("query") or raw_entry.get("config")
+        if not isinstance(possible_query, dict):
+            possible_query = raw_entry
+        for candidate in (raw_entry.get("query_id"), possible_query.get("query_id")):
+            if _applied_query_number(candidate) is not None:
+                reserved.add(candidate)
+
+    stored_sequence = document.get(
+        "next_query_sequence", document.get("next_id", 1))
+    try:
+        sequence = max(1, int(stored_sequence))
+    except (TypeError, ValueError):
+        sequence = 1
+    sequence = max(sequence, (max(
+        (_applied_query_number(qid) for qid in reserved), default=0) or 0) + 1)
+
+    normalized = []
+    seen = set()
+    for index, raw_entry in enumerate(raw_queries, start=1):
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"Applied Query item #{index} is not an object")
+
+        query = raw_entry.get("query")
+        if not isinstance(query, dict):
+            query = raw_entry.get("config")
+        if not isinstance(query, dict) and all(
+            key in raw_entry for key in ("code", "cube", "x", "y", "measures")
+        ):
+            query = raw_entry
+        if not isinstance(query, dict):
+            raise ValueError(
+                f"Applied Query item #{index} has no query/config; "
+                "original file was not changed"
+            )
+
+        config = dict(query)
+        if "cube_type" not in config:
+            cube = str(config.get("cube") or "")
+            config["cube_type"] = next(
+                (kind for kind in ("UY", "AY") if cube.endswith("_" + kind)), "FY")
+
+        query_id = raw_entry.get("query_id") or config.get("query_id")
+        if _applied_query_number(query_id) is None or query_id in seen:
+            while f"Q{sequence:03d}" in reserved or f"Q{sequence:03d}" in seen:
+                sequence += 1
+            query_id = f"Q{sequence:03d}"
+            sequence += 1
+
+        config["query_id"] = query_id
+        try:
+            validate_query(config)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError(
+                f"Applied Query {query_id} (item #{index}) cannot be migrated: {exc}; "
+                "original file was not changed"
+            ) from exc
+
+        # Old plans have different allocation keys; always regenerate them
+        # from the actual validated query if stale or structurally different.
+        expected_plan = build_selected_task_plan(config)
+        plan = raw_entry.get("task_plan")
+        if (not isinstance(plan, dict) or
+                plan.get("query_hash") != expected_plan["query_hash"] or
+                plan.get("assignments") != expected_plan["assignments"]):
+            plan = expected_plan
+
+        normalized.append({
+            "query_id": query_id,
+            "query": config,
+            "task_plan": plan,
+            "applied_at": raw_entry.get("applied_at")
+            if isinstance(raw_entry.get("applied_at"), str)
+            else datetime.now(timezone.utc).isoformat(),
+        })
+        seen.add(query_id)
+
+    sequence = max(sequence, max(
+        (_applied_query_number(value) for value in seen), default=0) + 1)
+    revision = document.get("revision")
+    if not isinstance(revision, str) or not revision:
+        revision = uuid.uuid4().hex
+    result = {
+        "storage_version": APPLIED_STORAGE_VERSION,
+        "revision": revision,
+        "next_query_sequence": sequence,
+        "queries": normalized,
+    }
+    return result, result != original
+
+
+def save_applied_queries(path: Path, document: dict, *,
+                         backup_legacy: bool = False) -> None:
+    """Atomic replacement; first migration keeps the byte-for-byte old JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if backup_legacy and path.exists():
+        backup = path.with_name(
+            f"{path.stem}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid.uuid4().hex[:8]}{path.suffix}")
+        shutil.copy2(path, backup)
+    payload = dict(document)
+    payload["storage_version"] = APPLIED_STORAGE_VERSION
+    payload["revision"] = uuid.uuid4().hex
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\\n",
+            encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    document.update(payload)
+
+
 # ============================================================
 # TERMINAL APPLICATION
 # ============================================================

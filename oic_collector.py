@@ -66,7 +66,7 @@ import subprocess
 import shutil
 
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
-                       validate_query, build_mdx as selected_mdx, build_direct_mdx, query_hash)
+                       validate_query, build_direct_mdx, query_hash)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -3015,7 +3015,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             ).disabled = True
             self.query_one("#force_stop", Button).disabled = True
             applied_table = self.query_one("#applied_queries", DataTable)
-            for heading in ("ID", "CATEGORY / CUBE", "X", "Y", "VALUES", "WORKERS", "CHUNKS", "PLAN"):
+            for heading in ("ID", "CATEGORY / CUBE", "X", "Y", "VALUES", "MODE", "REQUESTS", "PLAN"):
                 applied_table.add_column(heading)
             self.select_category("MV")
             self.set_interval(1.0, self.poll_selected_run)
@@ -4521,8 +4521,9 @@ def launch_terminal_ui(args, return_app: bool = False):
                 table.add_row(entry["query_id"],
                               f"{config['code']} / {config['cube']}",
                               str(len(config["x"])), str(len(config["y"])),
-                              str(len(config["measures"])), str(config["workers"]),
-                              f"{config['x_chunk']}/{config['y_chunk']}",
+                              str(len(config["measures"])),
+                              "DIRECT" if config.get("execution_mode") == "DIRECT" else "CHUNKED",
+                              "1" if config.get("execution_mode") == "DIRECT" else "PAGED",
                               entry["task_plan"]["status"], key=entry["query_id"])
             identities = [entry["query_id"] for entry in self.applied_queries]
             self.selected_query_id = previous if previous in identities else (identities[0] if identities else None)
@@ -5244,30 +5245,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                             classes="designer_section",
                         )
 
-                        with Horizontal(id="designer_settings"):
-                            yield Label("WORKERS")
-
-                            yield Input(
-                                value="4",
-                                id="designer_workers",
-                                type="integer",
-                            )
-
-                            yield Label("X CHUNK")
-
-                            yield Input(
-                                value="1",
-                                id="designer_x_chunk",
-                                type="integer",
-                            )
-
-                            yield Label("Y CHUNK")
-
-                            yield Input(
-                                value="20",
-                                id="designer_y_chunk",
-                                type="integer",
-                            )
+                        yield Static(
+                            "DIRECT XMLA / ONE REQUEST PER QUERY",
+                            classes="designer_section",
+                        )
 
                         yield Static(
                             "QUERY PREVIEW / LOCAL ONLY",
@@ -5324,10 +5305,6 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.by_category[self.code] = {
                         key: list(ids.get(key, [])) for key in self.chosen
                     }
-                    for name, key in (("workers", "designer_workers"),
-                                      ("x_chunk", "designer_x_chunk"),
-                                      ("y_chunk", "designer_y_chunk")):
-                        self.query_one("#" + key, Input).value = str(previous[name])
                     break
             except (ValueError, TypeError, KeyError) as exc:
                 self.show_error(f"Applied list cannot be restored: {exc}")
@@ -5793,23 +5770,13 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "selection_ids": selections,
                 "selected_fields": selected_fields,
                 "filters": [],
-                "workers": int(
-                    self.query_one(
-                        "#designer_workers", Input
-                    ).value
-                ),
-                "x_chunk": int(
-                    self.query_one(
-                        "#designer_x_chunk", Input
-                    ).value
-                ),
-                "y_chunk": int(
-                    self.query_one(
-                        "#designer_y_chunk", Input
-                    ).value
-                ),
-                "timeout": 60,
-                "delay": 1.0,
+                "execution_mode": "DIRECT",
+                "workers": 1,
+                "x_chunk": 1,
+                "y_chunk": 20,
+                "timeout": 180,
+                "retries": 2,
+                "delay": 0.0,
             }
 
             return validate_query(config)
@@ -5817,7 +5784,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         def preview_query(self) -> None:
             try:
                 query = self.build_query()
-                mdx = selected_mdx(query)
+                mdx = build_direct_mdx(query)
 
                 self.query_one(
                     "#designer_preview",
@@ -5827,9 +5794,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                     f"X ROWS (Axis1): {len(query['x'])}   "
                     f"Y COLUMNS (Axis0): {len(query['y'])}   "
                     f"VALUES: {len(query['measures'])}\n"
-                    f"Workers: {query['workers']}  "
-                    f"Chunks: {query['x_chunk']} × {query['y_chunk']}\n"
-                    f"NOTE: CrossJoin queries may be expensive.\n"
+                    f"DIRECT: 1 complete XMLA request (no pagination)\n"
+                    f"NOTE: Large CrossJoin queries may exceed OIC limits.\n"
                     f"{mdx}"
                 )
 
@@ -5847,8 +5813,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                 identity, changed = applied_update(self.selection_path, "append", config=config)
                 if changed:
                     self.query_one("#designer_preview", Static).update(
-                        f"APPLIED {identity} / {config['code']} / PLAN READY "
-                        f"({config['workers']} workers). Add another query without closing.")
+                        f"APPLIED {identity} / {config['code']} / DIRECT PROFILE READY "
+                        "(1 XMLA request). Add another query without closing.")
                     self.by_category[self.code] = {
                         key: list(values) for key, values in self.chosen.items()}
                 else:

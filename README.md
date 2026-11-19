@@ -70,44 +70,55 @@ OIC_OUTPUT_DIR=output
 python oic_collector.py
 ```
 
-## 5. Query Designer: เลือกมุมมองเอง
+## 5. Five-Cube Field Catalog และ Dedicated Query Designer
 
-**ค่าเริ่มต้นใหม่: ไม่ดึง Hierarchies ทั้งหมดโดยอัตโนมัติ** ต้องเลือกมุมมองและกด Start เองก่อน
+หลัง Session ผ่าน Main Terminal จะค้นหา Field Catalog ของ AH/FI/MR/MI/MV แบบ AGGREGATE_FY ทีละหมวด โดยยังไม่เริ่มเก็บสถิติ
 
-1. ที่ Insurance Category เลือก **AH / FI / MR / MI / MV** หนึ่งหมวด
-2. ใช้ Field Explorer ค้นหาชื่อไทย อังกฤษ หรือ MDX Identifier (ค้นหาจาก Local Catalog ไม่ยิง API ทุกครั้ง)
-3. คลิก Dimension แล้วกด **A** เพื่อย้ายไป X (แนวนอน) หรือ **S** เพื่อย้ายไป Y (แนวตั้ง)
-4. เมื่อพิมพ์ใน Search ปุ่ม A/S จะพิมพ์ข้อความ ไม่เปลี่ยนแกน
-5. เลือก Measure ด้วยการคลิกรายการใน Field Explorer เพื่อเปิด/ปิด VALUES
-6. ใช้ Dropdown X/Y และปุ่ม X ↑/↓/REMOVE หรือ Y ↑/↓/REMOVE เพื่อเรียง/ลบ Field
-7. ปรับ **WORKERS** (เริ่มต้น 4), **X CHUNK** (1) และ **Y CHUNK** (20)
-8. กด **PREVIEW QUERY** เพื่อดู MDX ในเครื่อง โดยยังไม่ส่ง Request
-9. เมื่อ Session ใช้งานได้ กด **START COLLECTION**
+- GetStructure ให้ CAPTION และกลุ่ม มุมมอง/ข้อมูล ตาม OIC
+- GET_MENUTEMPLATE_LIST กับ XMLA Metadata ให้หลักฐานจับคู่ MDX Identifier
+- แสดง CAPTION ต้นฉบับทุกภาษา ไม่แปล ไม่เปลี่ยนชื่อ
+- Cache อยู่ใน output/catalog/AH.json, FI.json, MR.json, MI.json, MV.json
+- UNVERIFIED คือไม่มี Mapping พอใช้ส่ง Query; UNSUPPORTED คือ Calculation/Filter ที่ยังไม่รองรับ
+- Discovery ไม่ใช่หลักฐานว่า XMLA Execute ผ่านทุกรายการ
 
-โปรแกรมโหลด Field Catalog จากโปรไฟล์เดิมหรือแคชที่ output/catalog/CODE.json และมีปุ่ม REFRESH CATALOG เพื่ออ่าน XMLA Metadata โดยใช้ Session ที่ได้รับอนุญาต แสดง Source และไม่ถือว่าทุกฟิลด์ผ่านการทดสอบ Execute แล้วเพียงเพราะพบชื่อใน Metadata
+กด **OPEN QUERY DESIGNER** เพื่อเปิด Textual Window แยกจาก Main Terminal โดย Main ยังทำงานต่อ
 
-**MR:** YEAR ยังไม่ได้ยืนยันจาก Response ที่สำเร็จ จึงต้อง Refresh/เลือก YEAR จาก Metadata จริง ไม่เดาชื่อจาก MV หรือ Cube อื่น
+1. เลือก Insurance Category AH/FI/MR/MI/MV
+2. เลื่อนดู Tree ที่แบ่ง GROUP_DIMENSION → DIMENSION → CAPTION หรือค้นหา CAPTION, DATAFIELD, DATATABLE และ MDX
+3. คลิกฟิลด์ในกลุ่มมุมมอง แล้วกด A เพื่อเพิ่ม X = ROWS หรือ S เพื่อเพิ่ม Y = COLUMNS (มีปุ่ม + X / + Y)
+4. คลิกฟิลด์ในกลุ่มข้อมูลเพื่อเปิด/ปิด Measure ใน VALUES; เลือกหลายรายการได้
+5. เพิ่มหลายฟิลด์ต่อแกน เลือกจาก Dropdown แล้วกด ↑/↓/× เพื่อจัดลำดับหรือลบ
+6. ปรับ WORKERS (เริ่มต้น 4), X CHUNK (1), Y CHUNK (20)
+7. กด PREVIEW เพื่อแสดง MDX ในเครื่อง ไม่ส่ง API
+8. กด APPLY SELECTION เพื่อบันทึก Query และปิด Designer; Main อ่านค่าอัตโนมัติ
 
-## 6. Windows Terminal: 3 หน้าต่าง
+กด CANCEL แล้วไม่เปลี่ยน Query เดิม ขณะพิมพ์ Search ปุ่ม A/S ทำงานเป็นตัวอักษรปกติ
 
-| หน้าต่าง | หน้าที่ |
+เมื่อ Cache ยังเป็น PROFILE/UNVERIFIED สามารถ REFRESH CATALOGS จาก Main หรือ RELOAD CATALOG จาก Designer ได้ โดยไม่ดึงสถิติ
+
+## 6. สามหน้าต่างระหว่าง Collection
+
+กด START COLLECTION จาก Main หลัง Apply เท่านั้น จึงเริ่มดึงข้อมูล
+
+| Window | Function |
 |---|---|
-| 1. Query Designer | Textual UI หลัก ยังเปิดอยู่ระหว่างรัน |
-| 2. Live Monitor | Rich Monitor อ่านสถานะจริงจาก State/Heartbeat/Manifest |
-| 3. Worker Terminal | Windows Terminal หนึ่งหน้าต่าง พร้อม Tabs ตามจำนวน Workers |
+| Main Terminal | Authentication, Query Summary, Start/Stop/Resume |
+| Rich Live Monitor | Run ID, Worker/HTTP Status, Heartbeat, Chunk Summary |
+| Worker Terminal | หนึ่ง Windows Terminal พร้อม N Tabs ตาม Worker Count |
 
-Workers ใช้ requests.Session แยกกัน และรับ X Member Chunks ที่ไม่ซ้ำ โดยแต่ละ Worker จะดึง Y Member Chunks ต่อเนื่องตาม Query ที่ผู้ใช้เลือกจริง
+**schema_version=2:** X = ROWS = MDX Axis1 และ Y = COLUMNS = MDX Axis0; Measures อยู่บน Axis1 เพื่อรักษา CellOrdinal Mapping
 
-**ข้อควรระวัง:** Multi-Dimension CrossJoin อาจใช้เวลานาน ควรทดสอบมุมมองเล็กด้วย 1 Worker ก่อน และเพิ่มจำนวน Workers เมื่อบริการ OIC พร้อมใช้งาน
+Run รุ่นเก่าใช้ Semantics เดิมอย่างแยกเวอร์ชัน ไม่ใช้ Raw XML/Chunk ที่ตีความแกนคนละแบบมารวมกัน
+
+เลือกหลาย Dimensions ใช้ MDX CrossJoin จริง ซึ่งอาจหนักต่อ OIC แนะนำเริ่มทดสอบ 1 Worker ก่อนเพิ่ม Concurrency
 
 ## 7. Raw XML / Excel / Stop / Resume
-
-แต่ละ Start มี Run ID และแยก Output ไม่ให้ปะปนกัน:
 
 ~~~text
 output/
   catalog/
     AH.json, FI.json, MR.json, MI.json, MV.json
+  query_selection.json
   oic_parallel/
     RUN_ID/
       query_config.json
@@ -125,46 +136,40 @@ output/
         selected_query.xlsx
 ~~~
 
-Raw XML ถูกเก็บก่อนแปลง Excel เสมอ Excel เป็น Long Format เพื่อรักษาความสัมพันธ์ X/Y/VALUES สำหรับหลายมิติ หากบาง Chunk ล้มเหลว ชีต INFO จะระบุ PARTIAL
+- Raw XML ถูกบันทึกก่อน Excel
+- Excel เป็น Long Format เก็บทุก X/Y Member กับ Measure ตาม CellOrdinal
+- STOP ให้ Workers หยุดรับ Chunk ใหม่หลัง Request ปัจจุบัน
+- ปิด Monitor ไม่หยุด Workers
+- RESUME ใช้ Query Config เดิมและข้าม XML Chunk ที่ Valid แล้ว
+- หากบาง Chunk ล้มเหลว Excel INFO แสดง PARTIAL
 
-**STOP** จาก Query Designer จะส่งสัญญาณให้ Workers หยุดรับงานใหม่ หลังจัดการ Request ที่กำลังทำอยู่
-
-**RESUME** จาก Query Designer ใช้ Query เดิมและข้าม Chunk ที่มีไฟล์ XML ถูกต้องแล้ว หากกลับมาใช้งานภายหลัง ให้เปิด PowerShell ในโฟลเดอร์โปรแกรมและสั่ง:
+เปิด Run เดิมหรือ Export ซ้ำจาก PowerShell:
 
 ~~~powershell
 python oic_parallel_collector.py --query-config "output/oic_parallel/RUN_ID/query_config.json" --launch
-~~~
-
-หากหยุด Run เดิมด้วยปุ่ม STOP ต้องลบ stop.flag ในโฟลเดอร์ Run ก่อน Resume ทาง CLI (ปุ่ม RESUME ใน UI จัดการให้)
-
-ส่งออก Excel ซ้ำจาก Raw XML โดยไม่ยิง OIC:
-
-~~~powershell
 python oic_parallel_collector.py --query-config "output/oic_parallel/RUN_ID/query_config.json" --export-only
 ~~~
 
-การปิด Monitor ไม่หยุด Workers แต่ต้องสั่ง --export-only ภายหลังหากไม่ได้ปล่อย Monitor ไว้จนจบงาน
-
-## 8. Troubleshooting และ Tests
+## 8. Manual Validation และ Troubleshooting
 
 ~~~powershell
-python -m compileall -q oic_collector.py oic_parallel_collector.py oic_query.py
-python -m unittest discover -s tests -v
-python oic_collector.py --test-only
+python -m compileall -q oic_collector.py oic_query.py oic_parallel_collector.py
+python -c "import oic_collector, oic_query, oic_parallel_collector; print('IMPORT OK')"
+python oic_collector.py
 ~~~
 
-| ปัญหา | วิธีดำเนินการ |
+| อาการ | แนวทาง |
 |---|---|
-| Python / textual / rich / openpyxl ไม่พร้อม | python -m pip install -r requirements.txt |
-| SESSION_EXPIRED | Login เว็บ OIC ใหม่และอัปเดต Cookie ของตนเอง |
-| JWT EXPIRED | กด CHECK SESSION เพื่อขอ GenToken ใหม่ |
-| HTTP 500/503 | ตรวจความพร้อมของ Backend และลดขนาด Query ไม่เพิ่ม Workers เพื่อแก้ 503 |
-| MR ไม่มี X Default | Refresh Metadata และเลือก YEAR ที่ยืนยันได้จริง |
-| Monitor STALE | ตรวจ Worker Heartbeat และ Worker Tab ไม่สรุปว่า Completed |
-| Excel PARTIAL | ดู Worker Manifest ว่า Chunk ใดขาด |
+| Portable Python Isolated Import ไม่พบ | ตรวจ python314._pth และ Project Directory ของ Interpreter ที่ใช้งานจริง |
+| SESSION_EXPIRED | Login OIC ด้วยบัญชีที่ได้รับอนุญาต แล้วตั้ง Cookie ใหม่ |
+| JWT Expired | กด CHECK SESSION เพื่อเรียก GenToken |
+| GetStructure HTTP Error | เปิดจาก Cache แล้ว Refresh ภายหลัง |
+| UNVERIFIED | มีชื่อจาก OIC แต่ยังจับคู่ MDX ที่รองรับไม่ได้ |
+| UNSUPPORTED | Calculation/Display Mode ยังไม่รองรับ ห้าม Export ตัวเลขผิด |
+| HTTP 500/503 | ลด CrossJoin/Chunk Size และเริ่มจาก Worker เดียว |
+| Monitor STALE | ตรวจ Worker Tabs/Heartbeat |
+| Excel PARTIAL | ตรวจ Worker Manifest และ Raw XML |
 
-ข้อมูลทั้งหมดเป็น **OLAP Aggregate** ไม่ใช่ข้อมูลกรมธรรม์หรือเคลมรายธุรกรรมดิบ
+**ข้อจำกัด:** Live Metadata และการเปิด Windows Terminal 3 Windows ต้องตรวจด้วย Windows และ Session จริง; Offline Checks ไม่ใช่หลักฐานว่า Extract ครบทั้ง 5 Cube ทุก Combination
 
-**ความปลอดภัย:** ห้าม Commit .env, Cookie, JWT, Session, Raw Dataset หรือ Screenshot ที่มีค่า Credential จริง ทั้ง .env และ output/ อยู่ใน .gitignore
-
-**ข้อจำกัด:** การเปิดหน้าต่าง Windows และ Live XMLA ของ AH/FI/MR/MI/MV ต้องทดสอบด้วย Windows และ Session ที่ได้รับอนุญาต ผล Offline Tests ไม่เทียบเท่าการยืนยัน Live ทุก Cube
+ห้าม Commit .env, JWT, Cookie, Headers, Session, Network Dump หรือ Raw XML; โปรแกรมไม่สร้าง Web UI/Database/Queue และไม่ควบคุม Chrome

@@ -4484,109 +4484,135 @@ def launch_terminal_ui(args, return_app: bool = False):
         # SELECTED DATA EXTRACTION / WINDOW HANDOFF
         # ====================================================
 
+        def _launch_batch_process(self, path: Path) -> None:
+            script = BASE_DIR / "oic_parallel_collector.py"
+            if not script.is_file():
+                raise FileNotFoundError(str(script))
+            logfile = path / "batch.log"
+            with logfile.open("a", encoding="utf-8") as handle:
+                self.batch_process = subprocess.Popen(
+                    [sys.executable, str(script), "--batch-run", str(path)],
+                    cwd=str(BASE_DIR),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
+            self.active_run = path
+            self.last_run_path = path
+            self.query_one("#start", Button).disabled = True
+            self.query_one("#stop", Button).disabled = False
+            self.query_one("#force_stop", Button).disabled = False
+            self.query_one("#status", Static).update("STARTING / " + path.name)
+
         def start_selected_query(self) -> None:
             if self.active_run is not None:
-                self.info("A collection is already active; Stop or finish before restarting.", "warning")
+                self.info("A batch is active. Stop or finish it before restarting.", "warning")
                 return
             if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
-                self.info("Validate Cookie and JWT before Start; backend readiness is separate.", "error")
+                self.info("Validate Cookie and JWT before START.", "error")
                 return
-            if sys.platform != "win32" or not shutil.which("wt.exe"):
-                self.info("Windows Terminal (wt.exe) is required for the three-window workflow.", "error")
+            if not self.applied_queries:
+                self.info("APPLY at least one query before START.", "warning")
                 return
             try:
-                config = self.query_config()
                 self.save_credentials()
+                root = resolve_output_path(self.output_value()).resolve()
                 run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
-                config["run_id"] = run_id
-                config["created_at"] = datetime.now(timezone.utc).isoformat()
-                path = resolve_output_path(self.output_value()) / "oic_parallel" / run_id
+                path = root / "Runs" / run_id
                 path.mkdir(parents=True, exist_ok=False)
-                config_file = path / "query_config.json"
-                pending = config_file.with_suffix(".tmp")
-                pending.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-                pending.replace(config_file)
-                job_plan = path / "job_plan.json"
-                plan_temp = job_plan.with_suffix(".tmp")
-                plan_temp.write_text(json.dumps(
-                    {"run_id": run_id, "schema_version": config["schema_version"],
-                     "query_hash": query_hash(config),
-                     "x_rows": config["x"], "y_columns": config["y"],
-                     "measures": config["measures"],
-                     "workers": config["workers"], "partition": "x_row_page_mod_workers"},
-                    ensure_ascii=False, indent=2), encoding="utf-8")
-                plan_temp.replace(job_plan)
-                script = BASE_DIR / "oic_parallel_collector.py"
-                if not script.is_file():
-                    raise RuntimeError("oic_parallel_collector.py not found")
-                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                subprocess.Popen([sys.executable, str(script), "--query-config",
-                                  str(config_file), "--launch"], cwd=str(BASE_DIR),
-                                 creationflags=flags, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                self.active_run = path
-                self.last_run_path = path
-                self.query_one("#start", Button).disabled = True
-                self.query_one("#stop", Button).disabled = False
-                self.query_one("#status", Static).update(f"RUNNING / {run_id}")
-                self.info(f"Selected query launched: {run_id}", "success")
+                entries = []
+                from oic_parallel_collector import write_json
+                for item in self.applied_queries:
+                    qid = item["query_id"]
+                    config = dict(validate_query(item["query"]))
+                    plan = dict(item["task_plan"])
+                    if plan.get("query_hash") != query_hash(config):
+                        raise ValueError(f"{qid} changed after APPLY; re-apply to plan tasks")
+                    config["run_id"] = run_id
+                    config["created_at"] = datetime.now(timezone.utc).isoformat()
+                    config["output_root"] = str(root)
+                    qdir = path / qid
+                    qdir.mkdir()
+                    write_json(qdir / "query_config.json", config)
+                    write_json(qdir / "task_plan.json", plan)
+                    entries.append(dict(query_id=qid, code=config["code"],
+                                        cube_type=config.get("cube_type", "FY"),
+                                        cube=config["cube"], workers=config["workers"],
+                                        status="PENDING"))
+                write_json(path / "batch_config.json", {
+                    "run_id": run_id, "output_root": str(root),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "queries": entries,
+                })
+                self._launch_batch_process(path)
+                self.info(f"Batch started: {run_id} / {len(entries)} queries.", "success")
             except Exception as exc:
-                self.info(f"Cannot start collection: {exc}", "error")
+                self.active_run = None
+                self.info(f"Cannot start batch: {type(exc).__name__}: {exc}", "error")
 
         def resume_selected_query(self) -> None:
             if self.active_run is not None:
-                self.info("Finish or stop the active run before resuming.", "warning")
-                return
-            path = self.last_run_path
-            if not path or not (path / "query_config.json").is_file():
-                self.info("No previous query run to resume.", "warning")
+                self.info("Stop or finish the active batch before RESUME.", "warning")
                 return
             if self.cookie_state != "VALID":
-                self.info("Validate the Session before resuming.", "warning")
+                self.info("Validate Cookie session before RESUME.", "warning")
                 return
-            (path / "stop.flag").unlink(missing_ok=True)
-            script = BASE_DIR / "oic_parallel_collector.py"
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            root = resolve_output_path(self.output_value()).resolve()
+            runs_dir = root / "Runs"
+            eligible = sorted((p for p in runs_dir.glob("*")
+                               if (p / "batch_config.json").is_file()),
+                              reverse=True) if runs_dir.is_dir() else []
+            path = self.last_run_path if self.last_run_path and (
+                self.last_run_path / "batch_config.json").is_file() else (
+                eligible[0] if eligible else None)
+            if path is None:
+                self.info("No previous batch to resume.", "warning")
+                return
+            manifest = json.loads((path / "batch_manifest.json").read_text(
+                encoding="utf-8")) if (path / "batch_manifest.json").is_file() else {}
+            if manifest.get("status") == "COMPLETED":
+                self.info("The previous batch is already complete.", "warning")
+                return
             try:
-                subprocess.Popen([sys.executable, str(script), "--query-config",
-                                  str(path / "query_config.json"), "--launch"],
-                                 cwd=str(BASE_DIR), creationflags=flags,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.active_run = path
-                self.query_one("#start", Button).disabled = True
-                self.query_one("#stop", Button).disabled = False
-                self.info(f"Resuming {path.name}", "success")
+                (path / "stop.flag").unlink(missing_ok=True)
+                (path / "force_stop.flag").unlink(missing_ok=True)
+                self._launch_batch_process(path)
+                self.info(f"Resuming batch {path.name} from saved chunks.", "success")
             except Exception as exc:
-                self.info(f"Resume failed: {exc}", "error")
+                self.active_run = None
+                self.info(f"RESUME failed: {exc}", "error")
 
         def poll_selected_run(self) -> None:
             if self.active_run is None:
                 return
-            statuses = []
-            config_path = self.active_run / "query_config.json"
+            manifest = {}
             try:
-                workers = int(json.loads(config_path.read_text(encoding="utf-8"))["workers"])
-            except (OSError, ValueError, KeyError):
-                workers = 4
-            for wid in range(1, workers + 1):
-                path = self.active_run / f"worker_{wid:02d}" / "state.json"
-                if not path.is_file():
-                    continue
-                try:
-                    state = json.loads(path.read_text(encoding="utf-8"))
-                    statuses.append(state.get("status", "STARTING"))
-                except (OSError, ValueError):
-                    pass
+                manifest = json.loads((self.active_run / "batch_manifest.json").read_text(
+                    encoding="utf-8"))
+            except (FileNotFoundError, OSError, ValueError, TypeError):
+                pass
+            status = manifest.get("status", "STARTING")
+            items = manifest.get("queries", [])
+            details = " / ".join(f"{q['query_id']}:{q.get('status','?')}"
+                                 for q in items[:5])
             self.query_one("#status", Static).update(
-                f"RUN {self.active_run.name} | {len(statuses)}/{workers} workers | "
-                + ", ".join(statuses or ["STARTING"]))
-            if len(statuses) == workers and all(status in (
-                "COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED")
-                for status in statuses):
-                self.info(f"Run ended: {self.active_run.name} / {', '.join(statuses)}")
+                f"BATCH {self.active_run.name} / {status} / {details}"[:190])
+            process_failed = (
+                self.batch_process is not None and
+                self.batch_process.poll() is not None and
+                status not in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED")
+            )
+            if process_failed:
+                status = "FAILED"
+                self.info(f"Batch supervisor exited unexpectedly. See {self.active_run / 'batch.log'}", "error")
+            if status in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED"):
+                self.info(f"Batch ended: {self.active_run.name} / {status}.", "success" if status == "COMPLETED" else "warning")
                 self.active_run = None
+                self.batch_process = None
                 self.query_one("#start", Button).disabled = False
                 self.query_one("#stop", Button).disabled = True
+                self.query_one("#force_stop", Button).disabled = True
 
     # ========================================================
     # DEDICATED QUERY DESIGNER — same Textual framework, separate process.

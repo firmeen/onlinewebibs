@@ -137,6 +137,8 @@ KNOWN_MEASURE_NAMES = {
 KNOWN_DIMENSION_NAMES = {
     "YEAR": "ปีบัญชี",
     "FY YEAR": "ปีบัญชี",
+    "UY YEAR": "ปีรับประกัน",
+    "AY YEAR": "ปีอุบัติเหตุ",
     "MAIN NAME TH": "ประเภทงานหลัก",
     "SUB NAME TH": "ประเภทงานย่อย",
     "SUBCLASS DESC TH": "ประเภทกรมธรรม์",
@@ -244,6 +246,74 @@ PROFILES = {
 }
 
 
+# Every non-FY cube must be proven by GetStructure before it is selectable.
+CUBE_TYPES = ("FY", "UY", "AY")
+CUBE_INDEX = CATALOG_DIR / "cube_types.json"
+KNOWN_CUBE_EVIDENCE = {
+    ("MI", "UY"): ("MI_AGGREGATE_UY", "[VW PV MI AGGREGATE UY].[UY YEAR]"),
+    ("AH", "AY"): ("AH_AGGREGATE_AY", "[VW PV AH AGGREGATE AY].[AY YEAR]"),
+}
+
+def _cube_index() -> dict:
+    try:
+        value = json.loads(CUBE_INDEX.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+def cube_status(code: str, cube_type: str) -> dict:
+    if code not in PROFILES or cube_type not in CUBE_TYPES:
+        raise ValueError("Unknown insurance category / cube type")
+    if cube_type == "FY":
+        p = PROFILES[code]
+        return {"status": "AVAILABLE", "cube": p["cube"], "year": p["year"], "source": "PROFILE"}
+    found = _cube_index().get(code, {}).get(cube_type)
+    if isinstance(found, dict):
+        return found
+    example = KNOWN_CUBE_EVIDENCE.get((code, cube_type))
+    if example:
+        return {"status": "AVAILABLE", "cube": example[0], "year": example[1], "source": "OIC_EXAMPLE"}
+    return {"status": "UNKNOWN", "cube": None, "year": None, "source": "NOT_DISCOVERED"}
+
+def cube_profile(code: str, cube_type: str = "FY",
+                 *, discovery: bool = False) -> dict:
+    entry = cube_status(code, cube_type)
+    if cube_type != "FY" and entry["status"] != "AVAILABLE" and not discovery:
+        raise ValueError(f"{code}/{cube_type}: {entry['status']} - discover this cube first")
+    profile = dict(PROFILES[code])
+    profile["cube_type"] = cube_type
+    if cube_type != "FY":
+        # Candidate below is only a GetStructure probe, not executable MDX.
+        profile["cube"] = entry.get("cube") or f"{code}_AGGREGATE_{cube_type}"
+        profile["year"] = entry.get("year")
+        profile["row1"] = None
+        profile["row2"] = None
+        profile["measures"] = []
+    return profile
+
+def save_cube_status(code: str, cube_type: str, status: str,
+                     cube: str | None = None, year: str | None = None) -> None:
+    if cube_type == "FY":
+        return
+    if status not in ("AVAILABLE", "NOT_AVAILABLE", "UNKNOWN"):
+        raise ValueError("Invalid cube status")
+    data = _cube_index()
+    data.setdefault(code, {})[cube_type] = {
+        "status": status,
+        "cube": cube if status == "AVAILABLE" else None,
+        "year": year if status == "AVAILABLE" else None,
+        "source": "LIVE_DISCOVERY",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+    temp = CUBE_INDEX.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(CUBE_INDEX)
+
+def cube_options(code: str) -> list[tuple[str, str]]:
+    return [(kind, cube_status(code, kind)["status"]) for kind in CUBE_TYPES]
+
+
 # ============================================================
 # UTILITIES
 # ============================================================
@@ -309,15 +379,16 @@ def field_id(code: str, record: dict) -> str:
 # CATALOG STORAGE
 # ============================================================
 
-def cache_path(code: str) -> Path:
-    return CATALOG_DIR / f"{code}.json"
+def cache_path(code: str, cube_type: str = "FY") -> Path:
+    suffix = "" if cube_type == "FY" else "_" + cube_type
+    return CATALOG_DIR / f"{code}{suffix}.json"
 
 
-def seeded_catalog(code: str) -> dict:
+def seeded_catalog(code: str, cube_type: str = "FY") -> dict:
     if code not in PROFILES:
         raise ValueError("Unknown insurance category")
 
-    profile = PROFILES[code]
+    profile = cube_profile(code, cube_type, discovery=True)
     fields = []
 
     dimensions = filter(
@@ -333,7 +404,7 @@ def seeded_catalog(code: str) -> dict:
         caption = name.rsplit("[", 1)[-1].rstrip("]")
 
         fields.append({
-            "id": f"profile-d-{index}-{code}",
+            "id": f"profile-d-{index}-{code}-{cube_type}",
             "mdx": name,
             "display": caption,
             "caption": caption,
@@ -350,7 +421,7 @@ def seeded_catalog(code: str) -> dict:
         mdx = f"[Measures].[{name}]"
 
         fields.append({
-            "id": f"profile-m-{index}-{code}",
+            "id": f"profile-m-{index}-{code}-{cube_type}",
             "mdx": mdx,
             "display": name,
             "caption": name,
@@ -366,6 +437,7 @@ def seeded_catalog(code: str) -> dict:
     return {
         "code": code,
         "web_class": profile["cls"],
+        "cube_type": cube_type,
         "catalog": profile["catalog"],
         "cube": profile["cube"],
         "source": "PROFILE",
@@ -383,15 +455,15 @@ def seeded_catalog(code: str) -> dict:
     }
 
 
-def load_catalog(code: str) -> dict:
+def load_catalog(code: str, cube_type: str = "FY") -> dict:
     if code not in PROFILES:
         raise ValueError("Unknown insurance category")
 
-    fallback = seeded_catalog(code)
+    fallback = seeded_catalog(code, cube_type)
 
     try:
         cached = json.loads(
-            cache_path(code).read_text(
+            cache_path(code, cube_type).read_text(
                 encoding="utf-8"
             )
         )
@@ -440,11 +512,12 @@ def load_catalog(code: str) -> dict:
 
 def save_catalog(catalog: dict) -> None:
     code = catalog.get("code")
+    cube_type = catalog.get("cube_type", "FY")
 
     if code not in PROFILES:
         raise ValueError("Invalid catalog category")
 
-    if catalog.get("cube") != PROFILES[code]["cube"]:
+    if catalog.get("cube") != cube_profile(code, cube_type, discovery=True)["cube"]:
         raise ValueError("Invalid catalog cube")
 
     fields = catalog.get("fields")
@@ -459,7 +532,7 @@ def save_catalog(catalog: dict) -> None:
         exist_ok=True,
     )
 
-    destination = cache_path(code)
+    destination = cache_path(code, cube_type)
     temporary = destination.with_suffix(".tmp")
 
     try:
@@ -614,7 +687,7 @@ def discover_webform_authorizations(
             f"Unknown insurance category: {code}"
         )
 
-    profile = PROFILES[code]
+    profile = cube_profile(code, cube_type, discovery=True)
 
     referer = (
         f"{WEBFORM}?Class={profile['cls']}"
@@ -865,6 +938,7 @@ def post_webform_method(
     referer: str,
     *,
     timeout: int = 30,
+    profile: dict | None = None,
 ) -> list:
     """
     Send the original ASP.NET WebMethod request.
@@ -945,6 +1019,7 @@ def normalize_template_records(
     code: str,
     menu_records: list,
     binding_records: list,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     GET_MENUTEMPLATE_LIST:
@@ -957,7 +1032,7 @@ def normalize_template_records(
     Combine both formats without inventing MDX mappings.
     """
 
-    profile = PROFILES[code]
+    profile = profile or PROFILES[code]
 
     result = []
 
@@ -1046,6 +1121,7 @@ def normalize_getstructure(
     *,
     templates: list | None = None,
     xmla: list | None = None,
+    profile: dict | None = None,
 ) -> dict:
     """
     CAPTION is preserved exactly as returned by OIC.
@@ -1069,7 +1145,7 @@ def normalize_getstructure(
             "GetStructure must return a nonempty array"
         )
 
-    profile = PROFILES[code]
+    profile = profile or PROFILES[code]
 
     template_index: dict[
         tuple,
@@ -1174,6 +1250,7 @@ def normalize_getstructure(
             set(),
         ).add(mdx)
 
+    discovered = {(item.get("type"), item.get("mdx")) for item in xmla or []}
     fields = []
 
     for index, row in enumerate(raw):
@@ -1228,6 +1305,17 @@ def normalize_getstructure(
                         set(),
                     )
                 )
+
+        if not candidates:
+            # Match SQL source names only against actual XMLA Discover results.
+            table = str(row.get("DATATABLE") or "").replace("_", " ").upper()
+            column = str(row.get("DATAFIELD") or "").replace("_", " ").upper()
+            direct = {mdx for discovered_type, mdx in discovered
+                      if discovered_type == kind and isinstance(mdx, str)
+                      and (mdx.upper() == f"[{table}].[{column}]"
+                           or (kind == "MEASURE" and mdx.upper() == f"[MEASURES].[{column}]"))}
+            if len(direct) == 1:
+                candidates = {(next(iter(direct)), False)}
 
         if not candidates:
             candidates = {
@@ -1286,8 +1374,12 @@ def normalize_getstructure(
             for key in FIELD_COLUMNS
         }
 
+        reason = ("Exact MDX mapping from OIC metadata" if status == "MAPPED"
+                  else "Calculated/derived field" if derived
+                  else "No unique MDX mapping found" if not mapped_names
+                  else "Ambiguous MDX mappings")
         fields.append({
-            "id": field_id(code, row),
+            "id": field_id(code + "_" + profile.get("cube_type", "FY"), row),
             "mdx": mdx,
             "display": caption,
             "caption": caption,
@@ -1297,6 +1389,7 @@ def normalize_getstructure(
             "source": "GETSTRUCTURE",
             "status": status,
             "mapping_status": status,
+            "mapping_reason": reason,
             "seq": row.get("SEQ"),
             "details": retained,
         })
@@ -1309,6 +1402,7 @@ def normalize_getstructure(
     return {
         "code": code,
         "web_class": profile["cls"],
+        "cube_type": profile.get("cube_type", "FY"),
         "cube": profile["cube"],
         "catalog": profile["catalog"],
         "source": "LIVE",
@@ -1335,6 +1429,7 @@ def normalize_getstructure(
 def make_discover_request(
     code: str,
     request_type: str,
+    profile: dict | None = None,
 ) -> bytes:
     supported = {
         "MDSCHEMA_DIMENSIONS",
@@ -1354,7 +1449,7 @@ def make_discover_request(
             "Unknown insurance category"
         )
 
-    profile = PROFILES[code]
+    profile = profile or PROFILES[code]
 
     envelope = ET.Element(
         f"{{{SOAP_NS}}}Envelope"
@@ -1458,6 +1553,7 @@ def discover_xmla_metadata(
                 data=make_discover_request(
                     code,
                     kind,
+                    profile=profile,
                 ),
                 headers=headers,
                 timeout=(10, timeout),
@@ -1541,6 +1637,7 @@ def discover_fields(
     cookie: str,
     *,
     timeout: int = 30,
+    cube_type: str = "FY",
 ) -> dict:
     """
     Discover the complete field catalog for one OIC cube.
@@ -1611,9 +1708,8 @@ def discover_fields(
         )
 
         if not structure:
-            raise ValueError(
-                f"{code}: GetStructure returned zero fields"
-            )
+            save_cube_status(code, cube_type, "NOT_AVAILABLE")
+            raise ValueError(f"{code}/{cube_type}: NOT_AVAILABLE (empty GetStructure)")
 
         # ----------------------------------------------------
         # OPTIONAL: TEMPLATE MENU
@@ -1670,6 +1766,7 @@ def discover_fields(
             code,
             menu_records,
             binding_records,
+            profile=profile,
         )
 
         # ----------------------------------------------------
@@ -1683,6 +1780,7 @@ def discover_fields(
                 token,
                 referer,
                 timeout=timeout,
+                profile=profile,
             )
         )
 
@@ -1697,13 +1795,18 @@ def discover_fields(
         structure,
         templates=templates,
         xmla=xmla_fields,
+        profile=profile,
     )
 
     catalog["errors"] = errors
     catalog["source"] = "LIVE"
 
-    # Never save secrets or partial invalid catalogs.
-
+    # Successful GetStructure is evidence of availability; YEAR mapping
+    # comes only from an exact MDX identifier returned by OIC.
+    year = next((f["mdx"] for f in catalog["fields"]
+                 if f.get("mdx") and f["mdx"].upper().endswith(f".[{cube_type} YEAR]")), None)
+    if cube_type != "FY":
+        save_cube_status(code, cube_type, "AVAILABLE", profile["cube"], year)
     save_catalog(catalog)
 
     return catalog
@@ -1724,7 +1827,7 @@ def validate_query(
             "Select AH/FI/MR/MI/MV"
         )
 
-    profile = PROFILES[code]
+    profile = cube_profile(code, config.get("cube_type", "FY"))
 
     if (
         config.get("catalog") != profile["catalog"]
@@ -2067,9 +2170,7 @@ def build_mdx(
         columns = x
         rows = f"CrossJoin({y},{measures})"
 
-    cube = PROFILES[
-        config["code"]
-    ]["cube"]
+    cube = cube_profile(config["code"], config.get("cube_type", "FY"))["cube"]
 
     return (
         f"SELECT {columns} "

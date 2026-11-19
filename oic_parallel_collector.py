@@ -4001,7 +4001,7 @@ def selected_worker(args) -> int:
                                           error=text_message[:300],
                                           completed_at=utc_now())
         has_success = any(c.get("status") == "OK" for c in manifest["chunks"].values())
-        state["status"] = ("SESSION_EXPIRED" if "SESSION_EXPIRED" in text_message
+        state["status"] = ("SESSION_EXPIRED" if any(marker in text_message.upper() for marker in ("SESSION_EXPIRED", "COOKIE SESSION EXPIRED", "AUTH HTTP 401", "AUTH HTTP 403"))
                            else "PARTIAL" if has_success else "FAILED")
         state["last_message"] = text_message[:200]
         log(f"FAILED: {text_message}", worker_id, "ERROR")
@@ -4153,6 +4153,15 @@ def selected_launch(config: dict, run_dir: Path, config_path: Path) -> int:
     def command(extra):
         return [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
                 "--query-config", str(config_path), *extra]
+    # Each resume attempt re-enters STARTING; do not mistake a previous
+    # terminal state for the current worker processes.
+    for worker_id in range(1, int(config["workers"]) + 1):
+        state_file = run_dir / f"worker_{worker_id:02d}" / "state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        write_json(state_file, dict(run_id=config["run_id"], worker_id=worker_id,
+                                    status="STARTING", current_request=None,
+                                    request_started_at=None, last_http=None,
+                                    last_message="Starting this attempt", updated_at=utc_now()))
     # Exactly two new Windows Terminal windows. The Textual UI stays alive.
     monitor_ps = "& " + powershell_quote(command([])[0]) + " " + " ".join(powershell_quote(a) for a in command([])[1:] + ["--monitor-only"])
     subprocess.Popen([wt, "-w", "new", "new-tab", "--title", "OIC | Live Monitor",

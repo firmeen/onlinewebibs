@@ -4667,11 +4667,11 @@ def launch_terminal_ui(args, return_app: bool = False):
             )
 
         def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
-            if event.tree.id == "catalog_tree":
+            if event.control.id == "catalog_tree":
                 self.highlighted_id = event.node.data if isinstance(event.node.data, str) else None
 
         def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
-            if event.tree.id != "catalog_tree":
+            if event.control.id != "catalog_tree":
                 return
             item = event.node.data
             if not isinstance(item, str) or item not in self.fields:
@@ -4870,6 +4870,11 @@ def main() -> int:
             "/ Live Authentication Terminal UI"
         )
     )
+
+    parser.add_argument("--designer", action="store_true",
+                        help="Open the dedicated Textual query designer")
+    parser.add_argument("--selection-file", type=str, default="output/query_selection.json")
+    parser.add_argument("--category", choices=list(PROFILES), default="MV")
 
     parser.add_argument(
         "--cli",

@@ -673,6 +673,9 @@ def create_webform_session(
 
     return session
 
+# FILE: oic_query.py
+# ตำแหน่งที่ 1: บรรทัด ~677
+# แทนที่ฟังก์ชัน discover_webform_authorizations() ทั้งฟังก์ชัน
 
 def discover_webform_authorizations(
     session,
@@ -694,7 +697,7 @@ def discover_webform_authorizations(
             f"Unknown insurance category: {code}"
         )
 
-    profile = cube_profile(code, cube_type, discovery=True)
+    profile = PROFILES[code]
 
     referer = (
         f"{WEBFORM}?Class={profile['cls']}"
@@ -745,10 +748,6 @@ def discover_webform_authorizations(
         if values
     ):
         return auth
-
-    # Only inspect same-origin JavaScript referenced by the page.
-    # Inline page scripts are preferred; external scripts are
-    # fetched only if required Authorization values are missing.
 
     script_pattern = re.compile(
         r"""<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""",
@@ -1638,6 +1637,10 @@ def discover_xmla_metadata(
 # LIVE FIVE-CUBE FIELD DISCOVERY
 # ============================================================
 
+# FILE: oic_query.py
+# ตำแหน่งที่ 2: บรรทัด ~1641
+# แทนที่ฟังก์ชัน discover_fields() ทั้งฟังก์ชัน
+
 def discover_fields(
     code: str,
     token: str,
@@ -1676,7 +1679,11 @@ def discover_fields(
             f"{code}: OIC_COOKIE is missing"
         )
 
-    profile = PROFILES[code]
+    profile = cube_profile(
+        code,
+        cube_type,
+        discovery=True,
+    )
 
     referer = (
         f"{WEBFORM}?Class={profile['cls']}"
@@ -1685,20 +1692,14 @@ def discover_fields(
     errors = []
 
     with create_webform_session(cookie) as session:
-        # Authentication values must come from the
-        # current WebForm page, not an unrelated JWT.
 
-        authorizations = (
-            discover_webform_authorizations(
-                session,
-                code,
-                timeout=timeout,
-            )
+        authorizations = discover_webform_authorizations(
+            session,
+            code,
+            timeout=timeout,
         )
 
-        # ----------------------------------------------------
-        # MANDATORY: GETSTRUCTURE
-        # ----------------------------------------------------
+        # GETSTRUCTURE
 
         structure = post_webform_method(
             session=session,
@@ -1715,12 +1716,17 @@ def discover_fields(
         )
 
         if not structure:
-            save_cube_status(code, cube_type, "NOT_AVAILABLE")
-            raise ValueError(f"{code}/{cube_type}: NOT_AVAILABLE (empty GetStructure)")
+            save_cube_status(
+                code,
+                cube_type,
+                "NOT_AVAILABLE",
+            )
+            raise ValueError(
+                f"{code}/{cube_type}: NOT_AVAILABLE "
+                "(empty GetStructure)"
+            )
 
-        # ----------------------------------------------------
-        # OPTIONAL: TEMPLATE MENU
-        # ----------------------------------------------------
+        # TEMPLATE MENU
 
         menu_records = []
 
@@ -1743,9 +1749,7 @@ def discover_fields(
                 f"GET_MENUTEMPLATE_LIST: {exc}"
             )
 
-        # ----------------------------------------------------
-        # OPTIONAL: EXISTING PIVOT MAPPINGS
-        # ----------------------------------------------------
+        # EXISTING PIVOT MAPPINGS
 
         binding_records = []
 
@@ -1776,26 +1780,20 @@ def discover_fields(
             profile=profile,
         )
 
-        # ----------------------------------------------------
-        # OPTIONAL: XMLA METADATA
-        # ----------------------------------------------------
+        # XMLA METADATA
 
-        xmla_fields, xmla_errors = (
-            discover_xmla_metadata(
-                session,
-                code,
-                token,
-                referer,
-                timeout=timeout,
-                profile=profile,
-            )
+        xmla_fields, xmla_errors = discover_xmla_metadata(
+            session,
+            code,
+            token,
+            referer,
+            timeout=timeout,
+            profile=profile,
         )
 
         errors.extend(xmla_errors)
 
-    # --------------------------------------------------------
     # NORMALIZE CATALOG
-    # --------------------------------------------------------
 
     catalog = normalize_getstructure(
         code,
@@ -1808,12 +1806,27 @@ def discover_fields(
     catalog["errors"] = errors
     catalog["source"] = "LIVE"
 
-    # Successful GetStructure is evidence of availability; YEAR mapping
-    # comes only from an exact MDX identifier returned by OIC.
-    year = next((f["mdx"] for f in catalog["fields"]
-                 if f.get("mdx") and f["mdx"].upper().endswith(f".[{cube_type} YEAR]")), None)
+    year = next(
+        (
+            field["mdx"]
+            for field in catalog["fields"]
+            if field.get("mdx")
+            and field["mdx"].upper().endswith(
+                f".[{cube_type} YEAR]"
+            )
+        ),
+        None,
+    )
+
     if cube_type != "FY":
-        save_cube_status(code, cube_type, "AVAILABLE", profile["cube"], year)
+        save_cube_status(
+            code,
+            cube_type,
+            "AVAILABLE",
+            profile["cube"],
+            year,
+        )
+
     save_catalog(catalog)
 
     return catalog

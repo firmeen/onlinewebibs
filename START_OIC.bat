@@ -28,7 +28,7 @@ if /I not "%~1"=="--inside" (
         pause
         exit /b 1
     )
-    powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$bat = ('%~f0').Replace([char]39, [string][char]39+[char]39); $script = '& ' + [char]39 + $bat + [char]39 + ' --inside'; $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)); Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList ('-NoLogo -NoProfile -NoExit -EncodedCommand ' + $enc) -WorkingDirectory '%CD%' -WindowStyle Maximized"
+    powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$bat = ('%~f0').Replace([string][char]39, ([string][char]39 + [char]39)); $script = '& ' + [char]39 + $bat + [char]39 + ' --inside'; $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)); Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList ('-NoLogo -NoProfile -NoExit -EncodedCommand ' + $enc) -WorkingDirectory '%CD%' -WindowStyle Maximized"
     exit /b %ERRORLEVEL%
 )
 

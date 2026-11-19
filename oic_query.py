@@ -340,51 +340,86 @@ def discover_fields(code: str, token: str, cookie: str, *, timeout: int = 30) ->
 
 
 def validate_query(config: dict, catalog: dict | None = None) -> dict:
-    code = config.get("code", "")
+    code = config.get("code")
     if code not in PROFILES:
-        raise ValueError("Select AH, FI, MR, MI or MV")
-    cat = catalog or load_catalog(code)
+        raise ValueError("Select AH/FI/MR/MI/MV")
     p = PROFILES[code]
-    if config.get("cube") != p["cube"] or config.get("catalog") != p["catalog"]:
-        raise ValueError("Cube/Catalog do not match the selected insurance category")
-    x = config.get("x", [])
-    y = config.get("y", [])
-    measures = config.get("measures", [])
-    if not isinstance(x, list) or not isinstance(y, list) or not x or not y:
-        raise ValueError("Select at least one X and one Y dimension")
+    if config.get("catalog") != p["catalog"] or config.get("cube") != p["cube"]:
+        raise ValueError("Catalog/Cube do not match the selected category")
+    version = int(config.get("schema_version", 1))
+    if version not in (1, SCHEMA_VERSION):
+        raise ValueError("Unsupported query schema version")
+    x, y, measures = (config.get(k) for k in ("x", "y", "measures"))
+    if not all(isinstance(v, list) and v for v in (x, y, measures)):
+        raise ValueError("Select X/ROWS, Y/COLUMNS and at least one Measure")
     if len(x) + len(y) > 5:
-        raise ValueError("Maximum five selected dimensions across X and Y for safe preview")
-    if len(x + y) != len(set(x + y)):
-        raise ValueError("Duplicate hierarchy across X/Y is not supported")
-    allowed = {f["mdx"]: f["type"] for f in cat["fields"]}
-    for item in x + y:
-        if not IDENTIFIER.fullmatch(item) or allowed.get(item) != "DIMENSION":
-            raise ValueError(f"Dimension unavailable in selected catalog: {item}")
-    if not measures or len(measures) != len(set(measures)):
-        raise ValueError("Select at least one distinct measure")
-    for item in measures:
-        if not MEASURE_IDENTIFIER.fullmatch(item) or allowed.get(item) != "MEASURE":
-            raise ValueError(f"Measure unavailable in selected catalog: {item}")
-    workers = int(config.get("workers", 1))
-    xs = int(config.get("x_chunk", 1))
-    ys = int(config.get("y_chunk", 20))
-    if not 1 <= workers <= 6 or not 1 <= xs <= 20 or not 1 <= ys <= 100:
-        raise ValueError("Workers: 1–6, X chunk: 1–20, Y chunk: 1–100")
+        raise ValueError("Maximum five selected hierarchies for safe CrossJoin")
+    if len(set(x+y)) != len(x+y) or len(set(measures)) != len(measures):
+        raise ValueError("Duplicate hierarchy or Measure in query")
+    for name in x+y:
+        if not IDENTIFIER.fullmatch(name):
+            raise ValueError("Invalid hierarchy identifier: " + str(name))
+    for name in measures:
+        if not MEASURE_IDENTIFIER.fullmatch(name):
+            raise ValueError("Invalid Measure identifier: " + str(name))
+    if version == SCHEMA_VERSION:
+        ids = config.get("selection_ids", {})
+        snapshot = config.get("selected_fields", [])
+        if not isinstance(ids, dict) or not isinstance(snapshot, list):
+            raise ValueError("Missing applied selection identities")
+        source = {f.get("id"): f for f in snapshot if isinstance(f, dict)}
+        if len(source) != len(snapshot):
+            raise ValueError("Duplicate selected display identity")
+        for axis, names in (("x", x), ("y", y), ("measures", measures)):
+            identities = ids.get(axis, [])
+            if len(identities) != len(names):
+                raise ValueError(f"Missing {axis} selection identity")
+            for identity, mdx in zip(identities, names):
+                field = source.get(identity)
+                if not field or field.get("mdx") != mdx or field.get("status") not in ("MAPPED", "VERIFIED"):
+                    raise ValueError(f"Unmapped/unsupported field in {axis}: {identity}")
+                if field.get("type") != ("MEASURE" if axis == "measures" else "DIMENSION"):
+                    raise ValueError("Field type mismatch")
+        if len(set(ids["x"]+ids["y"])) != len(x+y):
+            raise ValueError("Duplicate display field on both axes")
+    else:
+        cat = catalog or load_catalog(code)
+        allowed = {(f.get("mdx"), f.get("type")) for f in cat["fields"]}
+        for name in x+y:
+            if (name, "DIMENSION") not in allowed:
+                raise ValueError("Unknown hierarchy: " + name)
+        for name in measures:
+            if (name, "MEASURE") not in allowed:
+                raise ValueError("Unknown Measure: " + name)
+    try:
+        workers = int(config.get("workers", 4))
+        xc = int(config.get("x_chunk", 1))
+        yc = int(config.get("y_chunk", 20))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Workers and chunk sizes must be integers") from exc
+    if not 1 <= workers <= 6 or not 1 <= xc <= 20 or not 1 <= yc <= 100:
+        raise ValueError("Workers 1-6; X chunks 1-20; Y chunks 1-100")
     if config.get("filters"):
-        raise ValueError("Filter expressions are not enabled without validated metadata")
+        raise ValueError("Filters require verified metadata; unsupported in this release")
+    for secret in ("cookie", "token", "jwt", "authorization", "OIC_COOKIE", "OIC_BEARER_TOKEN"):
+        if secret in config:
+            raise ValueError("Authentication secrets must not be in query configuration")
     return config
 
 
-def default_query(code: str, *, workers: int = 1) -> dict:
+def default_query(code: str, *, workers: int = 1, schema_version: int = 1) -> dict:
     p = PROFILES[code]
+    # Preserve historical v1 defaults for archived runs. The new designer makes
+    # a separate v2 configuration from mapped field identities.
     return dict(code=code, cube=p["cube"], catalog=p["catalog"],
                 x=[p["year"]] if p["year"] else [], y=[p["row1"]],
                 measures=[f"[Measures].[{name}]" for name in p["measures"]],
-                filters=[], workers=workers, x_chunk=1, y_chunk=20)
+                filters=[], workers=workers, x_chunk=1, y_chunk=20,
+                **({"schema_version": schema_version} if schema_version != 1 else {}))
 
 
 def axis_set(fields: list[str], offset: int, size: int) -> str:
-    if offset < 0 or size < 1:
+    if not fields or offset < 0 or size < 1:
         raise ValueError("Invalid pagination")
     members = [field + ".AllMembers" for field in fields]
     result = members[0]
@@ -397,9 +432,14 @@ def build_mdx(config: dict, x_offset: int = 0, y_offset: int = 0) -> str:
     validate_query(config)
     x = axis_set(config["x"], x_offset, int(config.get("x_chunk", 1)))
     y = axis_set(config["y"], y_offset, int(config.get("y_chunk", 20)))
-    m = "{" + ",".join(config["measures"]) + "}"
-    rows = f"CrossJoin({y},{m})"
-    return (f"SELECT {x} DIMENSION PROPERTIES PARENT_UNIQUE_NAME,"
+    measures = "{" + ",".join(config["measures"]) + "}"
+    if int(config.get("schema_version", 1)) == SCHEMA_VERSION:
+        # User-facing X = ROWS / Axis1, Y = COLUMNS / Axis0.
+        columns, rows = y, f"CrossJoin({x},{measures})"
+    else:
+        # Only for previously stored v1 runs: X = Axis0, Y = Axis1.
+        columns, rows = x, f"CrossJoin({y},{measures})"
+    return (f"SELECT {columns} DIMENSION PROPERTIES PARENT_UNIQUE_NAME,"
             f"HIERARCHY_UNIQUE_NAME,MEMBER_VALUE ON COLUMNS,"
             f"{rows} DIMENSION PROPERTIES PARENT_UNIQUE_NAME,"
             f"HIERARCHY_UNIQUE_NAME,MEMBER_VALUE ON ROWS "
@@ -458,21 +498,22 @@ def parse_xmla(content: bytes) -> dict:
 
 
 def excel_records(config: dict, data: dict):
-    """Long-format rows keep all X/Y dimensions, members and the selected Measure."""
+    """Long-format records keep every hierarchy and Measure without aggregation."""
     columns = data["axes"]["Axis0"]
     rows = data["axes"]["Axis1"]
     width = len(columns)
+    modern = int(config.get("schema_version", 1)) == SCHEMA_VERSION
     for ri, row in enumerate(rows):
         measure = next((m for m in row if m["hierarchy"] == "[Measures]"), None)
         if measure is None:
-            raise ValueError("No [Measures] member on Axis1")
-        y = [m for m in row if m["hierarchy"] != "[Measures]"]
-        for ci, x in enumerate(columns):
+            raise ValueError("Missing Measures member on Axis1")
+        dimensions = [m for m in row if m["hierarchy"] != "[Measures]"]
+        for ci, column in enumerate(columns):
             ordinal = ci + width * ri
             if ordinal not in data["cells"]:
                 continue
-            value = data["cells"][ordinal]
-            yield {
-                "X": x, "Y": y, "MEASURE": measure["unique_name"],
-                "VALUE": value, "LAST_DATA_UPDATE": data["last_data_update"],
-            }
+            yield dict(X=dimensions if modern else column,
+                       Y=column if modern else dimensions,
+                       MEASURE=measure["unique_name"],
+                       VALUE=data["cells"][ordinal],
+                       LAST_DATA_UPDATE=data["last_data_update"])

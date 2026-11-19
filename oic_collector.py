@@ -67,7 +67,8 @@ import shutil
 
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
                        validate_query, build_mdx as selected_mdx, query_hash,
-                        cube_status, cube_profile, cube_options, CUBE_TYPES)
+                        cube_status, cube_profile, cube_options, CUBE_TYPES,
+                        verify_field)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2442,7 +2443,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.force_confirm_until = 0
             self.catalog_running = False
             self.catalog_started = False
-            self.catalog_statuses = {code: "CACHE" if load_catalog(code)["source"] == "CACHE" else "PROFILE" for code in QUERY_PROFILES}
+            self.catalog_statuses = {
+                f"{code}/{kind}": cube_status(code, kind)["status"]
+                for code in QUERY_PROFILES for kind in CUBE_TYPES
+            }
 
             self.busy = False
             self.stop_event = threading.Event()
@@ -4434,9 +4438,12 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
 
         def update_catalog_summary(self) -> None:
-            status = "  |  ".join(f"{code}: {self.catalog_statuses.get(code,'—')}"
-                                  for code in QUERY_PROFILES)
-            self.query_one("#catalog_status", Static).update("FY FIELD CATALOGS\n" + status)
+            status = "  |  ".join(
+                f"{code}/{kind}: {self.catalog_statuses.get(f'{code}/{kind}', 'UNKNOWN')}"
+                for code in QUERY_PROFILES for kind in CUBE_TYPES
+            )
+            self.query_one("#catalog_status", Static).update(
+                "FY / UY / AY CUBE CATALOGS\n" + status)
 
         @work(thread=True, group="five-cube-discovery", exclusive=True)
         def discover_all_catalogs(self, force: bool = False) -> None:
@@ -4446,38 +4453,46 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.catalog_started = True
             sequence = self.auth_sequence
             cookie, token = self.cookie_value(), self.token_value()
-            for code in QUERY_PROFILES:
-                if sequence != self.auth_sequence:
-                    break
-                existing = load_catalog(code)
-                if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
-                    try:
-                        updated = datetime.fromisoformat(existing["refreshed_at"])
-                        if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
-                            self.call_from_thread(self.catalog_discovery_event, code,
-                                                  existing, None)
-                            continue
-                    except (TypeError, ValueError):
-                        pass
-                try:
-                    catalog = discover_fields(code, token, cookie)
-                    self.call_from_thread(self.catalog_discovery_event, code, catalog, None)
-                except Exception as exc:
-                    error = str(exc)[:110]
-                    self.call_from_thread(self.catalog_discovery_event, code, None, error)
-                    if "SESSION_EXPIRED" in error or "401" in error or "403" in error:
-                        break
-            self.catalog_running = False
+            try:
+                for code in QUERY_PROFILES:
+                    for cube_type in CUBE_TYPES:
+                        if sequence != self.auth_sequence:
+                            return
+                        existing = load_catalog(code, cube_type)
+                        if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
+                            try:
+                                updated = datetime.fromisoformat(existing["refreshed_at"])
+                                if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
+                                    self.call_from_thread(self.catalog_discovery_event,
+                                                          code, cube_type, existing, None)
+                                    continue
+                            except (TypeError, ValueError):
+                                pass
+                        try:
+                            result = discover_fields(code, token, cookie, cube_type=cube_type)
+                            self.call_from_thread(self.catalog_discovery_event,
+                                                  code, cube_type, result, None)
+                        except Exception as exc:
+                            error = str(exc)[:150]
+                            self.call_from_thread(self.catalog_discovery_event,
+                                                  code, cube_type, None, error)
+                            if any(x in error.upper() for x in ("SESSION_EXPIRED", "HTTP 401", "HTTP 403")):
+                                return
+            finally:
+                self.catalog_running = False
 
-        def catalog_discovery_event(self, code: str, catalog: dict | None,
-                                    error: str | None) -> None:
+        def catalog_discovery_event(self, code: str, cube_type: str,
+                                    catalog: dict | None, error: str | None) -> None:
+            key = f"{code}/{cube_type}"
             if error:
-                self.catalog_statuses[code] = "ERROR / CACHE KEPT"
-                self.info(f"{code} metadata: {error}", "warning")
+                self.catalog_statuses[key] = cube_status(code, cube_type)["status"]
+                if "NOT_AVAILABLE" not in error:
+                    self.info(f"{key} metadata: {error}", "warning")
             else:
-                self.catalog_statuses[code] = (
-                    f"{catalog['view_count']}+{catalog['data_count']}")
-                self.info(f"{code}: {len(catalog['fields'])} field items cached.", "success")
+                self.catalog_statuses[key] = (
+                    f"AVAILABLE {catalog['view_count']}+{catalog['data_count']}"
+                )
+                self.info(f"{key}: {len(catalog['fields'])} fields cached.", "success")
             self.update_catalog_summary()
 
         # ====================================================
@@ -4874,6 +4889,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                                 "RELOAD",
                                 id="reload_designer_catalog",
                             )
+                            yield Button(
+                                "VERIFY",
+                                id="verify_designer_field",
+                            )
 
                     with Vertical(id="query_right"):
 
@@ -5100,6 +5119,33 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.call_from_thread(self.catalog_refreshed, code, cube_type, result, None)
             except Exception as exc:
                 self.call_from_thread(self.catalog_refreshed, code, cube_type, None, str(exc)[:200])
+
+        @work(thread=True, group="designer-verify", exclusive=True)
+        def verify_selected_field(self) -> None:
+            item = self.highlighted_id
+            field = self.fields.get(item)
+            if not field:
+                self.call_from_thread(self.show_error, "Select a field in the Tree first")
+                return
+            env = read_env()
+            code, cube_type = self.code, self.cube_type
+            try:
+                result = verify_field(code, cube_type, item,
+                                      env.get("OIC_BEARER_TOKEN", ""),
+                                      env.get("OIC_COOKIE", ""))
+                self.call_from_thread(
+                    self.field_verified, code, cube_type, result["caption"])
+            except Exception as exc:
+                self.call_from_thread(self.show_error, f"VERIFY FAILED: {exc}")
+
+        def field_verified(self, code: str, cube_type: str, caption: str) -> None:
+            if (code, cube_type) == (self.code, self.cube_type):
+                self.by_category[(code, cube_type)] = {
+                    axis: list(v) for axis, v in self.chosen.items()
+                }
+                self.update_catalog(code, cube_type)
+            self.query_one("#designer_preview", Static).update(
+                f"VERIFIED {code}/{cube_type}: {caption} — XMLA Execute successful")
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "catalog_search":
@@ -5707,6 +5753,8 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             elif operation == "reload_designer_catalog":
                 self.refresh_catalog_worker()
+            elif operation == "verify_designer_field":
+                self.verify_selected_field()
 
             elif operation == "designer_preview_button":
                 self.preview_query()

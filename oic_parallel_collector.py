@@ -3877,6 +3877,35 @@ def build_parser() -> argparse.ArgumentParser:
 # The old full-hierarchy CLI remains diagnostic, never the default.
 # ============================================================
 
+def build_selected_task_plan(config: dict) -> dict:
+    """Immutable, deterministic worker allocations prepared at APPLY time.
+
+    Exact chunk count depends on server member counts: discovery remains
+    dynamic, but every X page already has exactly one worker owner.
+    """
+    validate_query(config)
+    count = int(config["workers"])
+    x_size = int(config["x_chunk"])
+    return {
+        "query_hash": query_hash(config),
+        "query_id": config.get("query_id"),
+        "code": config["code"],
+        "cube": config["cube"],
+        "cube_type": config.get("cube_type", "FY"),
+        "created_at": utc_now(),
+        "task_count": None,
+        "task_count_status": "DYNAMIC",
+        "assignments": [
+            {"worker_id": wid,
+             "x_offset_start": (wid - 1) * x_size,
+             "x_offset_stride": count * x_size,
+             "y_offset_start": 0,
+             "y_offset_step": int(config["y_chunk"])}
+            for wid in range(1, count + 1)
+        ],
+    }
+
+
 def selected_paths(config_path: Path):
     config_path = config_path.resolve()
     run_dir = config_path.parent
@@ -4325,6 +4354,197 @@ def selected_launch(
     return 0
 
 
+# ============================================================
+# BATCH SUPERVISOR — one monitor, sequential queries, parallel
+# hidden workers; all state survives application restarts.
+# ============================================================
+
+BATCH_TERMINAL = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED", "PENDING"}
+
+def _batch_snapshot(batch_dir: Path, *, status: str, current: str | None,
+                    entries: list[dict], error: str = "") -> None:
+    write_json(batch_dir / "batch_manifest.json", {
+        "run_id": batch_dir.name, "pid": os.getpid(),
+        "status": status, "current_query": current,
+        "queries": entries, "error": error,
+        "updated_at": utc_now(),
+    })
+
+def _update_history(root: Path, record: dict) -> None:
+    path = root / "history.csv"
+    columns = ("run_id", "query_id", "code", "cube_type", "cube",
+               "status", "started_at", "finished_at", "rows", "excel_path", "error")
+    rows = []
+    if path.is_file():
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    rows = [row for row in rows
+            if (row.get("run_id"), row.get("query_id")) !=
+            (record["run_id"], record["query_id"])]
+    rows.append(record)
+    temp = path.with_suffix(".tmp")
+    with temp.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    temp.replace(path)
+
+def batch_monitor(batch_dir: Path) -> int:
+    with Live(console=console, refresh_per_second=1,
+              screen=True, transient=False) as live:
+        while True:
+            manifest = read_json(batch_dir / "batch_manifest.json", {}) or {}
+            rows = manifest.get("queries", [])
+            table = Table(title="OIC | MULTI-QUERY LIVE MONITOR",
+                          box=rich_box.ROUNDED, expand=True)
+            for name in ("Query", "Category", "Cube", "Status", "Workers", "Chunks", "Last Event"):
+                table.add_column(name)
+            for entry in rows:
+                qdir = batch_dir / entry["query_id"]
+                cfg = read_json(qdir / "query_config.json", {}) or {}
+                if cfg and entry.get("status") in ("RUNNING", "STOPPING"):
+                    workers, summary = selected_summary(cfg, qdir)
+                    workers_label = f"{summary['workers_terminal']}/{len(workers)}"
+                    chunks_label = str(summary["chunks_ok"])
+                    last = next((w.get("last_message") for w in reversed(workers)
+                                 if w.get("last_message")), "—")
+                else:
+                    workers_label = str(entry.get("workers", "—"))
+                    chunks_label = str(entry.get("chunks_ok", "—"))
+                    last = str(entry.get("error") or "—")
+                table.add_row(entry["query_id"], str(entry.get("code", "")),
+                              str(entry.get("cube_type", "FY")),
+                              str(entry.get("status", "PENDING")),
+                              workers_label, chunks_label, str(last)[:55])
+            head = (f"Run: {batch_dir.name} | Status: {manifest.get('status','STARTING')}\n"
+                    f"Current: {manifest.get('current_query') or '—'} | "
+                    f"Queries: {len(rows)} | Ctrl+C closes only this monitor")
+            live.update(Group(Panel(head, title="BATCH OVERVIEW"), table), refresh=True)
+            if manifest.get("status") in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED"):
+                break
+            time.sleep(1)
+    return 0
+
+def run_batch(batch_dir: Path) -> int:
+    batch_dir = Path(batch_dir).resolve()
+    batch = read_json(batch_dir / "batch_config.json", {}) or {}
+    entries = [dict(entry, status=entry.get("status", "PENDING"))
+               for entry in batch.get("queries", [])]
+    if not entries or batch.get("run_id") != batch_dir.name:
+        raise RuntimeError("Invalid or missing batch configuration")
+    output_root = Path(batch["output_root"]).resolve()
+    stop = batch_dir / "stop.flag"
+    force = batch_dir / "force_stop.flag"
+    _batch_snapshot(batch_dir, status="STARTING", current=None, entries=entries)
+    python = str(Path(sys.executable).resolve())
+    script = str(Path(__file__).resolve())
+    launch_terminal_window(
+        [[python, script, "--batch-monitor", str(batch_dir)]],
+        title="OIC | Live Monitor", cwd=HERE, keep_open=False)
+    try:
+        for entry in entries:
+            qid = entry["query_id"]
+            qdir = batch_dir / qid
+            cfg_path = qdir / "query_config.json"
+            config, _ = selected_paths(cfg_path)
+            expected = read_json(qdir / "task_plan.json", {})
+            if expected.get("query_hash") != query_hash(config):
+                entry.update(status="FAILED", error="Apply-time plan does not match configuration")
+                _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
+                continue
+            old = read_json(batch_dir / "batch_manifest.json", {}) or {}
+            previous = next((e for e in old.get("queries", [])
+                             if e.get("query_id") == qid), {})
+            if (previous.get("status") == "COMPLETED"
+                    and previous.get("excel_path")
+                    and Path(previous["excel_path"]).is_file()):
+                entry.update(previous)
+                continue
+            if stop.exists():
+                break
+            (qdir / "stop.flag").unlink(missing_ok=True)
+            entry.update(status="RUNNING", error="", started_at=utc_now())
+            _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
+            processes = []
+            for worker_id in range(1, int(config["workers"]) + 1):
+                if stop.exists():
+                    break
+                wd = qdir / f"worker_{worker_id:02d}"
+                wd.mkdir(parents=True, exist_ok=True)
+                state_path = wd / "state.json"
+                write_json(state_path, dict(run_id=config["run_id"],
+                           worker_id=worker_id, status="STARTING",
+                           last_message="Launching", updated_at=utc_now()))
+                logfile = (wd / "worker.log").open("a", encoding="utf-8")
+                try:
+                    proc = subprocess.Popen(
+                        [python, script, "--query-config", str(cfg_path),
+                         "--worker-id", str(worker_id)],
+                        cwd=str(HERE), stdout=logfile, stderr=subprocess.STDOUT,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    processes.append((worker_id, proc, logfile))
+                except Exception:
+                    logfile.close()
+                    raise
+            try:
+                stopping_since = None
+                while any(proc.poll() is None for _, proc, _ in processes):
+                    if stop.exists() and stopping_since is None:
+                        stopping_since = time.monotonic()
+                        entry["status"] = "STOPPING"
+                        _batch_snapshot(batch_dir, status="STOPPING", current=qid, entries=entries)
+                    if force.exists() or (stopping_since is not None and
+                        time.monotonic() - stopping_since >
+                        max(30, int(config.get("timeout", 60)) + 30)):
+                        for _, proc, _ in processes:
+                            if proc.poll() is None:
+                                proc.terminate()
+                    time.sleep(0.5)
+            finally:
+                for wid, proc, logfile in processes:
+                    proc.wait()
+                    logfile.close()
+                    state_path = qdir / f"worker_{wid:02d}" / "state.json"
+                    state = read_json(state_path, {}) or {}
+                    if proc.returncode and state.get("status") not in (
+                        "FAILED", "PARTIAL", "SESSION_EXPIRED", "STOPPED"):
+                        state.update(status="STOPPED" if stop.exists() else "FAILED",
+                                     last_message=f"Worker exited: {proc.returncode}",
+                                     updated_at=utc_now())
+                        write_json(state_path, state)
+            workers, totals = selected_summary(config, qdir)
+            entry["chunks_ok"] = totals["chunks_ok"]
+            entry["finished_at"] = utc_now()
+            if stop.exists():
+                entry["status"] = "STOPPED"
+            elif totals["workers_completed"] == config["workers"]:
+                entry["status"] = "COMPLETED"
+            else:
+                entry["status"] = "PARTIAL" if totals["chunks_ok"] else "FAILED"
+            try:
+                output, row_count = selected_export(config, qdir)
+                entry.update(excel_path=output, rows=row_count)
+            except Exception as exc:
+                entry.update(status="PARTIAL" if totals["chunks_ok"] else "FAILED",
+                             error=f"EXCEL: {exc}")
+            _update_history(output_root, dict(
+                run_id=batch_dir.name, query_id=qid, code=config["code"],
+                cube_type=config.get("cube_type", "FY"), cube=config["cube"],
+                status=entry["status"], started_at=entry["started_at"],
+                finished_at=entry["finished_at"], rows=entry.get("rows", 0),
+                excel_path=entry.get("excel_path", ""), error=entry.get("error", "")))
+            _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
+        final_status = ("STOPPED" if stop.exists()
+                        else "COMPLETED" if all(e["status"] == "COMPLETED" for e in entries)
+                        else "PARTIAL")
+        _batch_snapshot(batch_dir, status=final_status, current=None, entries=entries)
+        return 0 if final_status == "COMPLETED" else 1
+    except Exception as exc:
+        _batch_snapshot(batch_dir, status="FAILED", current=None,
+                        entries=entries, error=str(exc)[:400])
+        raise
+
+
 def selected_main(argv) -> int:
     parser = argparse.ArgumentParser(description="Run an explicit user-selected OIC XMLA query")
     parser.add_argument("--query-config", type=Path, required=True)
@@ -4354,6 +4574,12 @@ def selected_main(argv) -> int:
 
 def main() -> int:
 
+    if "--batch-run" in sys.argv or "--batch-monitor" in sys.argv:
+        operation = sys.argv[1]
+        if len(sys.argv) < 3 or operation not in ("--batch-run", "--batch-monitor"):
+            raise ValueError("Expected --batch-run/--batch-monitor directory")
+        directory = Path(sys.argv[2]).resolve()
+        return run_batch(directory) if operation == "--batch-run" else batch_monitor(directory)
     if "--query-config" in sys.argv:
         return selected_main(sys.argv[1:])
 

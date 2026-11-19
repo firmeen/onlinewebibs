@@ -1811,6 +1811,60 @@ def discover_fields(
 
     return catalog
 
+def verify_field(code: str, cube_type: str, field_id_value: str,
+                 token: str, cookie: str, *, timeout: int = 30) -> dict:
+    """Small real XMLA Execute. Only mapped identifiers can be verified."""
+    import requests
+    catalog = load_catalog(code, cube_type)
+    selected = next((f for f in catalog["fields"]
+                     if f.get("id") == field_id_value), None)
+    if not selected or selected.get("status") not in ("MAPPED", "VERIFIED"):
+        raise ValueError("A unique MAPPED field is required for XMLA verification")
+    dimensions = [f["mdx"] for f in catalog["fields"]
+                  if f["type"] == "DIMENSION" and f.get("mdx")
+                  and f.get("status") in ("MAPPED", "VERIFIED")]
+    measures = [f["mdx"] for f in catalog["fields"]
+                if f["type"] == "MEASURE" and f.get("mdx")
+                and f.get("status") in ("MAPPED", "VERIFIED")]
+    if selected["type"] == "DIMENSION":
+        dimensions.insert(0, selected["mdx"])
+    else:
+        measures.insert(0, selected["mdx"])
+    if not dimensions or not measures:
+        raise ValueError("Verification needs one mapped Dimension and one mapped Measure")
+    profile = cube_profile(code, cube_type)
+    mdx = (f"SELECT {{{measures[0]}}} ON COLUMNS, "
+           f"Subset({dimensions[0]}.AllMembers,0,1) ON ROWS "
+           f"FROM [{profile['cube']}] CELL PROPERTIES VALUE")
+    envelope = ET.Element(f"{{{SOAP_NS}}}Envelope")
+    body = ET.SubElement(envelope, f"{{{SOAP_NS}}}Body")
+    execute = ET.SubElement(body, f"{{{XMLA_NS}}}Execute")
+    command = ET.SubElement(execute, f"{{{XMLA_NS}}}Command")
+    ET.SubElement(command, f"{{{XMLA_NS}}}Statement").text = mdx
+    properties = ET.SubElement(ET.SubElement(
+        execute, f"{{{XMLA_NS}}}Properties"), f"{{{XMLA_NS}}}PropertyList")
+    ET.SubElement(properties, f"{{{XMLA_NS}}}Catalog").text = profile["catalog"]
+    ET.SubElement(properties, f"{{{XMLA_NS}}}ShowHiddenCubes").text = "True"
+    with create_webform_session(cookie) as session:
+        response = session.post(PROXY_URL, data=ET.tostring(envelope, encoding="utf-8"),
+            headers={"Authorization": "Bearer " + normalize_token(token),
+                     "Content-Type": "text/xml",
+                     "Origin": BASE_URL,
+                     "Referer": WEBFORM + "?Class=" + profile["cls"]},
+            timeout=(10, timeout), allow_redirects=False)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        if any(local_name(node.tag) == "Fault" for node in root.iter()):
+            raise ValueError("XMLA SOAP Fault (field not verified)")
+        if not any(local_name(node.tag) == "Axes" for node in root.iter()):
+            raise ValueError("XMLA response is missing Axes")
+    selected["status"] = "VERIFIED"
+    selected["mapping_status"] = "VERIFIED"
+    selected["mapping_reason"] = "XMLA Execute returned valid dataset"
+    selected["verified_at"] = datetime.now(timezone.utc).isoformat()
+    save_catalog(catalog)
+    return selected
+
 
 # ============================================================
 # QUERY VALIDATION
@@ -2267,6 +2321,7 @@ def query_hash(config: dict) -> str:
             "run_id",
             "created_at",
             "output",
+            "output_root",
         )
     }
 

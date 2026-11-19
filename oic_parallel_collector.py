@@ -245,7 +245,7 @@ USER_AGENT = (
     "Chrome/157.0.0.0 Safari/537.36"
 )
 
-from oic_query import PROFILES as QUERY_PROFILES, validate_query, build_soap as query_soap, parse_xmla as query_parse, excel_records as query_excel_records, query_hash
+from oic_query import PROFILES as QUERY_PROFILES, validate_query, build_soap as query_soap, parse_xmla as query_parse, excel_records as query_excel_records, build_direct_mdx, query_hash
 
 console = Console(highlight=False)
 
@@ -3944,30 +3944,40 @@ def force_stop_batch(batch_dir: Path) -> int:
 
 
 def selected_plan(config: dict, run_dir: Path, *, required: bool = False) -> dict | None:
-    """Read an already-applied immutable plan; never partition at START."""
+    """Validate the immutable Apply-time execution plan, never plan at START."""
     path = run_dir / "task_plan.json"
     if not path.exists():
         if required:
             raise ValueError(f"Precomputed task plan missing: {path}")
-        return None  # explicit legacy selected-query CLI compatibility
+        return None
     plan = read_json(path)
-    if not isinstance(plan, dict) or plan.get("version") != 1:
-        raise ValueError("Invalid task plan version")
+    if not isinstance(plan, dict):
+        raise ValueError("Invalid applied task plan")
     query_id = run_dir.name
     if plan.get("query_id") != query_id or plan.get("query_hash") != query_hash(config):
         raise ValueError("Immutable query identity/hash disagrees with task plan")
+
+    if config.get("execution_mode") == "DIRECT":
+        expected = [{"worker_id": 1, "request_id": query_id + "-direct"}]
+        if (plan.get("version") != 2 or plan.get("partition") != "direct_request"
+                or plan.get("status") != "PLANNED" or plan.get("workers") != 1
+                or plan.get("total_chunks") != 1 or plan.get("assignments") != expected
+                or int(config["workers"]) != 1):
+            raise ValueError("Direct task plan does not match the applied request")
+        return plan
+
     n = int(config["workers"])
     xs, ys = int(config["x_chunk"]), int(config["y_chunk"])
     expected = [{"worker_id": i, "first_x_offset": (i - 1) * xs,
                  "x_stride": n * xs, "first_y_offset": 0, "y_stride": ys}
                 for i in range(1, n + 1)]
-    if (plan.get("partition") != "x_page_stride" or plan.get("status") != "PLANNED"
-            or plan.get("workers") != n or plan.get("x_chunk") != xs
-            or plan.get("y_chunk") != ys or plan.get("total_chunks", "bad") is not None
+    if (plan.get("version") != 1 or plan.get("partition") != "x_page_stride"
+            or plan.get("status") != "PLANNED" or plan.get("workers") != n
+            or plan.get("x_chunk") != xs or plan.get("y_chunk") != ys
+            or plan.get("total_chunks", "bad") is not None
             or plan.get("assignments") != expected):
-        raise ValueError("Applied plan assignment/configuration mismatch")
+        raise ValueError("Applied legacy plan assignment/configuration mismatch")
     return plan
-
 
 def batch_load(batch_dir: Path) -> dict:
     data = read_json(batch_manifest_path(batch_dir))
@@ -4419,7 +4429,7 @@ def selected_worker(args) -> int:
             raise RuntimeError("SESSION_EXPIRED: OIC_COOKIE not configured")
         client = OICClient(cookie=cookie, token=env.get("OIC_BEARER_TOKEN", ""),
                            timeout=int(config.get("timeout", 60)),
-                           max_response_mb=100, worker_id=worker_id, code=code)
+                           max_response_mb=int(config.get("max_response_mb", 100)), worker_id=worker_id, code=code)
         state["status"] = "RUNNING"
         save_state()
         # Deterministic X paging: a given X page belongs to exactly one worker.
@@ -4701,8 +4711,10 @@ def selected_export(config: dict, run_dir: Path, *, status: str | None = None,
         ("RUN_ID", run_id), ("QUERY_ID", query_id),
         ("INSURANCE_CODE", code), ("INSURANCE_CLASS", QUERY_PROFILES[code]["name"]),
         ("CUBE", config["cube"]), ("CATALOG", config["catalog"]),
-        ("WORKERS", config["workers"]), ("X_CHUNK", config["x_chunk"]),
-        ("Y_CHUNK", config["y_chunk"]), ("STARTED_AT", started_at or ""),
+        ("WORKERS", config["workers"]), ("EXECUTION_MODE", config.get("execution_mode", "CHUNKED")),
+        ("X_CHUNK", "N/A" if config.get("execution_mode") == "DIRECT" else config["x_chunk"]),
+        ("Y_CHUNK", "N/A" if config.get("execution_mode") == "DIRECT" else config["y_chunk"]),
+        ("STARTED_AT", started_at or ""),
         ("FINISHED_AT", finished_at or ""), ("EXPORTED_AT", utc_now()),
         ("STATUS", final_status), ("TOTAL_RECORDS", row_count),
         ("QUERY_HASH", query_hash(config)),

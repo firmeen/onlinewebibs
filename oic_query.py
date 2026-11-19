@@ -44,6 +44,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -244,6 +245,40 @@ PROFILES = {
 }
 
 
+YEAR_TYPES = ("FY", "UY", "AY")
+YEAR_LABELS = {"FY": "ปีบัญชี", "UY": "ปีรับประกัน", "AY": "ปีอุบัติเหตุ"}
+
+
+def cube_for_year(code: str, year_type: str = "FY") -> str:
+    if code not in PROFILES or year_type not in YEAR_TYPES:
+        raise ValueError("Unknown insurance category or year type")
+    return f"{code}_AGGREGATE_{year_type}"
+
+
+def cube_year_type(code: str, cube: str) -> str:
+    for year_type in YEAR_TYPES:
+        if cube == cube_for_year(code, year_type):
+            return year_type
+    raise ValueError("Cube does not belong to this insurance category")
+
+
+def available_year_types(code: str) -> list[str]:
+    """Show alternative years only after valid live metadata was cached."""
+    result = ["FY"]  # Keep the existing FY default/legacy catalog.
+    for year_type in YEAR_TYPES[1:]:
+        path = cache_path(code, cube_for_year(code, year_type))
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if (isinstance(data, dict) and data.get("code") == code
+                    and data.get("cube") == cube_for_year(code, year_type)
+                    and data.get("refreshed_at")
+                    and isinstance(data.get("fields"), list) and data["fields"]):
+                result.append(year_type)
+        except (OSError, TypeError, ValueError):
+            pass
+    return result
+
+
 # ============================================================
 # UTILITIES
 # ============================================================
@@ -309,25 +344,24 @@ def field_id(code: str, record: dict) -> str:
 # CATALOG STORAGE
 # ============================================================
 
-def cache_path(code: str) -> Path:
-    return CATALOG_DIR / f"{code}.json"
+def cache_path(code: str, cube: str | None = None) -> Path:
+    year_type = cube_year_type(code, cube or PROFILES[code]["cube"])
+    # FY retains its existing cache name for backward compatibility.
+    suffix = "" if year_type == "FY" else f"_{year_type}"
+    return CATALOG_DIR / f"{code}{suffix}.json"
 
 
-def seeded_catalog(code: str) -> dict:
+def seeded_catalog(code: str, cube: str | None = None) -> dict:
     if code not in PROFILES:
         raise ValueError("Unknown insurance category")
 
     profile = PROFILES[code]
+    cube = cube or profile["cube"]
+    cube_year_type(code, cube)
     fields = []
 
-    dimensions = filter(
-        None,
-        (
-            profile["year"],
-            profile["row1"],
-            profile["row2"],
-        ),
-    )
+    # Never expose FY seed hierarchies as if they belonged to UY or AY.
+    dimensions = filter(None, (profile["year"], profile["row1"], profile["row2"])) if cube == profile["cube"] else ()
 
     for index, name in enumerate(dimensions):
         caption = name.rsplit("[", 1)[-1].rstrip("]")
@@ -346,7 +380,7 @@ def seeded_catalog(code: str) -> dict:
             "seq": index,
         })
 
-    for index, name in enumerate(profile["measures"]):
+    for index, name in enumerate(profile["measures"] if cube == profile["cube"] else ()):
         mdx = f"[Measures].[{name}]"
 
         fields.append({
@@ -367,8 +401,8 @@ def seeded_catalog(code: str) -> dict:
         "code": code,
         "web_class": profile["cls"],
         "catalog": profile["catalog"],
-        "cube": profile["cube"],
-        "source": "PROFILE",
+        "cube": cube,
+        "source": "PROFILE" if cube == profile["cube"] else "NOT_DISCOVERED",
         "refreshed_at": None,
         "fields": fields,
         "view_count": sum(
@@ -383,15 +417,16 @@ def seeded_catalog(code: str) -> dict:
     }
 
 
-def load_catalog(code: str) -> dict:
+def load_catalog(code: str, cube: str | None = None) -> dict:
     if code not in PROFILES:
         raise ValueError("Unknown insurance category")
 
-    fallback = seeded_catalog(code)
+    cube = cube or PROFILES[code]["cube"]
+    fallback = seeded_catalog(code, cube)
 
     try:
         cached = json.loads(
-            cache_path(code).read_text(
+            cache_path(code, cube).read_text(
                 encoding="utf-8"
             )
         )
@@ -444,8 +479,7 @@ def save_catalog(catalog: dict) -> None:
     if code not in PROFILES:
         raise ValueError("Invalid catalog category")
 
-    if catalog.get("cube") != PROFILES[code]["cube"]:
-        raise ValueError("Invalid catalog cube")
+    cube_year_type(code, catalog.get("cube"))
 
     fields = catalog.get("fields")
 
@@ -459,8 +493,8 @@ def save_catalog(catalog: dict) -> None:
         exist_ok=True,
     )
 
-    destination = cache_path(code)
-    temporary = destination.with_suffix(".tmp")
+    destination = cache_path(code, catalog["cube"])
+    temporary = destination.with_name(destination.name + f".{uuid.uuid4().hex}.tmp")
 
     try:
         temporary.write_text(
@@ -945,6 +979,7 @@ def normalize_template_records(
     code: str,
     menu_records: list,
     binding_records: list,
+    *, cube: str | None = None,
 ) -> list[dict]:
     """
     GET_MENUTEMPLATE_LIST:
@@ -958,6 +993,8 @@ def normalize_template_records(
     """
 
     profile = PROFILES[code]
+    cube = cube or profile["cube"]
+    cube_year_type(code, cube)
 
     result = []
 
@@ -971,7 +1008,7 @@ def normalize_template_records(
         ):
             continue
 
-        if item.get("CUBE_NAME") != profile["cube"]:
+        if item.get("CUBE_NAME") != cube:
             continue
 
         detail = item.get("TEMPLATE_DETAIL")
@@ -993,7 +1030,7 @@ def normalize_template_records(
 
         result.append({
             "CLASS": profile["cls"],
-            "CUBE_NAME": profile["cube"],
+            "CUBE_NAME": cube,
             "TEMPLATE_NAME": (
                 item.get("TEMPLATE_NAME") or ""
             ),
@@ -1026,7 +1063,7 @@ def normalize_template_records(
 
         result.append({
             "CLASS": profile["cls"],
-            "CUBE_NAME": profile["cube"],
+            "CUBE_NAME": cube,
             "TEMPLATE_NAME": (
                 item.get("NAME") or ""
             ),
@@ -1046,6 +1083,7 @@ def normalize_getstructure(
     *,
     templates: list | None = None,
     xmla: list | None = None,
+    cube: str | None = None,
 ) -> dict:
     """
     CAPTION is preserved exactly as returned by OIC.
@@ -1070,6 +1108,8 @@ def normalize_getstructure(
         )
 
     profile = PROFILES[code]
+    cube = cube or profile["cube"]
+    cube_year_type(code, cube)
 
     template_index: dict[
         tuple,
@@ -1086,7 +1126,7 @@ def normalize_getstructure(
         ):
             continue
 
-        if item.get("CUBE_NAME") != profile["cube"]:
+        if item.get("CUBE_NAME") != cube:
             continue
 
         detail = item.get("TEMPLATE_DETAIL")
@@ -1309,7 +1349,7 @@ def normalize_getstructure(
     return {
         "code": code,
         "web_class": profile["cls"],
-        "cube": profile["cube"],
+        "cube": cube,
         "catalog": profile["catalog"],
         "source": "LIVE",
         "refreshed_at": datetime.now(
@@ -1335,6 +1375,7 @@ def normalize_getstructure(
 def make_discover_request(
     code: str,
     request_type: str,
+    *, cube: str | None = None,
 ) -> bytes:
     supported = {
         "MDSCHEMA_DIMENSIONS",
@@ -1355,6 +1396,8 @@ def make_discover_request(
         )
 
     profile = PROFILES[code]
+    cube = cube or profile["cube"]
+    cube_year_type(code, cube)
 
     envelope = ET.Element(
         f"{{{SOAP_NS}}}Envelope"
@@ -1391,7 +1434,7 @@ def make_discover_request(
     ET.SubElement(
         restrictions,
         f"{{{XMLA_NS}}}CUBE_NAME",
-    ).text = profile["cube"]
+    ).text = cube
 
     properties = ET.SubElement(
         ET.SubElement(
@@ -1427,6 +1470,7 @@ def discover_xmla_metadata(
     token: str,
     referer: str,
     *,
+    cube: str | None = None,
     timeout: int = 30,
 ) -> tuple[list[dict], list[str]]:
     import requests
@@ -1458,6 +1502,7 @@ def discover_xmla_metadata(
                 data=make_discover_request(
                     code,
                     kind,
+                    cube=cube,
                 ),
                 headers=headers,
                 timeout=(10, timeout),
@@ -1540,6 +1585,7 @@ def discover_fields(
     token: str,
     cookie: str,
     *,
+    cube: str | None = None,
     timeout: int = 30,
 ) -> dict:
     """
@@ -1573,6 +1619,8 @@ def discover_fields(
         )
 
     profile = PROFILES[code]
+    cube = cube or profile["cube"]
+    year_type = cube_year_type(code, cube)
 
     referer = (
         f"{WEBFORM}?Class={profile['cls']}"
@@ -1602,7 +1650,7 @@ def discover_fields(
             payload={
                 "Template": [
                     code,
-                    profile["cube"],
+                    cube,
                 ]
             },
             authorizations=authorizations,
@@ -1611,9 +1659,12 @@ def discover_fields(
         )
 
         if not structure:
-            raise ValueError(
-                f"{code}: GetStructure returned zero fields"
-            )
+            raise ValueError(f"{code}/{year_type}: GetStructure returned zero fields")
+        if year_type != "FY" and not any(
+            f"{code}_AGGREGATE_{year_type}" in str(row.get("DATATABLE", "")).upper().replace(" ", "_")
+            for row in structure if isinstance(row, dict)
+        ):
+            raise ValueError(f"{code}/{year_type}: year cube not confirmed by GetStructure")
 
         # ----------------------------------------------------
         # OPTIONAL: TEMPLATE MENU
@@ -1653,7 +1704,7 @@ def discover_fields(
                 payload={
                     "Template": [
                         code,
-                        profile["cube"],
+                        cube,
                     ]
                 },
                 authorizations=authorizations,
@@ -1670,6 +1721,7 @@ def discover_fields(
             code,
             menu_records,
             binding_records,
+            cube=cube,
         )
 
         # ----------------------------------------------------
@@ -1682,6 +1734,7 @@ def discover_fields(
                 code,
                 token,
                 referer,
+                cube=cube,
                 timeout=timeout,
             )
         )
@@ -1697,6 +1750,7 @@ def discover_fields(
         structure,
         templates=templates,
         xmla=xmla_fields,
+        cube=cube,
     )
 
     catalog["errors"] = errors
@@ -1728,7 +1782,7 @@ def validate_query(
 
     if (
         config.get("catalog") != profile["catalog"]
-        or config.get("cube") != profile["cube"]
+        or config.get("cube") not in {cube_for_year(code, year) for year in YEAR_TYPES}
     ):
         raise ValueError(
             "Catalog/Cube do not match the selected category"
@@ -1873,7 +1927,7 @@ def validate_query(
             )
 
     else:
-        catalog = catalog or load_catalog(code)
+        catalog = catalog or load_catalog(code, config["cube"])
 
         allowed = {
             (
@@ -1882,7 +1936,7 @@ def validate_query(
             )
             for field in (
                 catalog["fields"]
-                + seeded_catalog(code)["fields"]
+                + seeded_catalog(code, config["cube"])["fields"]
             )
         }
 
@@ -2067,9 +2121,7 @@ def build_mdx(
         columns = x
         rows = f"CrossJoin({y},{measures})"
 
-    cube = PROFILES[
-        config["code"]
-    ]["cube"]
+    cube = config["cube"]
 
     return (
         f"SELECT {columns} "

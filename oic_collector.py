@@ -66,7 +66,8 @@ import subprocess
 import shutil
 
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
-                       validate_query, build_mdx as selected_mdx, query_hash)
+                       validate_query, build_mdx as selected_mdx, query_hash,
+                       YEAR_TYPES, YEAR_LABELS, cube_for_year, cube_year_type, available_year_types)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2122,9 +2123,22 @@ def load_applied(path: Path) -> dict:
     if len(ids) != len(set(ids)):
         raise ValueError("Duplicate Query ID in applied_queries.json")
     for entry in data["queries"]:
-        validate_query(entry["config"])
-        if entry["plan"] != applied_plan(entry["config"]):
+        config = validate_query(entry["config"])
+        expected_plan = applied_plan(config)
+        if entry.get("plan") is None:
+            # Older queue entries were saved without a plan. Reconstruct in
+            # memory; the next locked queue update persists it atomically.
+            entry["plan"] = expected_plan
+        elif entry["plan"] != expected_plan:
             raise ValueError("Applied Query plan mismatch: " + entry["query_id"])
+        entry.setdefault("fingerprint", applied_fingerprint(config))
+        entry.setdefault("code", config["code"])
+        entry.setdefault("cube", config["cube"])
+        entry.setdefault("catalog", config["catalog"])
+    if not data.get("revision"):
+        data["revision"] = hashlib.sha256(path.read_bytes()).hexdigest()[:20]
+    if not isinstance(data.get("next_id"), int) or data["next_id"] < 1:
+        data["next_id"] = max([int(q[1:]) for q in ids if re.fullmatch(r"Q[0-9]+", q)] or [0]) + 1
     return data
 
 
@@ -2593,7 +2607,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.active_started_at = None
             self.catalog_running = False
             self.catalog_started = False
-            self.catalog_statuses = {code: "CACHE" if load_catalog(code)["source"] == "CACHE" else "PROFILE" for code in QUERY_PROFILES}
+            self.catalog_statuses = {code: "/".join(available_year_types(code)) for code in QUERY_PROFILES}
 
             self.busy = False
             self.stop_event = threading.Event()
@@ -4553,7 +4567,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         def update_catalog_summary(self) -> None:
             status = "  |  ".join(f"{code}: {self.catalog_statuses.get(code,'—')}"
                                   for code in QUERY_PROFILES)
-            self.query_one("#catalog_status", Static).update("FY FIELD CATALOGS\n" + status)
+            self.query_one("#catalog_status", Static).update("FY / UY / AY FIELD CATALOGS\n" + status)
 
         @work(thread=True, group="five-cube-discovery", exclusive=True)
         def discover_all_catalogs(self, force: bool = False) -> None:
@@ -4563,38 +4577,39 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.catalog_started = True
             sequence = self.auth_sequence
             cookie, token = self.cookie_value(), self.token_value()
-            for code in QUERY_PROFILES:
-                if sequence != self.auth_sequence:
-                    break
-                existing = load_catalog(code)
-                if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
-                    try:
-                        updated = datetime.fromisoformat(existing["refreshed_at"])
-                        if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
-                            self.call_from_thread(self.catalog_discovery_event, code,
-                                                  existing, None)
-                            continue
-                    except (TypeError, ValueError):
-                        pass
-                try:
-                    catalog = discover_fields(code, token, cookie)
-                    self.call_from_thread(self.catalog_discovery_event, code, catalog, None)
-                except Exception as exc:
-                    error = str(exc)[:110]
-                    self.call_from_thread(self.catalog_discovery_event, code, None, error)
-                    if "SESSION_EXPIRED" in error or "401" in error or "403" in error:
-                        break
-            self.catalog_running = False
+            try:
+                for code in QUERY_PROFILES:
+                    for year_type in YEAR_TYPES:
+                        if sequence != self.auth_sequence:
+                            return
+                        cube = cube_for_year(code, year_type)
+                        existing = load_catalog(code, cube)
+                        if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
+                            try:
+                                updated = datetime.fromisoformat(existing["refreshed_at"])
+                                if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
+                                    self.call_from_thread(self.catalog_discovery_event, code, existing, None, year_type)
+                                    continue
+                            except (TypeError, ValueError):
+                                pass
+                        try:
+                            catalog = discover_fields(code, token, cookie, cube=cube)
+                            self.call_from_thread(self.catalog_discovery_event, code, catalog, None, year_type)
+                        except Exception as exc:
+                            error = str(exc)[:110]
+                            self.call_from_thread(self.catalog_discovery_event, code, None, error, year_type)
+                            if any(x in error.upper() for x in ("SESSION_EXPIRED", "HTTP 401", "HTTP 403")):
+                                return
+            finally:
+                self.catalog_running = False
 
         def catalog_discovery_event(self, code: str, catalog: dict | None,
-                                    error: str | None) -> None:
+                                    error: str | None, year_type: str = "FY") -> None:
+            self.catalog_statuses[code] = "/".join(available_year_types(code))
             if error:
-                self.catalog_statuses[code] = "ERROR / CACHE KEPT"
-                self.info(f"{code} metadata: {error}", "warning")
+                self.info(f"{code}/{year_type} metadata unavailable: {error}", "warning")
             else:
-                self.catalog_statuses[code] = (
-                    f"{catalog['view_count']}+{catalog['data_count']}")
-                self.info(f"{code}: {len(catalog['fields'])} field items cached.", "success")
+                self.info(f"{code}/{year_type}: {len(catalog['fields'])} field items cached.", "success")
             self.update_catalog_summary()
 
         # ====================================================
@@ -4761,7 +4776,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
     class OICQueryDesigner(App):
         TITLE = "OIC | Query Designer"
-        SUB_TITLE = "Five-Cube FY Field Catalog"
+        SUB_TITLE = "FY / UY / AY Field Catalog"
         BINDINGS = [
             Binding("a", "field_to_x", "X / ROWS", show=False),
             Binding("s", "field_to_y", "Y / COLUMNS", show=False),
@@ -4926,11 +4941,15 @@ def launch_terminal_ui(args, return_app: bool = False):
         def __init__(self):
             super().__init__()
             self.code = args.category if args.category in QUERY_PROFILES else "MV"
+            self.year_type = "FY"
+            self.cube = cube_for_year(self.code, self.year_type)
             self.selection_path = Path(args.selection_file).resolve()
-            self.catalog = load_catalog(self.code)
+            self.catalog = load_catalog(self.code, self.cube)
             self.fields = {}
             self.chosen = {"x": [], "y": [], "measures": []}
             self.by_category = {}
+            self.year_by_code = {}
+            self.year_options = ()
             self.highlighted_id = None
             self.pending_duplicate = None
 
@@ -4956,6 +4975,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="designer_category",
                     )
 
+                    yield Select(
+                        [(f"FY — {YEAR_LABELS['FY']}", "FY")],
+                        value="FY", allow_blank=False, id="designer_year_type",
+                    )
                     yield Static(
                         "CATALOG: CACHE",
                         id="designer_status",
@@ -5124,7 +5147,9 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.selection_path.with_suffix(".lock").write_text(
                 str(os.getpid()), encoding="ascii")
             self._restore_previous_selection()
-            self.update_catalog(self.code)
+            self.refresh_year_options()
+            self.update_catalog(self.code, self.year_type)
+            self.set_interval(2.0, self.refresh_year_options)
             self.query_one("#designer_add_anyway", Button).display = False
             self.query_one("#designer_cancel_duplicate", Button).display = False
 
@@ -5138,27 +5163,48 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         def _restore_previous_selection(self) -> None:
             try:
-                path = self.selection_path
-                if path.name == "query_selection.json":
-                    return
-                entries = load_applied(path)["queries"]
-                matching = next((e for e in reversed(entries) if e["code"] == self.code), None)
-                if not matching:
-                    return
-                previous = validate_query(matching["config"])
-                ids = previous["selection_ids"]
-                self.by_category[previous["code"]] = {axis: list(ids.get(axis, [])) for axis in self.chosen}
-                for name, key in (("workers", "designer_workers"), ("x_chunk", "designer_x_chunk"),
-                                  ("y_chunk", "designer_y_chunk")):
-                    self.query_one("#" + key, Input).value = str(previous[name])
+                entries = load_applied(self.selection_path)["queries"]
+                for entry in entries:
+                    previous = validate_query(entry["config"])
+                    code = previous["code"]
+                    cube = previous["cube"]
+                    ids = previous.get("selection_ids", {})
+                    self.by_category[(code, cube)] = {
+                        axis: list(ids.get(axis, [])) for axis in ("x", "y", "measures")}
+                    year_type = cube_year_type(code, cube)
+                    if year_type in available_year_types(code):
+                        self.year_by_code[code] = year_type
+                self.year_type = self.year_by_code.get(self.code, "FY")
+                self.cube = cube_for_year(self.code, self.year_type)
+                matching = next((e for e in reversed(entries)
+                                 if e["code"] == self.code and e["cube"] == self.cube), None)
+                if matching:
+                    for name, key in (("workers", "designer_workers"), ("x_chunk", "designer_x_chunk"),
+                                      ("y_chunk", "designer_y_chunk")):
+                        self.query_one("#" + key, Input).value = str(matching["config"][name])
             except (OSError, ValueError, TypeError, KeyError):
                 pass
 
-        def update_catalog(self, code: str) -> None:
+        def refresh_year_options(self) -> None:
+            options = tuple(available_year_types(self.code))
+            if self.year_type not in options:
+                self.year_type = "FY"
+            if options != self.year_options:
+                self.year_options = options
+                self.query_one("#designer_year_type", Select).set_options(
+                    [(f"{year} — {YEAR_LABELS[year]}", year) for year in options])
+            picker = self.query_one("#designer_year_type", Select)
+            if picker.value != self.year_type:
+                picker.value = self.year_type
+
+        def update_catalog(self, code: str, year_type: str | None = None) -> None:
+            year_type = year_type or self.year_type
             self.code = code
-            self.catalog = load_catalog(code)
+            self.year_type = year_type
+            self.cube = cube_for_year(code, year_type)
+            self.catalog = load_catalog(code, self.cube)
             self.fields = {field["id"]: field for field in self.catalog["fields"]}
-            previous = self.by_category.get(code, {})
+            previous = self.by_category.get((code, self.cube), {})
             self.chosen = {axis: [item for item in previous.get(axis, [])
                                   if item in self.fields and
                                   self.fields[item].get("status") in ("MAPPED", "VERIFIED")]
@@ -5167,18 +5213,27 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.refresh_tree()
             self.refresh_layout()
             self.query_one("#designer_status", Static).update(
-                f"CATALOG {code}: {self.catalog.get('view_count', 0)} views / "
-                f"{self.catalog.get('data_count', 0)} data  ·  {self.catalog['source']}"
-            )
+                f"{code}/{year_type}: {self.catalog.get('view_count', 0)} views / "
+                f"{self.catalog.get('data_count', 0)} data · {self.catalog['source']}")
 
         def on_select_changed(self, event: Select.Changed) -> None:
-            if event.select.id != "designer_category":
-                return
-            code = event.value
-            if code in QUERY_PROFILES and code != self.code:
-                self.by_category[self.code] = {
-                    key: list(value) for key, value in self.chosen.items()}
-                self.update_catalog(str(code))
+            if event.select.id == "designer_category":
+                code = event.value
+                if code in QUERY_PROFILES and code != self.code:
+                    self.by_category[(self.code, self.cube)] = {
+                        key: list(value) for key, value in self.chosen.items()}
+                    self.year_by_code[self.code] = self.year_type
+                    self.code = str(code)
+                    self.year_type = self.year_by_code.get(self.code, "FY")
+                    self.refresh_year_options()
+                    self.update_catalog(self.code, self.year_type)
+            elif event.select.id == "designer_year_type":
+                year_type = event.value
+                if year_type in available_year_types(self.code) and year_type != self.year_type:
+                    self.by_category[(self.code, self.cube)] = {
+                        key: list(value) for key, value in self.chosen.items()}
+                    self.year_by_code[self.code] = str(year_type)
+                    self.update_catalog(self.code, str(year_type))
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "catalog_search":
@@ -5359,7 +5414,8 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             if (
                 axis == "y"
-                and field["mdx"] == QUERY_PROFILES[self.code].get("year")
+                and (field["mdx"] == QUERY_PROFILES[self.code].get("year")
+                     or field.get("caption") in YEAR_LABELS.values())
                 and self.query_one(
                     "#designer_y_chunk",
                     Input,
@@ -5598,7 +5654,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             config = {
                 "schema_version": SCHEMA_VERSION,
                 "code": self.code,
-                "cube": profile["cube"],
+                "cube": self.cube,
                 "catalog": profile["catalog"],
                 "x": [
                     self.fields[item]["mdx"]
@@ -5684,13 +5740,34 @@ def launch_terminal_ui(args, return_app: bool = False):
             except Exception as exc:
                 self.show_error(f"APPLY FAILED: {type(exc).__name__}: {exc}")
 
-        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
-            if error:
+        @work(thread=True, group="designer-catalog-discovery", exclusive=True)
+        def refresh_catalog_worker(self) -> None:
+            env = read_env()
+            cookie, token = env.get("OIC_COOKIE", ""), env.get("OIC_BEARER_TOKEN", "")
+            if not cookie:
+                self.call_from_thread(self.show_error, "Save/validate OIC_COOKIE in the Main App first")
+                return
+            code = self.code
+            for year_type in YEAR_TYPES:
+                try:
+                    catalog = discover_fields(code, token, cookie, cube=cube_for_year(code, year_type))
+                    self.call_from_thread(self.catalog_refreshed, code, catalog, None, year_type)
+                except Exception as exc:
+                    self.call_from_thread(self.catalog_refreshed, code, None, str(exc)[:150], year_type)
+                    if any(marker in str(exc).upper() for marker in ("SESSION_EXPIRED", "HTTP 401", "HTTP 403")):
+                        break
+
+        def catalog_refreshed(self, code: str, catalog: dict | None,
+                              error: str | None, year_type: str = "FY"):
+            if code != self.code:
+                return
+            if error and self.year_type == year_type:
                 self.show_error("Catalog refresh failed; existing cache kept: " + error)
-            elif code == self.code:
-                previous = {k: list(v) for k, v in self.chosen.items()}
-                self.by_category[code] = previous
-                self.update_catalog(code)
+            elif catalog:
+                self.refresh_year_options()
+                if catalog.get("cube") == self.cube:
+                    self.by_category[(code, self.cube)] = {k: list(v) for k, v in self.chosen.items()}
+                    self.update_catalog(code, self.year_type)
 
         def action_cancel(self) -> None:
             self.exit()

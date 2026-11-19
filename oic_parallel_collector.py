@@ -242,7 +242,7 @@ USER_AGENT = (
     "Chrome/157.0.0.0 Safari/537.36"
 )
 
-from oic_query import PROFILES as QUERY_PROFILES, validate_query, build_soap as query_soap, parse_xmla as query_parse, excel_records as query_excel_records, query_hash
+from oic_query import PROFILES as QUERY_PROFILES, validate_query, build_soap as query_soap, parse_xmla as query_parse, excel_records as query_excel_records, query_hash, cube_year_type
 
 console = Console(highlight=False)
 
@@ -4399,6 +4399,7 @@ def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
     labels = {f.get("mdx"): f.get("caption", f.get("mdx")) for f in config.get("selected_fields", [])}
     metadata = [("RUN_ID", config["run_id"]), ("QUERY_ID", config.get("query_id", "")),
                 ("INSURANCE_CODE", config["code"]), ("CUBE", config["cube"]),
+                ("YEAR_TYPE", cube_year_type(config["code"], config["cube"])),
                 ("CATALOG", config["catalog"]), ("QUERY_HASH", query_hash(config)),
                 ("STARTED_AT", config.get("created_at", "")), ("FINISHED_AT", utc_now()),
                 ("X_ROWS", " | ".join(labels.get(v, v) for v in config["x"])),

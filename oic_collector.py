@@ -4248,41 +4248,106 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.update_query_summary()
             self.info(f"Designer applied {config['code']} ({len(config['selected_fields'])} fields).", "success")
 
+        # oic_collector.py
+        # Replace OICApp.open_query_designer() inside launch_terminal_ui().
+
         def open_query_designer(self) -> None:
             if sys.platform != "win32":
-                self.info("Dedicated Query Designer requires Windows Terminal.", "error")
+                self.info(
+                    "Dedicated Query Designer requires Windows.",
+                    "error",
+                )
                 return
-            wt = shutil.which("wt.exe")
-            if not wt:
-                self.info("Windows Terminal (wt.exe) was not found.", "error")
-                return
+
+            from oic_parallel_collector import launch_terminal_window
+
             selection = self.selection_file().resolve()
             lock_path = selection.with_suffix(".lock")
+
+            # Prevent opening another instance when the existing
+            # Query Designer process is still active.
+
             if lock_path.exists():
                 try:
-                    pid = int(lock_path.read_text(encoding="ascii"))
+                    pid = int(
+                        lock_path.read_text(
+                            encoding="ascii"
+                        ).strip()
+                    )
+
                     import ctypes
-                    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-                    if handle:
-                        ctypes.windll.kernel32.CloseHandle(handle)
-                        self.info("Query Designer is already open.", "warning")
+
+                    process_handle = ctypes.windll.kernel32.OpenProcess(
+                        0x1000,
+                        False,
+                        pid,
+                    )
+
+                    if process_handle:
+                        ctypes.windll.kernel32.CloseHandle(
+                            process_handle
+                        )
+
+                        self.info(
+                            "Query Designer is already open.",
+                            "warning",
+                        )
                         return
+
                 except (OSError, ValueError):
                     pass
-                lock_path.unlink(missing_ok=True)
-            selection.parent.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.info(
+                        f"Cannot clear stale Designer lock: {exc}",
+                        "error",
+                    )
+                    return
+
             try:
-                subprocess.Popen(
-                    [wt, "-w", "new", "new-tab", "--title", "OIC | Query Designer",
-                     "--startingDirectory", str(BASE_DIR),
-                     str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
-                     "--designer", "--selection-file", str(selection),
-                     "--category", self.selected_code],
-                    cwd=str(BASE_DIR)
+                selection.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
                 )
-                self.info("Opening dedicated Query Designer window.", "success")
-            except OSError as exc:
-                self.info(f"Designer launch failed: {exc}", "error")
+
+                python_path = str(
+                    Path(sys.executable).resolve()
+                )
+
+                script_path = str(
+                    Path(__file__).resolve()
+                )
+
+                designer_command = [
+                    python_path,
+                    script_path,
+                    "--designer",
+                    "--selection-file",
+                    str(selection),
+                    "--category",
+                    self.selected_code,
+                ]
+
+                mode = launch_terminal_window(
+                    [designer_command],
+                    title="OIC | Query Designer",
+                    cwd=BASE_DIR,
+                    tab_titles=["OIC | Query Designer"],
+                    keep_open=False,
+                )
+
+                self.info(
+                    f"Query Designer opened via {mode}.",
+                    "success",
+                )
+
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.info(
+                    f"Query Designer launch failed: {exc}",
+                    "error",
+                )
 
         def update_catalog_summary(self) -> None:
             status = "  |  ".join(f"{code}: {self.catalog_statuses.get(code,'—')}"

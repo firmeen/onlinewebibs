@@ -3240,42 +3240,362 @@ def monitor_workers(
 # ============================================================
 
 def powershell_quote(value: str) -> str:
+    value = str(value)
 
-    return (
-        "'"
-        + value.replace("'", "''")
-        + "'"
-    )
+    if any(char in value for char in ("\x00", "\r", "\n")):
+        raise ValueError("Invalid PowerShell argument")
 
+    return "'" + value.replace("'", "''") + "'"
 
-def find_windows_terminal() -> str | None:
+def find_powershell() -> str:
+    if os.name != "nt":
+        raise RuntimeError("PowerShell launcher requires Windows")
 
-    path = (
-        shutil.which("wt.exe")
-        or shutil.which("wt")
-    )
+    candidates = [
+        shutil.which("pwsh.exe"),
+        shutil.which("powershell.exe"),
+        shutil.which("pwsh"),
+        shutil.which("powershell"),
+    ]
 
-    if path:
-        return path
+    program_files = os.environ.get("ProgramFiles")
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
 
-    local_app_data = os.environ.get(
-        "LOCALAPPDATA",
-        "",
-    )
-
-    if local_app_data:
-
-        candidate = (
-            Path(local_app_data)
-            / "Microsoft"
-            / "WindowsApps"
-            / "wt.exe"
+    if program_files:
+        candidates.append(
+            str(Path(program_files) / "PowerShell" / "7" / "pwsh.exe")
         )
 
-        if candidate.exists():
-            return str(candidate)
+    candidates.append(
+        str(
+            Path(system_root)
+            / "System32"
+            / "WindowsPowerShell"
+            / "v1.0"
+            / "powershell.exe"
+        )
+    )
+
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(Path(candidate).resolve())
+
+    raise RuntimeError(
+        "PowerShell 5.1 or PowerShell 7 was not found"
+    )
+
+# oic_parallel_collector.py
+
+def find_windows_terminal() -> str | None:
+    if os.name != "nt":
+        return None
+
+    candidates = [
+        shutil.which("wt.exe"),
+        shutil.which("wt"),
+    ]
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+
+    if local_app_data:
+        candidates.append(
+            str(
+                Path(local_app_data)
+                / "Microsoft"
+                / "WindowsApps"
+                / "wt.exe"
+            )
+        )
+
+    try:
+        shell = find_powershell()
+
+        result = subprocess.run(
+            [
+                shell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                (
+                    "$command = Get-Command wt.exe "
+                    "-ErrorAction SilentlyContinue; "
+                    "if ($command -and "
+                    "$command.CommandType -eq 'Application') "
+                    "{ $command.Source }"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        if result.returncode == 0:
+            candidates.extend(
+                line.strip()
+                for line in result.stdout.splitlines()
+                if line.strip()
+            )
+
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        pass
+
+    seen = set()
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        path = Path(candidate)
+
+        if not path.is_absolute():
+            resolved = shutil.which(str(candidate))
+
+            if not resolved:
+                continue
+
+            path = Path(resolved)
+
+        normalized = str(path).casefold()
+
+        if normalized in seen:
+            continue
+
+        seen.add(normalized)
+
+        if path.is_file():
+            return str(path)
 
     return None
+
+
+# oic_parallel_collector.py
+# New shared launcher function.
+
+def launch_terminal_window(
+    commands: list[list[str]],
+    *,
+    title: str,
+    cwd: Path,
+    tab_titles: list[str] | None = None,
+    keep_open: bool = True,
+) -> str:
+    """
+    Launch one terminal window.
+
+    Windows Terminal:
+        One window with one or more tabs.
+
+    PowerShell fallback:
+        One console window.
+        Multiple commands run as independent processes
+        inside that console.
+
+    Returns:
+        "WINDOWS_TERMINAL" or "POWERSHELL"
+    """
+
+    if os.name != "nt":
+        raise RuntimeError("Windows terminal launcher requires Windows")
+
+    if not commands or any(not command for command in commands):
+        raise ValueError("At least one valid command is required")
+
+    working_dir = Path(cwd).expanduser().resolve()
+
+    if not working_dir.is_dir():
+        raise FileNotFoundError(
+            f"Working directory not found: {working_dir}"
+        )
+
+    shell = find_powershell()
+    wt = find_windows_terminal()
+
+    normalized_commands = [
+        [str(argument) for argument in command]
+        for command in commands
+    ]
+
+    titles = tab_titles or [
+        f"{title} | {index:02d}"
+        for index in range(1, len(commands) + 1)
+    ]
+
+    if len(titles) != len(commands):
+        raise ValueError(
+            "tab_titles count must match commands count"
+        )
+
+    def as_powershell_command(arguments: list[str]) -> str:
+        return "& " + " ".join(
+            powershell_quote(argument)
+            for argument in arguments
+        )
+
+    if wt:
+        terminal_command = [
+            wt,
+            "-w",
+            "new",
+        ]
+
+        for index, arguments in enumerate(normalized_commands):
+            if index:
+                terminal_command.append(";")
+
+            terminal_command.extend(
+                [
+                    "new-tab",
+                    "--title",
+                    titles[index],
+                    "--startingDirectory",
+                    str(working_dir),
+                    shell,
+                    "-NoLogo",
+                    "-NoProfile",
+                ]
+            )
+
+            if keep_open:
+                terminal_command.append("-NoExit")
+
+            terminal_command.extend(
+                [
+                    "-Command",
+                    as_powershell_command(arguments),
+                ]
+            )
+
+        try:
+            subprocess.Popen(
+                terminal_command,
+                cwd=str(working_dir),
+                close_fds=True,
+            )
+
+            return "WINDOWS_TERMINAL"
+
+        except OSError:
+            # Windows Terminal is unavailable or its alias is invalid.
+            # Continue with the PowerShell fallback.
+            pass
+
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+
+    if len(normalized_commands) == 1:
+        shell_command = [
+            shell,
+            "-NoLogo",
+            "-NoProfile",
+        ]
+
+        if keep_open:
+            shell_command.append("-NoExit")
+
+        shell_command.extend(
+            [
+                "-Command",
+                (
+                    "$Host.UI.RawUI.WindowTitle = "
+                    + powershell_quote(title)
+                    + "; "
+                    + as_powershell_command(normalized_commands[0])
+                ),
+            ]
+        )
+
+        subprocess.Popen(
+            shell_command,
+            cwd=str(working_dir),
+            creationflags=flags,
+            close_fds=True,
+        )
+
+        return "POWERSHELL"
+
+    # Multiple workers without Windows Terminal:
+    # one PowerShell window, multiple independent child processes.
+    #
+    # Start-Process -NoNewWindow keeps all worker processes
+    # attached to the same console instead of opening N windows.
+
+    script_lines = [
+        "$ErrorActionPreference = 'Stop'",
+        (
+            "$Host.UI.RawUI.WindowTitle = "
+            + powershell_quote(title)
+        ),
+        (
+            "$processes = New-Object "
+            "'System.Collections.Generic.List[System.Diagnostics.Process]'"
+        ),
+    ]
+
+    for index, arguments in enumerate(normalized_commands, start=1):
+        executable = arguments[0]
+
+        # Windows argument quoting, then PowerShell string quoting.
+        argument_string = subprocess.list2cmdline(arguments[1:])
+
+        script_lines.extend(
+            [
+                (
+                    "Write-Host "
+                    + powershell_quote(
+                        f"Starting process {index}/{len(commands)}"
+                    )
+                    + " -ForegroundColor Cyan"
+                ),
+                (
+                    "$process = Start-Process "
+                    "-FilePath "
+                    + powershell_quote(executable)
+                    + " -ArgumentList "
+                    + powershell_quote(argument_string)
+                    + " -WorkingDirectory "
+                    + powershell_quote(str(working_dir))
+                    + " -NoNewWindow -PassThru"
+                ),
+                "$processes.Add($process)",
+            ]
+        )
+
+    script_lines.extend(
+        [
+            "Write-Host 'All processes launched.' -ForegroundColor Green",
+            "foreach ($process in $processes) {",
+            "    $process.WaitForExit()",
+            "}",
+            "Write-Host 'All processes finished.' -ForegroundColor Cyan",
+        ]
+    )
+
+    shell_command = [
+        shell,
+        "-NoLogo",
+        "-NoProfile",
+    ]
+
+    if keep_open:
+        shell_command.append("-NoExit")
+
+    shell_command.extend(
+        [
+            "-Command",
+            "; ".join(script_lines),
+        ]
+    )
+
+    subprocess.Popen(
+        shell_command,
+        cwd=str(working_dir),
+        creationflags=flags,
+        close_fds=True,
+    )
+
+    return "POWERSHELL"
 
 
 def worker_powershell_command(
@@ -3343,91 +3663,67 @@ def worker_powershell_command(
 
     return command
 
+# oic_parallel_collector.py
+# Replace the existing legacy launch_worker_tabs() function.
 
 def launch_worker_tabs(
     args: argparse.Namespace,
     output: Path,
     plan: dict,
 ) -> str:
-
     if os.name != "nt":
+        raise RuntimeError("Worker terminal requires Windows")
 
-        raise RuntimeError(
-            "Windows Terminal tabs require Windows."
-        )
+    workers = int(plan["workers"])
 
-    wt = find_windows_terminal()
-
-    if not wt:
-
-        raise RuntimeError(
-            "Windows Terminal (wt.exe) not found."
-        )
+    if workers < 1:
+        raise ValueError("Worker count must be at least 1")
 
     run_id = (
-        datetime.now().strftime(
-            "%Y%m%d_%H%M%S"
-        )
+        datetime.now().strftime("%Y%m%d_%H%M%S")
         + "_"
         + uuid.uuid4().hex[:6]
     )
 
-    # ========================================================
-    # ONE NEW WINDOWS TERMINAL WINDOW
-    #
-    # All workers are created by ONE wt.exe invocation.
-    #
-    # This prevents:
-    #   - Four separate Windows Terminal windows
-    #   - Multiple independent terminal launchers
-    #
-    # Command structure:
-    #
-    # wt -w new new-tab <worker1>
-    #           ; new-tab <worker2>
-    #           ; new-tab <worker3>
-    #           ; new-tab <worker4>
-    #
-    # The original PowerShell remains the Rich monitor.
-    # ========================================================
+    shell = find_powershell()
 
-    command = [
-        wt,
-        "-w",
-        "new",
-    ]
+    commands = []
+    titles = []
 
-    for worker_id in range(
-        1,
-        plan["workers"] + 1,
-    ):
-
-        if worker_id > 1:
-            command.append(";")
-
-        ps_command = worker_powershell_command(
-            args,
-            worker_id,
-            output,
-            run_id,
+    for worker_id in range(1, workers + 1):
+        worker_command = worker_powershell_command(
+            args=args,
+            worker_id=worker_id,
+            output=output,
+            run_id=run_id,
         )
 
-        command.extend([
-            "new-tab",
-            "--title",
-            f"OIC | Worker {worker_id:02d}",
-            "--startingDirectory",
-            str(HERE),
-            "powershell.exe",
-            "-NoLogo",
-            "-NoExit",
-            "-Command",
-            ps_command,
-        ])
+        commands.append(
+            [
+                shell,
+                "-NoLogo",
+                "-NoProfile",
+                "-Command",
+                worker_command,
+            ]
+        )
 
-    subprocess.Popen(
-        command,
-        cwd=str(HERE),
+        titles.append(
+            f"OIC | Worker {worker_id:02d}"
+        )
+
+    mode = launch_terminal_window(
+        commands,
+        title="OIC | Parallel Workers",
+        cwd=HERE,
+        tab_titles=titles,
+        keep_open=True,
+    )
+
+    log(
+        f"Worker terminal: {mode} | "
+        f"{workers} worker processes",
+        level="OK",
     )
 
     return run_id
@@ -4151,36 +4447,111 @@ def selected_monitor(config: dict, run_dir: Path) -> int:
     return 0
 
 
-def selected_launch(config: dict, run_dir: Path, config_path: Path) -> int:
-    wt = find_windows_terminal()
-    if os.name != "nt" or not wt:
-        raise RuntimeError("Windows Terminal wt.exe required; run workers manually on other systems")
-    def command(extra):
-        return [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
-                "--query-config", str(config_path), *extra]
-    # Each resume attempt re-enters STARTING; do not mistake a previous
-    # terminal state for the current worker processes.
-    for worker_id in range(1, int(config["workers"]) + 1):
-        state_file = run_dir / f"worker_{worker_id:02d}" / "state.json"
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        write_json(state_file, dict(run_id=config["run_id"], worker_id=worker_id,
-                                    status="STARTING", current_request=None,
-                                    request_started_at=None, last_http=None,
-                                    last_message="Starting this attempt", updated_at=utc_now()))
-    # Exactly two new Windows Terminal windows. The Textual UI stays alive.
-    monitor_ps = "& " + powershell_quote(command([])[0]) + " " + " ".join(powershell_quote(a) for a in command([])[1:] + ["--monitor-only"])
-    subprocess.Popen([wt, "-w", "new", "new-tab", "--title", "OIC | Live Monitor",
-                      "--startingDirectory", str(HERE), "powershell.exe", "-NoLogo", "-NoExit",
-                      "-Command", monitor_ps], cwd=str(HERE))
-    worker_cmd = [wt, "-w", "new"]
-    for wid in range(1, int(config["workers"]) + 1):
-        if wid > 1:
-            worker_cmd.append(";")
-        ps = "& " + powershell_quote(command([])[0]) + " " + " ".join(powershell_quote(a) for a in command([])[1:] + ["--worker-id", str(wid)])
-        worker_cmd += ["new-tab", "--title", f"OIC | Worker {wid:02d}",
-                       "--startingDirectory", str(HERE), "powershell.exe",
-                       "-NoLogo", "-NoExit", "-Command", ps]
-    subprocess.Popen(worker_cmd, cwd=str(HERE))
+def selected_launch(
+    config: dict,
+    run_dir: Path,
+    config_path: Path,
+) -> int:
+    if os.name != "nt":
+        raise RuntimeError(
+            "Selected-query terminal launcher requires Windows"
+        )
+
+    workers = int(config["workers"])
+
+    if workers < 1:
+        raise ValueError("Worker count must be at least 1")
+
+    run_dir = Path(run_dir).resolve()
+    config_path = Path(config_path).resolve()
+
+    python_path = str(Path(sys.executable).resolve())
+    script_path = str(Path(__file__).resolve())
+
+    def command(*extra: str) -> list[str]:
+        return [
+            python_path,
+            script_path,
+            "--query-config",
+            str(config_path),
+            *extra,
+        ]
+
+    # Reset state only for the current run.
+    # Never reuse a terminal status from an earlier attempt.
+
+    for worker_id in range(1, workers + 1):
+        state_file = (
+            run_dir
+            / f"worker_{worker_id:02d}"
+            / "state.json"
+        )
+
+        state_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        write_json(
+            state_file,
+            {
+                "run_id": config["run_id"],
+                "worker_id": worker_id,
+                "status": "STARTING",
+                "current_request": None,
+                "request_started_at": None,
+                "last_http": None,
+                "last_message": "Starting this attempt",
+                "updated_at": utc_now(),
+            },
+        )
+
+    worker_commands = [
+        command("--worker-id", str(worker_id))
+        for worker_id in range(1, workers + 1)
+    ]
+
+    worker_titles = [
+        f"OIC | Worker {worker_id:02d}"
+        for worker_id in range(1, workers + 1)
+    ]
+
+    # Worker Window:
+    # Windows Terminal -> N tabs in one window.
+    # PowerShell fallback -> N processes in one window.
+
+    worker_mode = launch_terminal_window(
+        worker_commands,
+        title="OIC | Parallel Workers",
+        cwd=HERE,
+        tab_titles=worker_titles,
+        keep_open=True,
+    )
+
+    log(
+        f"Workers launched via {worker_mode} "
+        f"({workers} processes)",
+        level="OK",
+    )
+
+    # Monitor Window:
+    # Always separate from Main and Worker windows.
+
+    monitor_mode = launch_terminal_window(
+        [
+            command("--monitor-only")
+        ],
+        title="OIC | Live Monitor",
+        cwd=HERE,
+        tab_titles=["OIC | Live Monitor"],
+        keep_open=True,
+    )
+
+    log(
+        f"Live Monitor launched via {monitor_mode}",
+        level="OK",
+    )
+
     return 0
 
 

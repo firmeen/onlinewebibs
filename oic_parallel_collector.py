@@ -1200,7 +1200,7 @@ class OICClient:
             "_tk": "Init",
             "_pageUrl": (
                 f"{PAGE_PATH}"
-                f"?Class={CUBE['class']}"
+                f"?Class={self.profile['cls']}"
             ),
         }
 
@@ -3962,11 +3962,16 @@ def selected_worker(args) -> int:
                     manifest["updated_at"] = utc_now()
                     write_json(manifest_path, manifest)
                     log(f"OK X={record['x_count']} Y={record['y_tuples']} cells={record['cells']}", worker_id, "OK")
-                # Measure crossjoin is on Y, so count unique Y tuples without Measure.
-                x_count = len(data["axes"]["Axis0"])
-                y_keys = {tuple(m["unique_name"] for m in row if m["hierarchy"] != "[Measures]")
-                          for row in data["axes"]["Axis1"]}
-                y_count = len(y_keys)
+                # Schema v2 puts Measures on Axis1 with X/ROWS; v1 preserved.
+                row_keys = {tuple(m["unique_name"] for m in row
+                                  if m["hierarchy"] != "[Measures]")
+                            for row in data["axes"]["Axis1"]}
+                if int(config.get("schema_version", 1)) == 2:
+                    x_count = len(row_keys)
+                    y_count = len(data["axes"]["Axis0"])
+                else:
+                    x_count = len(data["axes"]["Axis0"])
+                    y_count = len(row_keys)
                 x_returned = x_count
                 state.update(current_request=None, request_started_at=None,
                              last_message=f"OK X={x_offset} Y={y_offset} cells={len(data['cells'])}")
@@ -4121,7 +4126,7 @@ def selected_monitor(config: dict, run_dir: Path) -> int:
                               str(worker.get("current_request") or "—"),
                               str(worker.get("last_http") or "—"),
                               str(worker.get("last_message") or "—")[:70])
-            status = (f"X: {', '.join(config['x'])}\nY: {', '.join(config['y'])}\n"
+            status = (f"X / ROWS: {', '.join(config['x'])}\nY / COLUMNS: {', '.join(config['y'])}\n"
                       f"Measures: {len(config['measures'])} | Workers: {config['workers']}\n"
                       f"Chunks OK: {totals['chunks_ok']} | Cells: {totals['cells']:,} | "
                       f"Bytes: {totals['bytes']:,} | Elapsed: {format_duration(elapsed_seconds(start))}\n"

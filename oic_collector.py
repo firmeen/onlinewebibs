@@ -2773,8 +2773,6 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.select_category("MV")
             self.set_interval(1.0, self.poll_selected_run)
             self.set_interval(1.0, self.poll_applied_selection)
-            self.poll_applied_selection()
-            self.reconnect_active_batch()
             self.update_catalog_summary()
 
             # Load local configuration without making
@@ -2783,6 +2781,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.reload_from_env(
                 auto_check=False
             )
+            # Resolve the configured output location before restoring the
+            # Applied Query List or reconnecting to an active batch.
+            self.poll_applied_selection()
+            self.reconnect_active_batch()
 
             self.info(
                 "Terminal UI initialized.",

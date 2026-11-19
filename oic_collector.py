@@ -4743,8 +4743,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             if self.active_run is not None:
                 self.info("Batch collection is already active", "warning")
                 return
-            if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
-                self.info("Validate Cookie and JWT before Start", "error")
+            if not self.cookie_value().strip():
+                self.info("Enter OIC_COOKIE before starting; the worker refreshes JWT via GenToken", "error")
                 return
             if sys.platform != "win32":
                 self.info("PowerShell collection requires Windows", "error")
@@ -4831,8 +4831,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             if self.active_run is not None:
                 self.info("A batch is already active", "warning")
                 return
-            if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
-                self.info("Validate Cookie and JWT before Resume", "warning")
+            if not self.cookie_value().strip():
+                self.info("Enter OIC_COOKIE before resuming; the worker refreshes JWT via GenToken", "warning")
                 return
             root = resolve_output_path(self.output_value()) / "Runs"
             path = self.last_run_path
@@ -5776,6 +5776,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "y_chunk": 20,
                 "timeout": 180,
                 "retries": 2,
+                "max_response_mb": 256,
                 "delay": 0.0,
             }
 

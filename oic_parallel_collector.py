@@ -18,14 +18,14 @@ COMMANDS
 Prepare jobs:
     python oic_parallel_collector.py --prepare
 
-Start 4 workers in ONE NEW Windows Terminal window:
+Start a PowerShell worker supervisor:
     python oic_parallel_collector.py
 
 Or:
     python oic_parallel_collector.py --launch
 
 The original PowerShell displays a LIVE RICH MONITOR.
-A new Windows Terminal window opens with 4 worker tabs.
+Workers are background Python processes; monitor uses PowerShell.
 
 Test one job:
     python oic_parallel_collector.py --worker-id 1 --max-jobs 1 --max-years 1
@@ -91,7 +91,7 @@ output/oic_parallel/MV/
 REQUIREMENTS
 ------------
 Windows 10/11
-Windows Terminal (wt.exe)
+Windows PowerShell (no Windows Terminal required)
 Python 3.10+
 requests
 openpyxl
@@ -3295,7 +3295,7 @@ def launch_terminal_window(
     keep_open: bool = True,
     maximized: bool = False,
 ) -> str:
-    """Open PowerShell directly. No Windows Terminal or wt.exe calls."""
+    """Open PowerShell directly without a terminal multiplexer."""
     if os.name != "nt":
         raise RuntimeError("PowerShell launcher requires Windows")
     if not commands or any(not cmd for cmd in commands):
@@ -3872,7 +3872,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # ============================================================
 # SELECTED-QUERY WORKFLOW — reuses OICClient, XMLA HTTP, logging,
-# Rich, Windows Terminal and file helpers from the legacy engine.
+# Rich, PowerShell and file helpers from the legacy engine.
 # The old full-hierarchy CLI remains diagnostic, never the default.
 # ============================================================
 
@@ -4315,7 +4315,7 @@ def selected_launch(
     ]
 
     # Worker Window:
-    # Windows Terminal -> N tabs in one window.
+    # PowerShell -> N background processes supervised in one console.
     # PowerShell fallback -> N processes in one window.
 
     worker_mode = launch_terminal_window(
@@ -4470,6 +4470,7 @@ def run_batch(batch_dir: Path) -> int:
             entry.update(status="RUNNING", error="", started_at=utc_now())
             _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
             processes = []
+            launch_error = None
             for worker_id in range(1, int(config["workers"]) + 1):
                 if stop.exists():
                     break
@@ -4487,9 +4488,16 @@ def run_batch(batch_dir: Path) -> int:
                         cwd=str(HERE), stdout=logfile, stderr=subprocess.STDOUT,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     processes.append((worker_id, proc, logfile))
-                except Exception:
+                except Exception as exc:
                     logfile.close()
-                    raise
+                    launch_error = str(exc)
+                    stop_requested_for_query = True
+                    for _, active_proc, _ in processes:
+                        if active_proc.poll() is None:
+                            active_proc.terminate()
+                    break
+            if launch_error:
+                entry.update(status="FAILED", error="WORKER LAUNCH: " + launch_error[:250])
             try:
                 stopping_since = None
                 while any(proc.poll() is None for _, proc, _ in processes):
@@ -4521,6 +4529,8 @@ def run_batch(batch_dir: Path) -> int:
             entry["finished_at"] = utc_now()
             if stop.exists():
                 entry["status"] = "STOPPED"
+            elif launch_error:
+                entry["status"] = "PARTIAL" if totals["chunks_ok"] else "FAILED"
             elif totals["workers_completed"] == config["workers"]:
                 entry["status"] = "COMPLETED"
             else:
@@ -4579,8 +4589,8 @@ def selected_main(argv) -> int:
 def main() -> int:
 
     if "--batch-run" in sys.argv or "--batch-monitor" in sys.argv:
-        operation = sys.argv[1]
-        if len(sys.argv) < 3 or operation not in ("--batch-run", "--batch-monitor"):
+        operation = sys.argv[1] if len(sys.argv) > 1 else ""
+        if len(sys.argv) != 3 or operation not in ("--batch-run", "--batch-monitor"):
             raise ValueError("Expected --batch-run/--batch-monitor directory")
         directory = Path(sys.argv[2]).resolve()
         return run_batch(directory) if operation == "--batch-run" else batch_monitor(directory)
@@ -4776,11 +4786,11 @@ def main() -> int:
             )
 
             log(
-                "Opening ONE new Windows Terminal window"
+                "Opening PowerShell collection window"
             )
 
             log(
-                f"Creating {plan['workers']} worker tabs"
+                f"Creating {plan['workers']} worker processes"
             )
 
             run_id = launch_worker_tabs(
@@ -4790,7 +4800,7 @@ def main() -> int:
             )
 
             log(
-                "Worker tabs launched",
+                "Worker processes launched",
                 level="OK",
             )
 

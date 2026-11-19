@@ -2440,6 +2440,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.applied_queries = []
             self.selection_revision = None
             self.batch_process = None
+            self.query_states = {}
             self.force_confirm_until = 0
             self.catalog_running = False
             self.catalog_started = False
@@ -2772,6 +2773,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.set_interval(1.0, self.poll_selected_run)
             self.set_interval(1.0, self.poll_applied_selection)
             self.poll_applied_selection()
+            self.reconnect_active_batch()
             self.update_catalog_summary()
 
             # Load local configuration without making
@@ -4253,7 +4255,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                 cfg = item["query"]
                 label = (f"{item['query_id']}  {cfg['code']}/{cfg.get('cube_type','FY')}"
                          f"  {cfg['cube']}  X:{len(cfg['x'])} Y:{len(cfg['y'])}"
-                         f" V:{len(cfg['measures'])}  W:{cfg['workers']}  PLANNED")
+                         f" V:{len(cfg['measures'])}  W:{cfg['workers']}  "
+                         f"{self.query_states.get(item['query_id'], 'PLANNED')}")
                 listing.add_option(Option(label, id=item["query_id"]))
             if self.applied_queries:
                 ids = [q["query_id"] for q in self.applied_queries]
@@ -4499,6 +4502,45 @@ def launch_terminal_ui(args, return_app: bool = False):
         # SELECTED DATA EXTRACTION / WINDOW HANDOFF
         # ====================================================
 
+        @staticmethod
+        def _batch_pid_alive(pid) -> bool:
+            try:
+                pid = int(pid)
+                if pid <= 0 or sys.platform != "win32":
+                    return False
+                import ctypes
+                handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+                if not handle:
+                    return False
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            except (TypeError, ValueError, OSError):
+                return False
+
+        def reconnect_active_batch(self) -> None:
+            root = resolve_output_path(self.output_value()).resolve() / "Runs"
+            if not root.is_dir():
+                return
+            runs = sorted((p for p in root.glob("*") if (p / "batch_config.json").is_file()),
+                          reverse=True)
+            self.last_run_path = runs[0] if runs else None
+            for path in runs:
+                manifest_path = path / "batch_manifest.json"
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if (manifest.get("status") in ("RUNNING", "STARTING", "STOPPING")
+                        and self._batch_pid_alive(manifest.get("pid"))):
+                    self.active_run = path
+                    self.last_run_path = path
+                    self.query_one("#start", Button).disabled = True
+                    self.query_one("#stop", Button).disabled = False
+                    self.query_one("#force_stop", Button).disabled = False
+                    self.info(f"Reconnected to active batch: {path.name}", "success")
+                    self.poll_selected_run()
+                    return
+
         def _launch_batch_process(self, path: Path) -> None:
             script = BASE_DIR / "oic_parallel_collector.py"
             if not script.is_file():
@@ -4586,6 +4628,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                 return
             manifest = json.loads((path / "batch_manifest.json").read_text(
                 encoding="utf-8")) if (path / "batch_manifest.json").is_file() else {}
+            if (manifest.get("status") in ("RUNNING", "STARTING", "STOPPING")
+                    and self._batch_pid_alive(manifest.get("pid"))):
+                self.info("That batch is still running; do not launch duplicate workers.", "warning")
+                return
             if manifest.get("status") == "COMPLETED":
                 self.info("The previous batch is already complete.", "warning")
                 return
@@ -4609,6 +4655,14 @@ def launch_terminal_ui(args, return_app: bool = False):
                 pass
             status = manifest.get("status", "STARTING")
             items = manifest.get("queries", [])
+            query_states = {item["query_id"]: item.get("status", "PENDING")
+                            for item in items if item.get("query_id")}
+            if query_states != self.query_states:
+                self.query_states = query_states
+                self.update_query_summary()
+                completed = sum(value == "COMPLETED" for value in query_states.values())
+                self.query_one("#progress", ProgressBar).update(
+                    total=max(1, len(query_states)), progress=completed)
             details = " / ".join(f"{q['query_id']}:{q.get('status','?')}"
                                  for q in items[:5])
             self.query_one("#status", Static).update(
@@ -4618,6 +4672,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.batch_process.poll() is not None and
                 status not in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED")
             )
+            if (self.batch_process is None and
+                    status in ("RUNNING", "STARTING", "STOPPING") and
+                    manifest.get("pid") and
+                    not self._batch_pid_alive(manifest.get("pid"))):
+                process_failed = True
             if process_failed:
                 status = "FAILED"
                 self.info(f"Batch supervisor exited unexpectedly. See {self.active_run / 'batch.log'}", "error")

@@ -65,8 +65,8 @@ import uuid
 import subprocess
 import shutil
 
-from oic_query import (PROFILES as QUERY_PROFILES, load_catalog, discover_fields,
-                       default_query, validate_query, build_mdx as selected_mdx, query_hash)
+from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
+                       validate_query, build_mdx as selected_mdx, query_hash)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2105,6 +2105,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             RichLog,
             Static,
             Select,
+            Tree,
         )
 
     except ImportError as exc:
@@ -2386,8 +2387,15 @@ def launch_terminal_ui(args, return_app: bool = False):
             background: #101a22;
         }
 
-        #categories, #table { display: none; }
+        #categories, #catalog_panel { display: none; }
         #cube_select { width: 1fr; }
+        #selected_query_summary {
+            height: 5; padding: 1 2; margin-top: 1;
+            border: solid #304352; background: #16232e;
+        }
+        #catalog_status { height: 3; margin-top: 1; padding: 0 2;
+                           border: solid #293c49; color: #9fb0ba; }
+        #activity_panel { height: 1fr; min-height: 8; }
         #designer_area { height: 1fr; min-height: 12; }
         #field_panel { width: 1fr; padding: 0 1; }
         #axis_panel { width: 1fr; padding: 0 1; }
@@ -2416,6 +2424,11 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.selected_measures = []
             self.active_run = None
             self.last_run_path = None
+            self.applied_config = None
+            self.selection_revision = None
+            self.catalog_running = False
+            self.catalog_started = False
+            self.catalog_statuses = {code: "CACHE" if load_catalog(code)["source"] == "CACHE" else "PROFILE" for code in QUERY_PROFILES}
 
             self.busy = False
             self.stop_event = threading.Event()
@@ -2566,6 +2579,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="test",
                     )
 
+                    yield Button("OPEN QUERY DESIGNER", id="open_designer")
+                    yield Button("REFRESH CATALOGS", id="refresh_all_catalogs")
                     yield Button(
                         "START COLLECTION",
                         id="start",
@@ -2580,6 +2595,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                         "OPEN OUTPUT",
                         id="open",
                     )
+                    yield Button("RESUME", id="resume_run")
 
                 # OUTPUT + CATEGORIES
 
@@ -2647,39 +2663,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                         zebra_stripes=True,
                     )
 
-                # USER-SELECTED QUERY DESIGNER
-                with Horizontal(id="designer_area"):
-                    with Vertical(id="field_panel"):
-                        yield Static("FIELD EXPLORER  /  CLICK + A → X, S → Y", classes="designer_title")
-                        yield Input(placeholder="Search Thai / English / MDX...", id="field_search")
-                        yield DataTable(id="field_table", cursor_type="row", zebra_stripes=True)
-                        yield Button("REFRESH CATALOG", id="refresh_catalog")
-                    with Vertical(id="axis_panel"):
-                        yield Static("X  /  HORIZONTAL AXIS", classes="designer_title")
-                        yield Select([], allow_blank=True, id="axis_x")
-                        with Horizontal(classes="axis_bar"):
-                            yield Button("X ↑", id="x_up")
-                            yield Button("X ↓", id="x_down")
-                            yield Button("REMOVE X", id="x_remove")
-                        yield Static("Y  /  VERTICAL AXIS", classes="designer_title")
-                        yield Select([], allow_blank=True, id="axis_y")
-                        with Horizontal(classes="axis_bar"):
-                            yield Button("Y ↑", id="y_up")
-                            yield Button("Y ↓", id="y_down")
-                            yield Button("REMOVE Y", id="y_remove")
-                        yield Static("VALUES  /  CLICK MEASURES IN FIELD LIST", classes="designer_title")
-                        yield Static("", id="values_list")
-                        with Horizontal(classes="axis_bar"):
-                            yield Button("PREVIEW QUERY", id="query_preview")
-                        yield Static("Select X and Y fields.", id="preview_text")
-                        with Horizontal(classes="axis_bar"):
-                            yield Label("WORKERS", classes="input_label")
-                            yield Input(value="4", id="worker_count", type="integer")
-                            yield Label("X CHUNK", classes="input_label")
-                            yield Input(value="1", id="x_chunk", type="integer")
-                            yield Label("Y CHUNK", classes="input_label")
-                            yield Input(value="20", id="y_chunk", type="integer")
-                            yield Button("RESUME", id="resume_run")
+                # Field editing is delegated to a separate Textual window.
+                yield Static("QUERY NOT APPLIED / Open Query Designer to select fields",
+                             id="selected_query_summary")
+                yield Static("FIELD CATALOG / Local caches", id="catalog_status")
 
                 # PROGRESS
 
@@ -2760,12 +2747,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "#stop",
                 Button,
             ).disabled = True
-            field_table = self.query_one("#field_table", DataTable)
-            field_table.add_column("FIELD", key="display", width=37)
-            field_table.add_column("TYPE", key="type", width=12)
-            field_table.add_column("SOURCE", key="source", width=17)
             self.select_category("MV")
             self.set_interval(1.0, self.poll_selected_run)
+            self.set_interval(1.0, self.poll_applied_selection)
+            self.poll_applied_selection()
+            self.update_catalog_summary()
 
             # Load local configuration without making
             # any network requests.
@@ -3156,10 +3142,6 @@ def launch_terminal_ui(args, return_app: bool = False):
         ) -> None:
             input_id = event.input.id
 
-            if input_id == "field_search":
-                self.refresh_field_table()
-                return
-
             if input_id == "token":
                 current = normalize_token(
                     event.value
@@ -3480,13 +3462,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                     "warning",
                 )
 
-            self.query_one(
-                "#status",
-                Static,
-            ).update(
-                "READY / Session VALID / "
-                "GenToken successful"
+            self.query_one("#status", Static).update(
+                "READY / Session VALID / GenToken successful"
             )
+            if not self.catalog_started:
+                self.discover_all_catalogs(force=False)
 
         # ====================================================
         # BUTTON EVENTS
@@ -3519,14 +3499,12 @@ def launch_terminal_ui(args, return_app: bool = False):
             elif button_id == "open":
                 self.action_open_output()
 
-            elif button_id == "query_preview":
-                self.preview_selected_query()
             elif button_id == "resume_run":
                 self.resume_selected_query()
-            elif button_id == "refresh_catalog":
-                self.refresh_catalog_worker(self.selected_code, self.token_value(), self.cookie_value())
-            elif button_id in ("x_up", "x_down", "x_remove", "y_up", "y_down", "y_remove"):
-                self.modify_axis(button_id)
+            elif button_id == "open_designer":
+                self.open_query_designer()
+            elif button_id == "refresh_all_catalogs":
+                self.discover_all_catalogs(force=True)
 
         # ====================================================
         # SELECTED INSURANCE CLASSES
@@ -4208,158 +4186,219 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
 
         # ====================================================
-        # QUERY DESIGNER / FIELD SELECTION
+        # MAIN WINDOW: CONFIG BRIDGE AND CATALOG DISCOVERY
         # ====================================================
+
+        def selection_file(self) -> Path:
+            return resolve_output_path(self.output_value()) / "query_selection.json"
 
         def select_category(self, code: str) -> None:
             if code not in QUERY_PROFILES:
                 return
             self.selected_code = code
-            self.field_catalog = load_catalog(code)
-            defaults = default_query(code, workers=4)
-            self.axis_x = defaults["x"]
-            self.axis_y = defaults["y"]
-            self.selected_measures = defaults["measures"]
-            self.selected_field = None
-            self.refresh_field_table()
-            self.refresh_axes()
-            if code == "MR" and not self.axis_x:
-                self.info("MR YEAR needs live metadata verification.", "warning")
+            self.update_query_summary()
 
         def on_select_changed(self, event: Select.Changed) -> None:
             if event.select.id == "cube_select" and event.value in QUERY_PROFILES:
                 self.select_category(str(event.value))
 
-        def refresh_field_table(self) -> None:
-            table = self.query_one("#field_table", DataTable)
-            search = self.query_one("#field_search", Input).value.casefold().strip()
-            table.clear(columns=False)
-            self.field_rows = {}
-            for field in self.field_catalog["fields"]:
-                name = field["mdx"]
-                haystack = " ".join([field.get("display", ""), name, field.get("group", "")]).casefold()
-                if search and search not in haystack:
-                    continue
-                mark = "[X]" if name in self.axis_x else "[Y]" if name in self.axis_y else "[v]" if name in self.selected_measures else ""
-                table.add_row(mark + " " + field.get("display", name),
-                              field["type"], field.get("source", ""), key=name)
-                self.field_rows[name] = field
-            if self.selected_field not in self.field_rows:
-                self.selected_field = None
-
-        def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-            if event.data_table.id == "field_table":
-                self.selected_field = str(event.row_key.value)
-
-        def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-            if event.data_table.id != "field_table":
+        def update_query_summary(self) -> None:
+            if not self.is_mounted:
                 return
-            name = str(event.row_key.value)
-            self.selected_field = name
-            field = self.field_rows.get(name)
-            if field and field["type"] == "MEASURE":
-                if name in self.selected_measures:
-                    self.selected_measures.remove(name)
-                else:
-                    self.selected_measures.append(name)
-                self.refresh_field_table()
-                self.refresh_axes()
-
-        def action_field_to_x(self) -> None:
-            self.move_selected("X")
-
-        def action_field_to_y(self) -> None:
-            self.move_selected("Y")
-
-        def move_selected(self, axis: str) -> None:
-            if isinstance(self.focused, Input):
+            config = self.applied_config
+            if not config or config.get("code") != self.selected_code:
+                self.query_one("#selected_query_summary", Static).update(
+                    f"{self.selected_code} / NO APPLIED QUERY\n"
+                    "Open Query Designer to select Rows, Columns and Values."
+                )
                 return
-            field = self.field_rows.get(self.selected_field or "")
-            if not field or field["type"] != "DIMENSION":
-                return
-            name = field["mdx"]
-            self.axis_x = [x for x in self.axis_x if x != name]
-            self.axis_y = [y for y in self.axis_y if y != name]
-            (self.axis_x if axis == "X" else self.axis_y).append(name)
-            self.refresh_field_table()
-            self.refresh_axes()
-
-        def refresh_axes(self) -> None:
-            labels = {f["mdx"]: f.get("display", f["mdx"]) for f in self.field_catalog["fields"]}
-            self.query_one("#axis_x", Select).set_options(
-                [(f"{i+1}. {labels.get(name, name)}", name)
-                 for i, name in enumerate(self.axis_x)])
-            self.query_one("#axis_y", Select).set_options(
-                [(f"{i+1}. {labels.get(name, name)}", name)
-                 for i, name in enumerate(self.axis_y)])
-            values = [labels.get(name, name) for name in self.selected_measures]
-            self.query_one("#values_list", Static).update(
-                "  |  ".join(values) if values else "Select at least one measure")
-            self.query_one("#preview_text", Static).update("Preview is local; no API call until Start.")
-
-        def modify_axis(self, action: str) -> None:
-            axis = self.axis_x if action.startswith("x") else self.axis_y
-            select = self.query_one("#axis_x" if action.startswith("x") else "#axis_y", Select)
-            name = select.value
-            if not isinstance(name, str) or name not in axis:
-                self.info("Select an axis field first.", "warning")
-                return
-            index = axis.index(name)
-            if action.endswith("remove"):
-                axis.remove(name)
-            else:
-                other = index - 1 if action.endswith("up") else index + 1
-                if 0 <= other < len(axis):
-                    axis[index], axis[other] = axis[other], axis[index]
-            self.refresh_field_table()
-            self.refresh_axes()
+            self.query_one("#selected_query_summary", Static).update(
+                f"APPLIED {config['code']} / {config['cube']}\n"
+                f"X ROWS: {len(config['x'])}  |  Y COLUMNS: {len(config['y'])}  |  "
+                f"VALUES: {len(config['measures'])}\n"
+                f"WORKERS: {config['workers']}  |  "
+                f"CHUNKS: {config['x_chunk']} ROWS × {config['y_chunk']} COLUMNS"
+            )
 
         def query_config(self) -> dict:
-            profile = QUERY_PROFILES[self.selected_code]
-            config = dict(code=self.selected_code, catalog=profile["catalog"],
-                          cube=profile["cube"], x=list(self.axis_x), y=list(self.axis_y),
-                          measures=list(self.selected_measures), filters=[],
-                          workers=int(self.query_one("#worker_count", Input).value),
-                          x_chunk=int(self.query_one("#x_chunk", Input).value),
-                          y_chunk=int(self.query_one("#y_chunk", Input).value),
-                          timeout=60, delay=1.0)
-            return validate_query(config, self.field_catalog)
+            if not self.applied_config:
+                raise ValueError("Apply a query in Query Designer before Start")
+            if self.applied_config.get("code") != self.selected_code:
+                raise ValueError("Category changed; open Query Designer and Apply this category")
+            return validate_query(dict(self.applied_config))
 
-        def preview_selected_query(self) -> None:
+        def poll_applied_selection(self) -> None:
             try:
-                config = self.query_config()
-                mdx = selected_mdx(config)
-                message = (f"Cube: {config['cube']} | Workers: {config['workers']} "
-                           f"| Chunk: {config['x_chunk']} X × {config['y_chunk']} Y\n"
-                           f"X: {', '.join(config['x'])}\nY: {', '.join(config['y'])}\n"
-                           f"Values: {len(config['measures'])}; large CrossJoins may time out.\n"
-                           + mdx)
-                self.query_one("#preview_text", Static).update(message)
-            except ValueError as exc:
-                self.query_one("#preview_text", Static).update(str(exc))
-                self.info(f"QUERY INVALID: {exc}", "warning")
+                envelope = json.loads(self.selection_file().read_text(encoding="utf-8"))
+                revision = envelope["revision"]
+                if revision == self.selection_revision:
+                    return
+                config = validate_query(envelope["query"])
+                if int(config.get("schema_version", 0)) != SCHEMA_VERSION:
+                    raise ValueError("Old query configuration cannot be applied with reversed axes")
+            except FileNotFoundError:
+                return
+            except (KeyError, ValueError, TypeError, OSError) as exc:
+                self.info(f"Applied selection rejected: {exc}", "warning")
+                return
+            self.applied_config = config
+            self.selection_revision = revision
+            self.selected_code = config["code"]
+            self.query_one("#cube_select", Select).value = config["code"]
+            self.update_query_summary()
+            self.info(f"Designer applied {config['code']} ({len(config['selected_fields'])} fields).", "success")
 
-        # ====================================================
-        # LIVE METADATA / RUN CONTROL
-        # ====================================================
+        # oic_collector.py
+        # Replace OICApp.open_query_designer() inside launch_terminal_ui().
 
-        @work(thread=True, group="catalog-refresh", exclusive=True)
-        def refresh_catalog_worker(self, code: str, token: str, cookie: str) -> None:
+        def open_query_designer(self) -> None:
+            if sys.platform != "win32":
+                self.info(
+                    "Dedicated Query Designer requires Windows.",
+                    "error",
+                )
+                return
+
+            from oic_parallel_collector import launch_terminal_window
+
+            selection = self.selection_file().resolve()
+            lock_path = selection.with_suffix(".lock")
+
+            # Prevent opening another instance when the existing
+            # Query Designer process is still active.
+
+            if lock_path.exists():
+                try:
+                    pid = int(
+                        lock_path.read_text(
+                            encoding="ascii"
+                        ).strip()
+                    )
+
+                    import ctypes
+
+                    process_handle = ctypes.windll.kernel32.OpenProcess(
+                        0x1000,
+                        False,
+                        pid,
+                    )
+
+                    if process_handle:
+                        ctypes.windll.kernel32.CloseHandle(
+                            process_handle
+                        )
+
+                        self.info(
+                            "Query Designer is already open.",
+                            "warning",
+                        )
+                        return
+
+                except (OSError, ValueError):
+                    pass
+
+                try:
+                    lock_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    self.info(
+                        f"Cannot clear stale Designer lock: {exc}",
+                        "error",
+                    )
+                    return
+
             try:
-                catalog = discover_fields(code, token, cookie)
-                self.call_from_thread(self.catalog_refreshed, code, catalog, None)
-            except Exception as exc:
-                self.call_from_thread(self.catalog_refreshed, code, None, str(exc))
+                selection.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
 
-        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
+                python_path = str(
+                    Path(sys.executable).resolve()
+                )
+
+                script_path = str(
+                    Path(__file__).resolve()
+                )
+
+                designer_command = [
+                    python_path,
+                    script_path,
+                    "--designer",
+                    "--selection-file",
+                    str(selection),
+                    "--category",
+                    self.selected_code,
+                ]
+
+                mode = launch_terminal_window(
+                    [designer_command],
+                    title="OIC | Query Designer",
+                    cwd=BASE_DIR,
+                    tab_titles=["OIC | Query Designer"],
+                    keep_open=False,
+                )
+
+                self.info(
+                    f"Query Designer opened via {mode}.",
+                    "success",
+                )
+
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.info(
+                    f"Query Designer launch failed: {exc}",
+                    "error",
+                )
+
+        def update_catalog_summary(self) -> None:
+            status = "  |  ".join(f"{code}: {self.catalog_statuses.get(code,'—')}"
+                                  for code in QUERY_PROFILES)
+            self.query_one("#catalog_status", Static).update("FY FIELD CATALOGS\n" + status)
+
+        @work(thread=True, group="five-cube-discovery", exclusive=True)
+        def discover_all_catalogs(self, force: bool = False) -> None:
+            if self.catalog_running or self.cookie_state != "VALID":
+                return
+            self.catalog_running = True
+            self.catalog_started = True
+            sequence = self.auth_sequence
+            cookie, token = self.cookie_value(), self.token_value()
+            for code in QUERY_PROFILES:
+                if sequence != self.auth_sequence:
+                    break
+                existing = load_catalog(code)
+                if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
+                    try:
+                        updated = datetime.fromisoformat(existing["refreshed_at"])
+                        if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
+                            self.call_from_thread(self.catalog_discovery_event, code,
+                                                  existing, None)
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    catalog = discover_fields(code, token, cookie)
+                    self.call_from_thread(self.catalog_discovery_event, code, catalog, None)
+                except Exception as exc:
+                    error = str(exc)[:110]
+                    self.call_from_thread(self.catalog_discovery_event, code, None, error)
+                    if "SESSION_EXPIRED" in error or "401" in error or "403" in error:
+                        break
+            self.catalog_running = False
+
+        def catalog_discovery_event(self, code: str, catalog: dict | None,
+                                    error: str | None) -> None:
             if error:
-                self.info(f"Metadata refresh failed; cache retained: {error}", "warning")
-                return
-            if code != self.selected_code:
-                return
-            self.field_catalog = catalog
-            self.refresh_field_table()
-            self.info(f"Catalog: {len(catalog['fields'])} fields ({catalog['source']}).", "success")
+                self.catalog_statuses[code] = "ERROR / CACHE KEPT"
+                self.info(f"{code} metadata: {error}", "warning")
+            else:
+                self.catalog_statuses[code] = (
+                    f"{catalog['view_count']}+{catalog['data_count']}")
+                self.info(f"{code}: {len(catalog['fields'])} field items cached.", "success")
+            self.update_catalog_summary()
+
+        # ====================================================
+        # SELECTED DATA EXTRACTION / WINDOW HANDOFF
+        # ====================================================
 
         def start_selected_query(self) -> None:
             if self.active_run is not None:
@@ -4380,12 +4419,19 @@ def launch_terminal_ui(args, return_app: bool = False):
                 path = resolve_output_path(self.output_value()) / "oic_parallel" / run_id
                 path.mkdir(parents=True, exist_ok=False)
                 config_file = path / "query_config.json"
-                config_file.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-                (path / "job_plan.json").write_text(json.dumps(
-                    {"run_id": run_id, "query_hash": query_hash(config),
-                     "x": config["x"], "y": config["y"], "measures": config["measures"],
-                     "workers": config["workers"], "partition": "x_page_mod_workers"},
+                pending = config_file.with_suffix(".tmp")
+                pending.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+                pending.replace(config_file)
+                job_plan = path / "job_plan.json"
+                plan_temp = job_plan.with_suffix(".tmp")
+                plan_temp.write_text(json.dumps(
+                    {"run_id": run_id, "schema_version": config["schema_version"],
+                     "query_hash": query_hash(config),
+                     "x_rows": config["x"], "y_columns": config["y"],
+                     "measures": config["measures"],
+                     "workers": config["workers"], "partition": "x_row_page_mod_workers"},
                     ensure_ascii=False, indent=2), encoding="utf-8")
+                plan_temp.replace(job_plan)
                 script = BASE_DIR / "oic_parallel_collector.py"
                 if not script.is_file():
                     raise RuntimeError("oic_parallel_collector.py not found")
@@ -4459,12 +4505,1015 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.query_one("#stop", Button).disabled = True
 
     # ========================================================
+    # DEDICATED QUERY DESIGNER — same Textual framework, separate process.
+    # ========================================================
+
+    class OICQueryDesigner(App):
+        TITLE = "OIC | Query Designer"
+        SUB_TITLE = "Five-Cube FY Field Catalog"
+        BINDINGS = [
+            Binding("a", "field_to_x", "X / ROWS", show=False),
+            Binding("s", "field_to_y", "Y / COLUMNS", show=False),
+            Binding("d", "field_to_values", "VALUES", show=False),
+            Binding("escape", "cancel", "Cancel", show=True),
+        ]
+
+        CSS = """
+        Screen {
+            background: #0d141b;
+            color: #dce5e9;
+        }
+
+        Header, Footer {
+            background: #17232e;
+        }
+
+        #designer_root {
+            height: 1fr;
+            padding: 0 2 1 2;
+        }
+
+        #designer_title {
+            height: 3;
+            background: #17232e;
+            padding: 1 2;
+            color: #c9b996;
+            text-style: bold;
+        }
+
+        #designer_header {
+            height: 3;
+        }
+
+        #designer_header Select {
+            width: 1fr;
+        }
+
+        #designer_status {
+            width: 2fr;
+            padding: 0 1;
+        }
+
+        #designer_panels {
+            height: 1fr;
+            min-height: 15;
+        }
+
+        #catalog_left {
+            width: 1fr;
+            margin-right: 1;
+            padding: 0 1;
+            border: solid #304352;
+            background: #111c25;
+        }
+
+        #query_right {
+            width: 1fr;
+            padding: 0 1;
+            border: solid #304352;
+            background: #111c25;
+        }
+
+        #catalog_search {
+            height: 3;
+        }
+
+        #catalog_tree {
+            height: 1fr;
+            overflow-y: auto;
+        }
+
+        #field_description {
+            height: 3;
+            color: #a8bac6;
+        }
+
+        .designer_section {
+            height: 1;
+            color: #c9b996;
+            text-style: bold;
+        }
+
+        .designer_axis {
+            height: 1fr;
+            min-height: 4;
+            margin-bottom: 1;
+        }
+
+        .designer_axis OptionList {
+            width: 1fr;
+            height: 1fr;
+            border: solid #304352;
+            background: #13202b;
+        }
+
+        .designer_axis_actions {
+            width: 7;
+            height: 1fr;
+            margin-left: 1;
+        }
+
+        .designer_axis_actions Button {
+            width: 7;
+            min-width: 7;
+            height: 2;
+            min-height: 2;
+        }
+
+        #designer_add_controls {
+            height: 3;
+        }
+
+        #designer_add_controls Button {
+            min-width: 8;
+            margin-right: 1;
+        }
+
+        #designer_preview {
+            height: 5;
+            min-height: 3;
+            overflow-y: auto;
+            color: #b7c9d4;
+        }
+
+        #designer_settings {
+            height: 3;
+        }
+
+        #designer_settings Input {
+            width: 1fr;
+        }
+
+        #designer_settings Label {
+            width: auto;
+            padding: 1 1;
+        }
+
+        #designer_footer {
+            height: 3;
+        }
+
+        #designer_footer Button {
+            margin-right: 1;
+        }
+
+        Button {
+            background: #2c4c5d;
+            color: #e6ebed;
+        }
+
+        Button:focus {
+            background: #416778;
+        }
+
+        Input {
+            background: #16232e;
+            color: #e5ebed;
+        }
+        """
+
+        def __init__(self):
+            super().__init__()
+            self.code = args.category if args.category in QUERY_PROFILES else "MV"
+            self.selection_path = Path(args.selection_file).resolve()
+            self.catalog = load_catalog(self.code)
+            self.fields = {}
+            self.chosen = {"x": [], "y": [], "measures": []}
+            self.by_category = {}
+            self.highlighted_id = None
+
+        def compose(self) -> ComposeResult:
+            from textual.widgets import OptionList
+
+            yield Header(show_clock=True)
+
+            with Vertical(id="designer_root"):
+                yield Static(
+                    "OIC QUERY DESIGNER   /   X = ROWS   •   Y = COLUMNS",
+                    id="designer_title",
+                )
+
+                with Horizontal(id="designer_header"):
+                    yield Select(
+                        [
+                            (f"{code} — {profile['name']}", code)
+                            for code, profile in QUERY_PROFILES.items()
+                        ],
+                        value=self.code,
+                        allow_blank=False,
+                        id="designer_category",
+                    )
+
+                    yield Static(
+                        "CATALOG: CACHE",
+                        id="designer_status",
+                    )
+
+                with Horizontal(id="designer_panels"):
+
+                    with Vertical(id="catalog_left"):
+                        yield Static(
+                            "FIELD EXPLORER / OIC CAPTION",
+                            classes="designer_section",
+                        )
+
+                        yield Input(
+                            placeholder="Search CAPTION / GROUP / DATAFIELD / MDX",
+                            id="catalog_search",
+                        )
+
+                        yield Tree(
+                            "OIC FIELD CATALOG",
+                            id="catalog_tree",
+                        )
+
+                        yield Static(
+                            "A = ROWS / S = COLUMNS / D = VALUES",
+                            id="field_description",
+                        )
+
+                        with Horizontal(id="designer_add_controls"):
+                            yield Button(
+                                "+ X",
+                                id="add_to_x",
+                            )
+
+                            yield Button(
+                                "+ Y",
+                                id="add_to_y",
+                            )
+
+                            yield Button(
+                                "+ VALUES",
+                                id="add_to_values",
+                            )
+
+                            yield Button(
+                                "RELOAD",
+                                id="reload_designer_catalog",
+                            )
+
+                    with Vertical(id="query_right"):
+
+                        yield Static(
+                            "X / ROWS (Axis1)",
+                            classes="designer_section",
+                        )
+
+                        with Horizontal(classes="designer_axis"):
+                            yield OptionList(
+                                id="designer_x",
+                                compact=True,
+                                markup=False,
+                            )
+
+                            with Vertical(classes="designer_axis_actions"):
+                                yield Button("↑", id="x_up")
+                                yield Button("↓", id="x_down")
+                                yield Button("×", id="x_remove")
+
+                        yield Static(
+                            "Y / COLUMNS (Axis0)",
+                            classes="designer_section",
+                        )
+
+                        with Horizontal(classes="designer_axis"):
+                            yield OptionList(
+                                id="designer_y",
+                                compact=True,
+                                markup=False,
+                            )
+
+                            with Vertical(classes="designer_axis_actions"):
+                                yield Button("↑", id="y_up")
+                                yield Button("↓", id="y_down")
+                                yield Button("×", id="y_remove")
+
+                        yield Static(
+                            "VALUES / MEASURES",
+                            classes="designer_section",
+                        )
+
+                        with Horizontal(classes="designer_axis"):
+                            yield OptionList(
+                                id="designer_values",
+                                compact=True,
+                                markup=False,
+                            )
+
+                            with Vertical(classes="designer_axis_actions"):
+                                yield Button("↑", id="value_up")
+                                yield Button("↓", id="value_down")
+                                yield Button("×", id="value_remove")
+
+                        yield Static(
+                            "FILTERS: Not supported without validated mappings",
+                            classes="designer_section",
+                        )
+
+                        with Horizontal(id="designer_settings"):
+                            yield Label("WORKERS")
+
+                            yield Input(
+                                value="4",
+                                id="designer_workers",
+                                type="integer",
+                            )
+
+                            yield Label("X CHUNK")
+
+                            yield Input(
+                                value="1",
+                                id="designer_x_chunk",
+                                type="integer",
+                            )
+
+                            yield Label("Y CHUNK")
+
+                            yield Input(
+                                value="20",
+                                id="designer_y_chunk",
+                                type="integer",
+                            )
+
+                        yield Static(
+                            "QUERY PREVIEW / LOCAL ONLY",
+                            classes="designer_section",
+                        )
+
+                        yield Static(
+                            "Choose mapped fields, then Preview.",
+                            id="designer_preview",
+                        )
+
+                with Horizontal(id="designer_footer"):
+                    yield Button(
+                        "PREVIEW",
+                        id="designer_preview_button",
+                    )
+
+                    yield Button(
+                        "APPLY SELECTION",
+                        id="designer_apply",
+                        variant="success",
+                    )
+
+                    yield Button(
+                        "CANCEL",
+                        id="designer_cancel",
+                    )
+
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.selection_path.parent.mkdir(parents=True, exist_ok=True)
+            self.selection_path.with_suffix(".lock").write_text(
+                str(os.getpid()), encoding="ascii")
+            self._restore_previous_selection()
+            self.update_catalog(self.code)
+
+        def on_unmount(self) -> None:
+            lock = self.selection_path.with_suffix(".lock")
+            try:
+                if lock.read_text(encoding="ascii") == str(os.getpid()):
+                    lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+        def _restore_previous_selection(self) -> None:
+            try:
+                envelope = json.loads(self.selection_path.read_text(encoding="utf-8"))
+                previous = validate_query(envelope["query"])
+                if int(previous.get("schema_version", 1)) != SCHEMA_VERSION:
+                    return
+                ids = previous["selection_ids"]
+                self.by_category[previous["code"]] = {
+                    key: list(ids.get(key, [])) for key in self.chosen
+                }
+                for name, key in (("workers", "designer_workers"),
+                                  ("x_chunk", "designer_x_chunk"),
+                                  ("y_chunk", "designer_y_chunk")):
+                    self.query_one("#" + key, Input).value = str(previous[name])
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+
+        def update_catalog(self, code: str) -> None:
+            self.code = code
+            self.catalog = load_catalog(code)
+            self.fields = {field["id"]: field for field in self.catalog["fields"]}
+            previous = self.by_category.get(code, {})
+            self.chosen = {axis: [item for item in previous.get(axis, [])
+                                  if item in self.fields and
+                                  self.fields[item].get("status") in ("MAPPED", "VERIFIED")]
+                           for axis in ("x", "y", "measures")}
+            self.highlighted_id = None
+            self.refresh_tree()
+            self.refresh_layout()
+            self.query_one("#designer_status", Static).update(
+                f"CATALOG {code}: {self.catalog.get('view_count', 0)} views / "
+                f"{self.catalog.get('data_count', 0)} data  ·  {self.catalog['source']}"
+            )
+
+        def on_select_changed(self, event: Select.Changed) -> None:
+            if event.select.id != "designer_category":
+                return
+            code = event.value
+            if code in QUERY_PROFILES and code != self.code:
+                self.by_category[self.code] = {
+                    key: list(value) for key, value in self.chosen.items()}
+                self.update_catalog(str(code))
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "catalog_search":
+                self.refresh_tree()
+
+        def refresh_tree(self) -> None:
+            search = (
+                self.query_one("#catalog_search", Input)
+                .value.casefold()
+                .strip()
+            )
+
+            tree = self.query_one("#catalog_tree", Tree)
+
+            tree.root.remove_children()
+
+            groups = {}
+            folders = {}
+            visible = 0
+
+            for field in self.catalog["fields"]:
+                caption = field.get(
+                    "caption",
+                    field.get("display", ""),
+                )
+
+                terms = " ".join(
+                    str(field.get(key) or "")
+                    for key in (
+                        "caption",
+                        "group_dimension",
+                        "dimension",
+                        "mdx",
+                    )
+                )
+
+                terms += " " + " ".join(
+                    str(field.get("details", {}).get(key) or "")
+                    for key in (
+                        "DATAFIELD",
+                        "DATATABLE",
+                    )
+                )
+
+                if search and search not in terms.casefold():
+                    continue
+
+                group = field.get("group_dimension") or (
+                    "ข้อมูล"
+                    if field["type"] == "MEASURE"
+                    else "มุมมอง"
+                )
+
+                if group not in groups:
+                    groups[group] = tree.root.add(
+                        group,
+                        expand=True,
+                    )
+
+                parent = groups[group]
+                folder = field.get("dimension") or ""
+
+                if folder:
+                    folder_key = (group, folder)
+
+                    if folder_key not in folders:
+                        folders[folder_key] = parent.add(
+                            folder,
+                            expand=True,
+                        )
+
+                    parent = folders[folder_key]
+
+                status = field.get("status")
+
+                if status == "UNSUPPORTED":
+                    suffix = "  [UNSUPPORTED]"
+                elif status not in ("MAPPED", "VERIFIED"):
+                    suffix = "  [UNVERIFIED]"
+                else:
+                    suffix = ""
+
+                parent.add_leaf(
+                    caption + suffix,
+                    data=field["id"],
+                )
+
+                visible += 1
+
+            tree.root.expand()
+
+            self.query_one(
+                "#field_description",
+                Static,
+            ).update(
+                f"{visible} visible / "
+                f"{len(self.catalog['fields'])} total"
+                " · A = ROWS / S = COLUMNS / D = VALUES"
+            )
+
+        def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+            if event.control.id == "catalog_tree":
+                self.highlighted_id = event.node.data if isinstance(event.node.data, str) else None
+
+        def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+            if event.control.id != "catalog_tree":
+                return
+            item = event.node.data
+            if not isinstance(item, str) or item not in self.fields:
+                return
+            self.highlighted_id = item
+            field = self.fields[item]
+            if field["type"] == "MEASURE":
+                self.toggle_value(item)
+            else:
+                self.query_one("#field_description", Static).update(
+                    f"{field['caption']} · {field.get('status')} · "
+                    "A → X/ROWS   S → Y/COLUMNS"
+                )
+
+        def action_field_to_x(self) -> None:
+            self.move_field("x")
+
+        def action_field_to_y(self) -> None:
+            self.move_field("y")
+
+        def action_field_to_values(self) -> None:
+            if isinstance(self.focused, Input):
+                return
+
+            item = self.highlighted_id
+            field = self.fields.get(item)
+
+            if field and field["type"] == "MEASURE":
+                self.toggle_value(item)
+
+        def move_field(self, axis: str) -> None:
+            if isinstance(self.focused, Input):
+                return
+
+            item = self.highlighted_id
+            field = self.fields.get(item)
+
+            if not field or field["type"] != "DIMENSION":
+                return
+
+            if (
+                field.get("status") not in ("MAPPED", "VERIFIED")
+                or not field.get("mdx")
+            ):
+                self.show_error(
+                    f"{field['caption']}: "
+                    f"mapping not available ({field.get('status')})"
+                )
+                return
+
+            if item in self.chosen[axis]:
+                return
+
+            for selected in self.chosen["x"] + self.chosen["y"]:
+                if (
+                    selected != item
+                    and self.fields[selected].get("mdx") == field["mdx"]
+                ):
+                    self.show_error(
+                        "The hierarchy is already selected "
+                        "under another display item"
+                    )
+                    return
+
+            other_axis = "y" if axis == "x" else "x"
+
+            if item in self.chosen[other_axis]:
+                self.chosen[other_axis].remove(item)
+                self.refresh_axis(other_axis)
+
+            self.chosen[axis].append(item)
+
+            if (
+                axis == "y"
+                and field["mdx"] == QUERY_PROFILES[self.code].get("year")
+                and self.query_one(
+                    "#designer_y_chunk",
+                    Input,
+                ).value == "20"
+            ):
+                self.query_one(
+                    "#designer_y_chunk",
+                    Input,
+                ).value = "1"
+
+            self.refresh_axis(
+                axis,
+                select_id=item,
+            )
+
+        def toggle_value(self, item: str) -> None:
+            field = self.fields.get(item)
+
+            if not field or field["type"] != "MEASURE":
+                return
+
+            if item in self.chosen["measures"]:
+                self.chosen["measures"].remove(item)
+
+            elif (
+                field.get("status") not in ("MAPPED", "VERIFIED")
+                or not field.get("mdx")
+            ):
+                self.show_error(
+                    f"{field['caption']}: "
+                    f"{field.get('status')} — selection disabled"
+                )
+                return
+
+            elif any(
+                self.fields[selected].get("mdx") == field["mdx"]
+                for selected in self.chosen["measures"]
+            ):
+                self.show_error(
+                    "This base Measure is already selected"
+                )
+                return
+
+            else:
+                self.chosen["measures"].append(item)
+
+            self.refresh_axis(
+                "measures",
+                select_id=item,
+            )
+
+        def refresh_axis(
+            self,
+            axis: str,
+            select_id: str | None = None,
+        ) -> None:
+            from textual.widgets import OptionList
+            from textual.widgets.option_list import Option
+
+            control = {
+                "x": "designer_x",
+                "y": "designer_y",
+                "measures": "designer_values",
+            }[axis]
+
+            widget = self.query_one(
+                f"#{control}",
+                OptionList,
+            )
+
+            items = self.chosen[axis]
+
+            previous = widget.highlighted_option
+            previous_id = (
+                previous.id
+                if previous is not None
+                else None
+            )
+
+            current_ids = [
+                option.id
+                for option in widget.options
+            ]
+
+            if current_ids == items:
+                return
+
+            widget.set_options(
+                [
+                    Option(
+                        f"{index + 1}. "
+                        f"{self.fields[item]['caption']}",
+                        id=item,
+                    )
+                    for index, item in enumerate(items)
+                ]
+            )
+
+            if not items:
+                widget.highlighted = None
+                return
+
+            target = (
+                select_id
+                if select_id in items
+                else previous_id
+                if previous_id in items
+                else items[-1]
+            )
+
+            widget.highlighted = items.index(target)
+
+        def refresh_layout(self) -> None:
+            for axis in ("x", "y", "measures"):
+                self.refresh_axis(axis)
+
+        def modify_axis(self, operation: str) -> None:
+            from textual.widgets import OptionList
+
+            axis = (
+                "measures"
+                if operation.startswith("value_")
+                else operation[0]
+            )
+
+            control = {
+                "x": "designer_x",
+                "y": "designer_y",
+                "measures": "designer_values",
+            }[axis]
+
+            widget = self.query_one(
+                f"#{control}",
+                OptionList,
+            )
+
+            selected = widget.highlighted_option
+
+            if selected is None:
+                self.show_error(
+                    "Select a field in that axis first"
+                )
+                return
+
+            item = selected.id
+            items = self.chosen[axis]
+
+            if item not in items:
+                self.show_error(
+                    "Select a field in that axis first"
+                )
+                return
+
+            index = items.index(item)
+
+            if operation.endswith("remove"):
+                items.pop(index)
+
+                target = (
+                    items[min(index, len(items) - 1)]
+                    if items
+                    else None
+                )
+
+            else:
+                next_index = (
+                    index - 1
+                    if operation.endswith("up")
+                    else index + 1
+                )
+
+                if not 0 <= next_index < len(items):
+                    return
+
+                items[index], items[next_index] = (
+                    items[next_index],
+                    items[index],
+                )
+
+                target = item
+
+            self.refresh_axis(
+                axis,
+                select_id=target,
+            )
+        def build_query(self) -> dict:
+            profile = QUERY_PROFILES[self.code]
+
+            selections = {
+                axis: list(self.chosen[axis])
+                for axis in ("x", "y", "measures")
+            }
+
+            if not selections["x"]:
+                raise ValueError("Select at least one X / ROWS field")
+
+            if not selections["y"]:
+                raise ValueError("Select at least one Y / COLUMNS field")
+
+            if not selections["measures"]:
+                raise ValueError("Select at least one VALUES / MEASURES field")
+
+            selected_ids = list(dict.fromkeys(
+                selections["x"]
+                + selections["y"]
+                + selections["measures"]
+            ))
+
+            selected_fields = []
+
+            for item in selected_ids:
+                field = self.fields.get(item)
+
+                if field is None:
+                    raise ValueError(
+                        f"Selected field not found: {item}"
+                    )
+
+                if (
+                    field.get("status") not in ("MAPPED", "VERIFIED")
+                    or not field.get("mdx")
+                ):
+                    raise ValueError(
+                        f"Field cannot be applied: "
+                        f"{field.get('caption', item)}"
+                    )
+
+                selected_fields.append({
+                    "id": field["id"],
+                    "mdx": field["mdx"],
+                    "caption": field["caption"],
+                    "type": field["type"],
+                    "status": field["status"],
+                })
+
+            config = {
+                "schema_version": SCHEMA_VERSION,
+                "code": self.code,
+                "cube": profile["cube"],
+                "catalog": profile["catalog"],
+                "x": [
+                    self.fields[item]["mdx"]
+                    for item in selections["x"]
+                ],
+                "y": [
+                    self.fields[item]["mdx"]
+                    for item in selections["y"]
+                ],
+                "measures": [
+                    self.fields[item]["mdx"]
+                    for item in selections["measures"]
+                ],
+                "selection_ids": selections,
+                "selected_fields": selected_fields,
+                "filters": [],
+                "workers": int(
+                    self.query_one(
+                        "#designer_workers", Input
+                    ).value
+                ),
+                "x_chunk": int(
+                    self.query_one(
+                        "#designer_x_chunk", Input
+                    ).value
+                ),
+                "y_chunk": int(
+                    self.query_one(
+                        "#designer_y_chunk", Input
+                    ).value
+                ),
+                "timeout": 60,
+                "delay": 1.0,
+            }
+
+            return validate_query(config)
+        
+        def preview_query(self) -> None:
+            try:
+                query = self.build_query()
+                mdx = selected_mdx(query)
+
+                self.query_one(
+                    "#designer_preview",
+                    Static,
+                ).update(
+                    f"CODE: {query['code']} / {query['cube']}\n"
+                    f"X ROWS (Axis1): {len(query['x'])}   "
+                    f"Y COLUMNS (Axis0): {len(query['y'])}   "
+                    f"VALUES: {len(query['measures'])}\n"
+                    f"Workers: {query['workers']}  "
+                    f"Chunks: {query['x_chunk']} × {query['y_chunk']}\n"
+                    f"NOTE: CrossJoin queries may be expensive.\n"
+                    f"{mdx}"
+                )
+
+            except Exception as exc:
+                self.show_error(
+                    f"PREVIEW FAILED: {type(exc).__name__}: {exc}"
+                )
+
+        def show_error(self, message: str) -> None:
+            self.query_one("#designer_preview", Static).update("VALIDATION: " + message[:450])
+
+        def apply_selection(self) -> None:
+            try:
+                config = self.build_query()
+
+                envelope = {
+                    "revision": uuid.uuid4().hex,
+                    "query": config,
+                }
+
+                self.selection_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                temp = self.selection_path.with_suffix(".tmp")
+
+                temp.write_text(
+                    json.dumps(
+                        envelope,
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+
+                temp.replace(self.selection_path)
+
+                saved = json.loads(
+                    self.selection_path.read_text(
+                        encoding="utf-8",
+                    )
+                )
+
+                if saved["revision"] != envelope["revision"]:
+                    raise RuntimeError(
+                        "Saved selection revision mismatch"
+                    )
+
+                validate_query(saved["query"])
+
+                self.exit()
+
+            except Exception as exc:
+                self.show_error(
+                    f"APPLY FAILED: {type(exc).__name__}: {exc}"
+                )
+
+        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
+            if error:
+                self.show_error("Catalog refresh failed; existing cache kept: " + error)
+            elif code == self.code:
+                previous = {k: list(v) for k, v in self.chosen.items()}
+                self.by_category[code] = previous
+                self.update_catalog(code)
+
+        def action_cancel(self) -> None:
+            self.exit()
+
+        def on_button_pressed(
+            self,
+            event: Button.Pressed,
+        ) -> None:
+            operation = event.button.id
+
+            if operation == "add_to_x":
+                self.move_field("x")
+
+            elif operation == "add_to_y":
+                self.move_field("y")
+
+            elif operation == "add_to_values":
+                self.action_field_to_values()
+
+            elif operation in (
+                "x_up",
+                "x_down",
+                "x_remove",
+                "y_up",
+                "y_down",
+                "y_remove",
+                "value_up",
+                "value_down",
+                "value_remove",
+            ):
+                self.modify_axis(operation)
+
+            elif operation == "reload_designer_catalog":
+                self.refresh_catalog_worker()
+
+            elif operation == "designer_preview_button":
+                self.preview_query()
+
+            elif operation == "designer_apply":
+                self.apply_selection()
+
+            elif operation == "designer_cancel":
+                self.action_cancel()
+
+    # ========================================================
     # LAUNCH TEXTUAL APPLICATION
     # ========================================================
 
     if return_app:
         return OICApp()
-    OICApp().run()
+    if getattr(args, "designer", False):
+        OICQueryDesigner().run()
+    else:
+        OICApp().run()
 
 
 # ============================================================
@@ -4478,6 +5527,11 @@ def main() -> int:
             "/ Live Authentication Terminal UI"
         )
     )
+
+    parser.add_argument("--designer", action="store_true",
+                        help="Open the dedicated Textual query designer")
+    parser.add_argument("--selection-file", type=str, default="output/query_selection.json")
+    parser.add_argument("--category", choices=list(PROFILES), default="MV")
 
     parser.add_argument(
         "--cli",

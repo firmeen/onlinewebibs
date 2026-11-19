@@ -322,19 +322,16 @@ def write_json(
     )
 
     temporary = path.with_name(
-        path.name + ".tmp"
+        path.name + "." + uuid.uuid4().hex + ".tmp"
     )
-
-    temporary.write_text(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
-    )
-
-    temporary.replace(path)
+    try:
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_env() -> dict[str, str]:
@@ -3938,6 +3935,26 @@ def selected_worker(args) -> int:
     batch_stop = run_dir.parent / "stop.flag"
     def stop_requested():
         return stop_file.exists() or batch_stop.exists()
+    shared_cooldown = run_dir.parent / "cooldown.json"
+    def wait_for_server():
+        while not stop_requested():
+            info = read_json(shared_cooldown, {}) or {}
+            remaining = float(info.get("until_ts", 0)) - time.time()
+            if remaining <= 0:
+                return
+            state["status"] = "PAUSED"
+            state["last_message"] = "Shared server cooldown"
+            save_state()
+            time.sleep(min(1, remaining))
+        return
+    def backoff_server(http_status: int, attempt: int):
+        old = read_json(shared_cooldown, {}) or {}
+        until = max(float(old.get("until_ts", 0)),
+                    time.time() + min(120, 5 * (2 ** attempt) + worker_id))
+        write_json(shared_cooldown, {
+            "until_ts": until, "http_status": http_status,
+            "worker_id": worker_id, "updated_at": utc_now(),
+        })
     planned = read_json(run_dir / "task_plan.json", {}) or {}
     if planned.get("query_hash") != query_hash(config):
         raise RuntimeError("Missing or stale apply-time task plan")
@@ -3999,6 +4016,9 @@ def selected_worker(args) -> int:
                     except (ValueError, ET.ParseError, OSError):
                         data = None
                 if data is None:
+                    wait_for_server()
+                    if stop_requested():
+                        break
                     req_path.write_bytes(query_soap(config, x_offset, y_offset))
                     state.update(status="RUNNING", current_request=key,
                                  request_started_at=utc_now(), last_message=f"Request {key}")
@@ -4014,16 +4034,23 @@ def selected_worker(args) -> int:
                                 break
                             if http["http_status"] in (401, 403):
                                 raise RuntimeError(f"AUTH HTTP {http['http_status']}")
-                            if http["http_status"] not in (429, 500, 502, 503, 504) or attempt:
+                            if http["http_status"] not in (408, 425, 429, 500, 502, 503, 504) or attempt:
                                 raise RuntimeError(f"XMLA HTTP {http['http_status']}")
-                            state["status"] = "PAUSED"; save_state()
-                            time.sleep(5 + worker_id)
+                            if http["http_status"] in (429, 503):
+                                backoff_server(http["http_status"], attempt)
+                            wait_for_server()
+                            if stop_requested():
+                                break
+                            state["status"] = "RUNNING"; save_state()
                             state["status"] = "RUNNING"; save_state()
                         except (requests.RequestException, ValueError, ET.ParseError, RuntimeError) as exc:
-                            if attempt == 1 or (http and http.get("http_status") not in (429, 500, 502, 503, 504)):
+                            if attempt == 1 or (http and http.get("http_status") not in
+                                                       (408, 425, 429, 500, 502, 503, 504)):
                                 raise
                             log(f"Transient error: {exc}", worker_id, "WARN")
-                            time.sleep(5 + worker_id)
+                            if stop_requested():
+                                break
+                            time.sleep(min(30, 2 ** (attempt + 1) + worker_id))
                     if data is None:
                         raise RuntimeError("Empty XMLA dataset after attempts")
                     record = dict(status="OK", x_offset=x_offset, y_offset=y_offset,

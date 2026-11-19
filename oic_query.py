@@ -30,7 +30,7 @@ PROFILES = {
                row2="[DIM MAINSUB CLASS AH].[SUB NAME TH]",
                measures=["ACT POLICY CNT", "ACT PREMIUM AMT", "EARNED", "ACT SUM INS AMT",
                          "CLAIM CNT", "INMTH CLM PAID", "ATMTH CLM LI"]),
-    "FI": dict(name="ทรัพย์สิน", cls="FI", catalog="PIVOT_202609_FI",
+    "FI": dict(name="อัคคีภัยและทรัพย์สิน", cls="FI", catalog="PIVOT_202609_FI",
                cube="FI_AGGREGATE_FY", year="[VW PV FI AGGREGATE FY].[YEAR]",
                row1="[DIM CT SUBCLASS FI].[GROUP DESC TH]", row2=None,
                measures=["ACT POLICY CNT", "ACT PREMIUM AMT", "EARNED PREMIUM",
@@ -384,7 +384,7 @@ def validate_query(config: dict, catalog: dict | None = None) -> dict:
             raise ValueError("Duplicate display field on both axes")
     else:
         cat = catalog or load_catalog(code)
-        allowed = {(f.get("mdx"), f.get("type")) for f in cat["fields"]}
+        allowed = {(f.get("mdx"), f.get("type")) for f in cat["fields"] + seeded_catalog(code)["fields"]}
         for name in x+y:
             if (name, "DIMENSION") not in allowed:
                 raise ValueError("Unknown hierarchy: " + name)

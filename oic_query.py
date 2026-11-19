@@ -44,6 +44,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -306,9 +307,14 @@ def save_cube_status(code: str, cube_type: str, status: str,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
     CATALOG_DIR.mkdir(parents=True, exist_ok=True)
-    temp = CUBE_INDEX.with_suffix(".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(CUBE_INDEX)
+    temp = CUBE_INDEX.with_name(
+        CUBE_INDEX.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        temp.replace(CUBE_INDEX)
+    finally:
+        temp.unlink(missing_ok=True)
 
 def cube_options(code: str) -> list[tuple[str, str]]:
     return [(kind, cube_status(code, kind)["status"]) for kind in CUBE_TYPES]
@@ -533,7 +539,8 @@ def save_catalog(catalog: dict) -> None:
     )
 
     destination = cache_path(code, cube_type)
-    temporary = destination.with_suffix(".tmp")
+    temporary = destination.with_name(
+        destination.name + "." + uuid.uuid4().hex + ".tmp")
 
     try:
         temporary.write_text(

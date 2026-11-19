@@ -2193,6 +2193,9 @@ def build_soap(
         "Timeout": "3600",
         "LocaleIdentifier": "9",
     }
+    if statement is not None:
+        # Match the working main collector XMLA Execute properties.
+        values["SspropInitAppName"] = "Microsoft SQL Server Management Studio"
 
     for key, value in values.items():
         ET.SubElement(

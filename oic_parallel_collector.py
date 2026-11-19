@@ -6,7 +6,7 @@ OIC PARALLEL COLLECTOR
 ======================
 
 XMLA / MDX / OLAP Aggregate Collector
-Rich Terminal Monitor + Windows Terminal Tabs
+Rich Terminal Monitor + PowerShell background workers
 4 Parallel Workers + Raw XML + Excel + Resume
 
 INSTALL
@@ -105,6 +105,7 @@ rich
 from __future__ import annotations
 
 import argparse
+import csv
 import base64
 import json
 import math
@@ -3286,315 +3287,54 @@ def find_powershell() -> str:
 
 # oic_parallel_collector.py
 
-def find_windows_terminal() -> str | None:
-    if os.name != "nt":
-        return None
-
-    candidates = [
-        shutil.which("wt.exe"),
-        shutil.which("wt"),
-    ]
-
-    local_app_data = os.environ.get("LOCALAPPDATA")
-
-    if local_app_data:
-        candidates.append(
-            str(
-                Path(local_app_data)
-                / "Microsoft"
-                / "WindowsApps"
-                / "wt.exe"
-            )
-        )
-
-    try:
-        shell = find_powershell()
-
-        result = subprocess.run(
-            [
-                shell,
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                (
-                    "$command = Get-Command wt.exe "
-                    "-ErrorAction SilentlyContinue; "
-                    "if ($command -and "
-                    "$command.CommandType -eq 'Application') "
-                    "{ $command.Source }"
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-
-        if result.returncode == 0:
-            candidates.extend(
-                line.strip()
-                for line in result.stdout.splitlines()
-                if line.strip()
-            )
-
-    except (OSError, RuntimeError, subprocess.TimeoutExpired):
-        pass
-
-    seen = set()
-
-    for candidate in candidates:
-        if not candidate:
-            continue
-
-        path = Path(candidate)
-
-        if not path.is_absolute():
-            resolved = shutil.which(str(candidate))
-
-            if not resolved:
-                continue
-
-            path = Path(resolved)
-
-        normalized = str(path).casefold()
-
-        if normalized in seen:
-            continue
-
-        seen.add(normalized)
-
-        if path.is_file():
-            return str(path)
-
-    return None
-
-
-# oic_parallel_collector.py
-# New shared launcher function.
-
 def launch_terminal_window(
-    commands: list[list[str]],
-    *,
+    commands: list[list[str]], *,
     title: str,
     cwd: Path,
     tab_titles: list[str] | None = None,
     keep_open: bool = True,
+    maximized: bool = False,
 ) -> str:
-    """
-    Launch one terminal window.
-
-    Windows Terminal:
-        One window with one or more tabs.
-
-    PowerShell fallback:
-        One console window.
-        Multiple commands run as independent processes
-        inside that console.
-
-    Returns:
-        "WINDOWS_TERMINAL" or "POWERSHELL"
-    """
-
+    """Open PowerShell directly. No Windows Terminal or wt.exe calls."""
     if os.name != "nt":
-        raise RuntimeError("Windows terminal launcher requires Windows")
-
-    if not commands or any(not command for command in commands):
-        raise ValueError("At least one valid command is required")
-
-    working_dir = Path(cwd).expanduser().resolve()
-
-    if not working_dir.is_dir():
-        raise FileNotFoundError(
-            f"Working directory not found: {working_dir}"
-        )
-
+        raise RuntimeError("PowerShell launcher requires Windows")
+    if not commands or any(not cmd for cmd in commands):
+        raise ValueError("No terminal command")
+    workdir = Path(cwd).resolve()
+    if not workdir.is_dir():
+        raise FileNotFoundError(str(workdir))
     shell = find_powershell()
-    wt = find_windows_terminal()
-
-    normalized_commands = [
-        [str(argument) for argument in command]
-        for command in commands
-    ]
-
-    titles = tab_titles or [
-        f"{title} | {index:02d}"
-        for index in range(1, len(commands) + 1)
-    ]
-
-    if len(titles) != len(commands):
-        raise ValueError(
-            "tab_titles count must match commands count"
-        )
-
-    def as_powershell_command(arguments: list[str]) -> str:
-        return "& " + " ".join(
-            powershell_quote(argument)
-            for argument in arguments
-        )
-
-    if wt:
-        terminal_command = [
-            wt,
-            "-w",
-            "new",
-        ]
-
-        for index, arguments in enumerate(normalized_commands):
-            if index:
-                terminal_command.append(";")
-
-            terminal_command.extend(
-                [
-                    "new-tab",
-                    "--title",
-                    titles[index],
-                    "--startingDirectory",
-                    str(working_dir),
-                    shell,
-                    "-NoLogo",
-                    "-NoProfile",
-                ]
-            )
-
-            if keep_open:
-                terminal_command.append("-NoExit")
-
-            terminal_command.extend(
-                [
-                    "-Command",
-                    as_powershell_command(arguments),
-                ]
-            )
-
-        try:
-            subprocess.Popen(
-                terminal_command,
-                cwd=str(working_dir),
-                close_fds=True,
-            )
-
-            return "WINDOWS_TERMINAL"
-
-        except OSError:
-            # Windows Terminal is unavailable or its alias is invalid.
-            # Continue with the PowerShell fallback.
-            pass
-
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-
-    if len(normalized_commands) == 1:
-        shell_command = [
-            shell,
-            "-NoLogo",
-            "-NoProfile",
-        ]
-
+    if len(commands) == 1:
+        command = "& " + " ".join(powershell_quote(str(a)) for a in commands[0])
+        args = [shell, "-NoLogo", "-NoProfile"]
         if keep_open:
-            shell_command.append("-NoExit")
-
-        shell_command.extend(
-            [
-                "-Command",
-                (
-                    "$Host.UI.RawUI.WindowTitle = "
-                    + powershell_quote(title)
-                    + "; "
-                    + as_powershell_command(normalized_commands[0])
-                ),
-            ]
-        )
-
-        subprocess.Popen(
-            shell_command,
-            cwd=str(working_dir),
-            creationflags=flags,
-            close_fds=True,
-        )
-
-        return "POWERSHELL"
-
-    # Multiple workers without Windows Terminal:
-    # one PowerShell window, multiple independent child processes.
-    #
-    # Start-Process -NoNewWindow keeps all worker processes
-    # attached to the same console instead of opening N windows.
-
-    script_lines = [
-        "$ErrorActionPreference = 'Stop'",
-        (
-            "$Host.UI.RawUI.WindowTitle = "
-            + powershell_quote(title)
-        ),
-        (
-            "$processes = New-Object "
-            "'System.Collections.Generic.List[System.Diagnostics.Process]'"
-        ),
-    ]
-
-    for index, arguments in enumerate(normalized_commands, start=1):
-        executable = arguments[0]
-
-        # Windows argument quoting, then PowerShell string quoting.
-        argument_string = subprocess.list2cmdline(arguments[1:])
-
-        script_lines.extend(
-            [
-                (
-                    "Write-Host "
-                    + powershell_quote(
-                        f"Starting process {index}/{len(commands)}"
-                    )
-                    + " -ForegroundColor Cyan"
-                ),
-                (
-                    "$process = Start-Process "
-                    "-FilePath "
-                    + powershell_quote(executable)
-                    + " -ArgumentList "
-                    + powershell_quote(argument_string)
-                    + " -WorkingDirectory "
-                    + powershell_quote(str(working_dir))
-                    + " -NoNewWindow -PassThru"
-                ),
-                "$processes.Add($process)",
-            ]
-        )
-
-    script_lines.extend(
-        [
-            "Write-Host 'All processes launched.' -ForegroundColor Green",
-            "foreach ($process in $processes) {",
-            "    $process.WaitForExit()",
-            "}",
-            "Write-Host 'All processes finished.' -ForegroundColor Cyan",
-        ]
-    )
-
-    shell_command = [
-        shell,
-        "-NoLogo",
-        "-NoProfile",
-    ]
-
-    if keep_open:
-        shell_command.append("-NoExit")
-
-    shell_command.extend(
-        [
-            "-Command",
-            "; ".join(script_lines),
-        ]
-    )
-
-    subprocess.Popen(
-        shell_command,
-        cwd=str(working_dir),
-        creationflags=flags,
-        close_fds=True,
-    )
-
+            args.append("-NoExit")
+        args += ["-Command", "$Host.UI.RawUI.WindowTitle = " +
+                 powershell_quote(title) + "; " + command]
+    else:
+        # The multi-command legacy diagnostic opens one PowerShell console,
+        # but starts its workers as hidden child processes.
+        instructions = ["$ErrorActionPreference='Stop'",
+                        "$Host.UI.RawUI.WindowTitle = " + powershell_quote(title)]
+        for cmd in commands:
+            arguments = subprocess.list2cmdline([str(v) for v in cmd[1:]])
+            instructions.append(
+                "Start-Process -WindowStyle Hidden -FilePath " +
+                powershell_quote(str(cmd[0])) +
+                " -ArgumentList " + powershell_quote(arguments) +
+                " -WorkingDirectory " + powershell_quote(str(workdir)))
+        args = [shell, "-NoLogo", "-NoProfile"]
+        if keep_open:
+            args.append("-NoExit")
+        args += ["-Command", "; ".join(instructions)]
+    startupinfo = None
+    if maximized:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 3  # SW_MAXIMIZE
+    subprocess.Popen(args, cwd=str(workdir), creationflags=flags,
+                     startupinfo=startupinfo, close_fds=True)
     return "POWERSHELL"
 
 
@@ -4167,6 +3907,17 @@ def selected_worker(args) -> int:
     manifest["worker_id"] = worker_id
     manifest["updated_at"] = utc_now()
     stop_file = run_dir / "stop.flag"
+    batch_stop = run_dir.parent / "stop.flag"
+    def stop_requested():
+        return stop_file.exists() or batch_stop.exists()
+    planned = read_json(run_dir / "task_plan.json", {}) or {}
+    if planned.get("query_hash") != query_hash(config):
+        raise RuntimeError("Missing or stale apply-time task plan")
+    allocations = {int(item["worker_id"]): item
+                   for item in planned.get("assignments", [])}
+    allocation = allocations.get(worker_id)
+    if not allocation:
+        raise RuntimeError("Worker was not assigned in task plan")
     heartbeat_stop = threading.Event()
     state = dict(run_id=config["run_id"], worker_id=worker_id, pid=os.getpid(),
                  status="STARTING", current_request=None, request_started_at=None,
@@ -4197,18 +3948,18 @@ def selected_worker(args) -> int:
         state["status"] = "RUNNING"
         save_state()
         # Deterministic X paging: a given X page belongs to exactly one worker.
-        x_offset = (worker_id - 1) * x_size
-        while not stop_file.exists():
+        x_offset = int(allocation["x_offset_start"])
+        while not stop_requested():
             y_offset = 0
             if (run_dir / "pause.flag").exists():
                 state["status"] = "PAUSED"; save_state()
-                while (run_dir / "pause.flag").exists() and not stop_file.exists():
+                while (run_dir / "pause.flag").exists() and not stop_requested():
                     time.sleep(1)
                 state["status"] = "RUNNING"; save_state()
-            if stop_file.exists():
+            if stop_requested():
                 break
             x_returned = None
-            while not stop_file.exists():
+            while not stop_requested():
                 key = f"{query_hash(config)}_x{x_offset:06d}_y{y_offset:06d}"
                 req_path = chunks_dir / f"{key}.request.xml"
                 resp_path = chunks_dir / f"{key}.response.xml"
@@ -4279,9 +4030,9 @@ def selected_worker(args) -> int:
             if x_returned is None or x_returned < x_size:
                 completed = True
                 break
-            x_offset += x_size * worker_count
+            x_offset += int(allocation["x_offset_stride"])
             time.sleep(float(config.get("delay", 1)))
-        state["status"] = "STOPPED" if stop_file.exists() else "COMPLETED" if completed else "PARTIAL"
+        state["status"] = "STOPPED" if stop_requested() else "COMPLETED" if completed else "PARTIAL"
     except KeyboardInterrupt:
         state["status"] = "STOPPED"
     except Exception as exc:
@@ -4348,12 +4099,16 @@ def selected_summary(config: dict, run_dir: Path):
 def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
     if Workbook is None:
         raise RuntimeError("openpyxl required for Excel export")
-    excel_dir = run_dir / "excel"
+    output_root = Path(config.get("output_root", run_dir)).resolve()
+    excel_dir = output_root / "Excel"
     excel_dir.mkdir(parents=True, exist_ok=True)
-    path = excel_dir / "selected_query.xlsx"
-    tmp = excel_dir / "selected_query.tmp.xlsx"
+    query_id = str(config.get("query_id", "Q001"))
+    cube_type = str(config.get("cube_type", "FY"))
+    filename = f"{config['run_id']}_{config['code']}_{cube_type}_{query_id}.xlsx"
+    path = excel_dir / filename
+    tmp = excel_dir / (filename + ".tmp")
     workbook = Workbook(write_only=True)
-    sheet = workbook.create_sheet("Data_1")
+    sheet = workbook.create_sheet("DATA")
     x_count, y_count = len(config["x"]), len(config["y"])
     headers = ["INSURANCE_CODE", "CUBE", "CATALOG"]
     for axis, count in (("X", x_count), ("Y", y_count)):
@@ -4403,9 +4158,24 @@ def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
                 sheet_rows += 1
     workers, totals = selected_summary(config, run_dir)
     info = workbook.create_sheet("INFO")
-    for key, val in (("RUN_ID", config["run_id"]), ("QUERY_HASH", query_hash(config)),
+    for key, val in (("RUN_ID", config["run_id"]),
+                     ("QUERY_ID", config.get("query_id", "Q001")),
+                     ("INSURANCE_CODE", config["code"]),
+                     ("CUBE_TYPE", config.get("cube_type", "FY")),
+                     ("CUBE", config["cube"]),
+                     ("CATALOG", config["catalog"]),
+                     ("STARTED_AT", config.get("created_at", "")),
+                     ("EXPORTED_AT", utc_now()),
+                     ("QUERY_HASH", query_hash(config)),
+                     ("X_ROWS", " | ".join(config["x"])),
+                     ("Y_COLUMNS", " | ".join(config["y"])),
+                     ("VALUES", " | ".join(config["measures"])),
+                     ("WORKERS", config["workers"]),
+                     ("X_CHUNK", config["x_chunk"]),
+                     ("Y_CHUNK", config["y_chunk"]),
                      ("STATUS", "COMPLETED" if totals["workers_completed"] == config["workers"] else "PARTIAL"),
-                     ("OUTPUT_ROWS", row_count), ("NOTE", "OLAP aggregates; do not add All and detail totals")):
+                     ("OUTPUT_ROWS", row_count),
+                     ("NOTE", "OLAP aggregates; do not add All and detail totals")):
         info.append([key, val])
     workbook.save(tmp)
     tmp.replace(path)

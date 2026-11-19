@@ -2990,6 +2990,13 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.set_interval(1.0, self.poll_applied_selection)
             self.poll_applied_selection()
             self.update_catalog_summary()
+            # Load local configuration without making
+            # any network requests.
+
+            self.reload_from_env(
+                auto_check=False
+            )
+
             # Recover a previously launched batch after reopening Main App.
             try:
                 from oic_parallel_collector import batch_controller_active
@@ -3007,13 +3014,6 @@ def launch_terminal_ui(args, return_app: bool = False):
                                 break
             except Exception as exc:
                 self.info(f"Batch recovery status unavailable: {exc}", "warning")
-
-            # Load local configuration without making
-            # any network requests.
-
-            self.reload_from_env(
-                auto_check=False
-            )
 
             self.info(
                 "Terminal UI initialized.",

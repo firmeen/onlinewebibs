@@ -66,7 +66,8 @@ import subprocess
 import shutil
 
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
-                       validate_query, build_mdx as selected_mdx, query_hash)
+                       validate_query, build_mdx as selected_mdx, query_hash,
+                        cube_status, cube_profile, cube_options, CUBE_TYPES)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2106,6 +2107,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             Static,
             Select,
             Tree,
+            OptionList,
         )
 
     except ImportError as exc:
@@ -2389,10 +2391,19 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         #categories, #catalog_panel { display: none; }
         #cube_select { width: 1fr; }
-        #selected_query_summary {
-            height: 5; padding: 1 2; margin-top: 1;
-            border: solid #304352; background: #16232e;
+        #applied_panel {
+            height: 15;
+            min-height: 9;
+            margin-top: 1;
+            border: solid #304352;
+            background: #16232e;
+            padding: 0 1;
         }
+        #applied_title { height: 1; color: #c9b996; text-style: bold; }
+        #applied_query_list { height: 1fr; overflow-y: auto; }
+        #applied_actions { height: 3; }
+        #applied_actions Button { min-width: 12; margin-right: 1; }
+        #selected_query_summary { height: 2; padding: 0 1; color: #9fb0ba; }
         #catalog_status { height: 3; margin-top: 1; padding: 0 2;
                            border: solid #293c49; color: #9fb0ba; }
         #activity_panel { height: 1fr; min-height: 8; }
@@ -2425,7 +2436,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.active_run = None
             self.last_run_path = None
             self.applied_config = None
+            self.applied_queries = []
             self.selection_revision = None
+            self.batch_process = None
+            self.force_confirm_until = 0
             self.catalog_running = False
             self.catalog_started = False
             self.catalog_statuses = {code: "CACHE" if load_catalog(code)["source"] == "CACHE" else "PROFILE" for code in QUERY_PROFILES}
@@ -2586,10 +2600,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="start",
                     )
 
-                    yield Button(
-                        "STOP",
-                        id="stop",
-                    )
+                    yield Button("STOP", id="stop")
+                    yield Button("FORCE STOP", id="force_stop")
 
                     yield Button(
                         "OPEN OUTPUT",
@@ -2664,8 +2676,15 @@ def launch_terminal_ui(args, return_app: bool = False):
                     )
 
                 # Field editing is delegated to a separate Textual window.
-                yield Static("QUERY NOT APPLIED / Open Query Designer to select fields",
-                             id="selected_query_summary")
+                with Vertical(id="applied_panel"):
+                    yield Static("APPLIED QUERIES — 0 QUERIES", id="applied_title")
+                    yield OptionList(id="applied_query_list", compact=True, markup=False)
+                    with Horizontal(id="applied_actions"):
+                        yield Button("REMOVE", id="remove_applied")
+                        yield Button("MOVE UP", id="move_applied_up")
+                        yield Button("MOVE DOWN", id="move_applied_down")
+                    yield Static("No applied queries. Open Query Designer.",
+                                 id="selected_query_summary")
                 yield Static("FIELD CATALOG / Local caches", id="catalog_status")
 
                 # PROGRESS
@@ -2743,10 +2762,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                     key=code,
                 )
 
-            self.query_one(
-                "#stop",
-                Button,
-            ).disabled = True
+            self.query_one("#stop", Button).disabled = True
+            self.query_one("#force_stop", Button).disabled = True
             self.select_category("MV")
             self.set_interval(1.0, self.poll_selected_run)
             self.set_interval(1.0, self.poll_applied_selection)
@@ -3495,6 +3512,14 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             elif button_id == "stop":
                 self.action_stop_collection()
+            elif button_id == "force_stop":
+                self.force_stop_collection()
+            elif button_id == "remove_applied":
+                self.manage_applied("remove")
+            elif button_id == "move_applied_up":
+                self.manage_applied("up")
+            elif button_id == "move_applied_down":
+                self.manage_applied("down")
 
             elif button_id == "open":
                 self.action_open_output()
@@ -3528,8 +3553,8 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_stop_collection(self) -> None:
             if self.active_run is not None:
                 (self.active_run / "stop.flag").touch()
-                self.info("Stop requested; workers finish their active request.", "warning")
-                self.query_one("#status", Static).update("STOP REQUESTED")
+                self.info("STOPPING / No new queries or tasks; workers finish active requests.", "warning")
+                self.query_one("#status", Static).update("STOPPING / Waiting for workers")
                 return
             if not self.busy:
                 return
@@ -3550,6 +3575,18 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "Finishing current operation"
             )
 
+        def force_stop_collection(self) -> None:
+            if self.active_run is None:
+                return
+            if time.monotonic() > self.force_confirm_until:
+                self.force_confirm_until = time.monotonic() + 8
+                self.info("FORCE STOP will terminate active workers. Press again within 8 seconds to confirm.", "warning")
+                return
+            (self.active_run / "stop.flag").touch()
+            (self.active_run / "force_stop.flag").touch()
+            self.force_confirm_until = 0
+            self.info("FORCE STOP requested; completed chunks remain saved.", "warning")
+
         # ====================================================
         # OPEN OUTPUT DIRECTORY
         # ====================================================
@@ -3557,7 +3594,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_open_output(self) -> None:
             output_dir = resolve_output_path(
                 self.output_value()
-            )
+            ) / "Excel"
 
             try:
                 output_dir.mkdir(
@@ -4190,13 +4227,11 @@ def launch_terminal_ui(args, return_app: bool = False):
         # ====================================================
 
         def selection_file(self) -> Path:
-            return resolve_output_path(self.output_value()) / "query_selection.json"
+            return resolve_output_path(self.output_value()) / "applied_queries.json"
 
         def select_category(self, code: str) -> None:
-            if code not in QUERY_PROFILES:
-                return
-            self.selected_code = code
-            self.update_query_summary()
+            if code in QUERY_PROFILES:
+                self.selected_code = code
 
         def on_select_changed(self, event: Select.Changed) -> None:
             if event.select.id == "cube_select" and event.value in QUERY_PROFILES:
@@ -4205,48 +4240,96 @@ def launch_terminal_ui(args, return_app: bool = False):
         def update_query_summary(self) -> None:
             if not self.is_mounted:
                 return
-            config = self.applied_config
-            if not config or config.get("code") != self.selected_code:
-                self.query_one("#selected_query_summary", Static).update(
-                    f"{self.selected_code} / NO APPLIED QUERY\n"
-                    "Open Query Designer to select Rows, Columns and Values."
-                )
-                return
+            from textual.widgets.option_list import Option
+            listing = self.query_one("#applied_query_list", OptionList)
+            previous = listing.highlighted_option
+            focused = previous.id if previous else None
+            listing.clear_options()
+            for item in self.applied_queries:
+                cfg = item["query"]
+                label = (f"{item['query_id']}  {cfg['code']}/{cfg.get('cube_type','FY')}"
+                         f"  {cfg['cube']}  X:{len(cfg['x'])} Y:{len(cfg['y'])}"
+                         f" V:{len(cfg['measures'])}  W:{cfg['workers']}  PLANNED")
+                listing.add_option(Option(label, id=item["query_id"]))
+            if self.applied_queries:
+                ids = [q["query_id"] for q in self.applied_queries]
+                listing.highlighted = ids.index(focused) if focused in ids else 0
+            self.query_one("#applied_title", Static).update(
+                f"APPLIED QUERIES — {len(self.applied_queries)} QUERIES")
             self.query_one("#selected_query_summary", Static).update(
-                f"APPLIED {config['code']} / {config['cube']}\n"
-                f"X ROWS: {len(config['x'])}  |  Y COLUMNS: {len(config['y'])}  |  "
-                f"VALUES: {len(config['measures'])}\n"
-                f"WORKERS: {config['workers']}  |  "
-                f"CHUNKS: {config['x_chunk']} ROWS × {config['y_chunk']} COLUMNS"
-            )
+                "APPLY creates tasks; START executes the prepared batch. "
+                "Duplicate checks use only this list.")
 
         def query_config(self) -> dict:
-            if not self.applied_config:
-                raise ValueError("Apply a query in Query Designer before Start")
-            if self.applied_config.get("code") != self.selected_code:
-                raise ValueError("Category changed; open Query Designer and Apply this category")
-            return validate_query(dict(self.applied_config))
+            if not self.applied_queries:
+                raise ValueError("Apply at least one query in Query Designer")
+            return validate_query(dict(self.applied_queries[0]["query"]))
+
+        def _write_applied_list(self, entries: list[dict]) -> None:
+            path = self.selection_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"revision": uuid.uuid4().hex, "queries": entries}
+            temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+            temp.replace(path)
+            self.applied_queries = entries
+            self.selection_revision = payload["revision"]
+            self.update_query_summary()
+
+        def manage_applied(self, action: str) -> None:
+            if self.active_run is not None:
+                self.info("Cannot edit applied list during collection.", "warning")
+                return
+            listing = self.query_one("#applied_query_list", OptionList)
+            selected = listing.highlighted_option
+            if selected is None:
+                self.info("Select an Applied Query first.", "warning")
+                return
+            entries = list(self.applied_queries)
+            index = next((i for i, e in enumerate(entries)
+                          if e["query_id"] == selected.id), -1)
+            if index < 0:
+                return
+            if action == "remove":
+                entries.pop(index)
+            else:
+                other = index - 1 if action == "up" else index + 1
+                if not 0 <= other < len(entries):
+                    return
+                entries[index], entries[other] = entries[other], entries[index]
+            self._write_applied_list(entries)
+            self.info(f"Applied Query {selected.id}: {action}", "success")
 
         def poll_applied_selection(self) -> None:
             try:
                 envelope = json.loads(self.selection_file().read_text(encoding="utf-8"))
-                revision = envelope["revision"]
+                revision = envelope.get("revision")
                 if revision == self.selection_revision:
                     return
-                config = validate_query(envelope["query"])
-                if int(config.get("schema_version", 0)) != SCHEMA_VERSION:
-                    raise ValueError("Old query configuration cannot be applied with reversed axes")
+                entries = envelope.get("queries", [])
+                if not isinstance(entries, list):
+                    raise ValueError("Invalid Applied Query List")
+                from oic_parallel_collector import build_selected_task_plan
+                for item in entries:
+                    cfg = validate_query(item["query"])
+                    if item["query_id"] != cfg.get("query_id"):
+                        raise ValueError("Query ID mismatch")
+                    plan = item.get("task_plan", {})
+                    if (plan.get("query_hash") != query_hash(cfg) or
+                        len(plan.get("assignments", [])) != int(cfg["workers"])):
+                        raise ValueError(f"Stale task plan: {item['query_id']}")
             except FileNotFoundError:
                 return
             except (KeyError, ValueError, TypeError, OSError) as exc:
-                self.info(f"Applied selection rejected: {exc}", "warning")
+                self.info(f"Applied list rejected: {exc}", "warning")
                 return
-            self.applied_config = config
+            self.applied_queries = entries
+            self.applied_config = entries[-1]["query"] if entries else None
             self.selection_revision = revision
-            self.selected_code = config["code"]
-            self.query_one("#cube_select", Select).value = config["code"]
             self.update_query_summary()
-            self.info(f"Designer applied {config['code']} ({len(config['selected_fields'])} fields).", "success")
+            self.info(f"Applied Query List updated: {len(entries)} queries.", "success")
+
 
         # oic_collector.py
         # Replace OICApp.open_query_designer() inside launch_terminal_ui().
@@ -4336,6 +4419,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     cwd=BASE_DIR,
                     tab_titles=["OIC | Query Designer"],
                     keep_open=False,
+                    maximized=True,
                 )
 
                 self.info(

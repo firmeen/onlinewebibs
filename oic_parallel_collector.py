@@ -111,6 +111,7 @@ import json
 import math
 import os
 import re
+import random
 import shutil
 import subprocess
 import sys
@@ -4453,7 +4454,7 @@ def selected_worker(args) -> int:
                     http = None
                     retry_history = []
                     transient = {408, 425, 429, 500, 502, 503, 504}
-                    max_attempts = max(1, int(config.get("retries", 3)) + 1)
+                    max_attempts = max(1, int(config.get("retries", 1)) + 1)
                     for attempt in range(1, max_attempts + 1):
                         if stop_file.exists():
                             break
@@ -4627,7 +4628,7 @@ def selected_export(config: dict, run_dir: Path, *, status: str | None = None,
     if Workbook is None:
         raise RuntimeError("openpyxl required for Excel export")
     batch = run_dir.name.startswith("Q") and run_dir.parent.parent.name == "Runs"
-    root = run_dir.parents[2] if batch else run_dir.parents[1]
+    root = run_dir.parents[2] if batch else run_dir
     excel_dir = root / "Excel"
     excel_dir.mkdir(parents=True, exist_ok=True)
     run_id = config["run_id"]

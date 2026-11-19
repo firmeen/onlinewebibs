@@ -5328,8 +5328,8 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         def _restore_previous_selection(self) -> None:
             try:
-                envelope = json.loads(self.selection_path.read_text(encoding="utf-8"))
-                items = envelope.get("queries", [])
+                envelope, _ = read_applied_queries(self.selection_path)
+                items = envelope["queries"]
                 if not items:
                     return
                 previous = validate_query(items[-1]["query"])
@@ -5938,66 +5938,68 @@ def launch_terminal_ui(args, return_app: bool = False):
             try:
                 from oic_parallel_collector import build_selected_task_plan
                 config = self.build_query()
+                fingerprint = applied_query_identity(config)
                 selection = self.selection_path
-                try:
-                    envelope = json.loads(selection.read_text(encoding="utf-8"))
-                except FileNotFoundError:
-                    envelope = {"revision": None, "queries": []}
-                raw_entries = envelope.get("queries", [])
-                if not isinstance(raw_entries, list):
-                    raise ValueError("Invalid applied query file")
-                entries = list(raw_entries)
-                identity = {
-                    key: config.get(key)
-                    for key in ("code", "cube", "x", "y", "measures", "filters")
-                }
-                fingerprint = json.dumps(identity, ensure_ascii=False, sort_keys=True)
-                duplicate = next((item for item in entries if
-                                  json.dumps({
-                                      key: item["query"].get(key)
-                                      for key in identity
-                                  }, ensure_ascii=False, sort_keys=True) == fingerprint),
-                                 None)
-                if duplicate and not force_duplicate:
-                    self.pending_duplicate = fingerprint
-                    self.query_one("#duplicate_confirm", Button).display = True
-                    self.query_one("#duplicate_cancel", Button).display = True
-                    self.show_error(
-                        f"DUPLICATE: {duplicate['query_id']} has the same category, cube, "
-                        "axes, measures and filters. ADD ANYWAY or CANCEL DUPLICATE.")
-                    return
-                if duplicate and force_duplicate and self.pending_duplicate != fingerprint:
+
+                if force_duplicate and self.pending_duplicate != fingerprint:
                     self.cancel_duplicate()
-                    self.show_error("Query changed after duplicate warning. Press APPLY again.")
-                    return
-                next_id = max((int(item["query_id"][1:])
-                               for item in entries
-                               if str(item.get("query_id", "")).startswith("Q")
-                               and str(item["query_id"])[1:].isdigit()), default=0) + 1
-                config["query_id"] = f"Q{next_id:03d}"
-                plan = build_selected_task_plan(config)
-                entry = {
-                    "query_id": config["query_id"],
-                    "query": config,
-                    "task_plan": plan,
-                    "applied_at": datetime.now(timezone.utc).isoformat(),
-                }
-                entries.append(entry)
-                saved = {"revision": uuid.uuid4().hex, "queries": entries}
-                selection.parent.mkdir(parents=True, exist_ok=True)
-                temp = selection.with_name(selection.name + "." + uuid.uuid4().hex + ".tmp")
-                temp.write_text(json.dumps(saved, ensure_ascii=False, indent=2),
-                                encoding="utf-8")
-                temp.replace(selection)
+                    raise ValueError(
+                        "Query changed after duplicate warning; press APPLY again"
+                    )
+
+                with applied_list_write_lock(selection):
+                    envelope, legacy = read_applied_queries(selection)
+                    entries = envelope["queries"]
+
+                    duplicate = next(
+                        (item for item in entries
+                         if applied_query_identity(item["query"]) == fingerprint),
+                        None,
+                    )
+                    if duplicate and not force_duplicate:
+                        self.pending_duplicate = fingerprint
+                        self.query_one("#duplicate_confirm", Button).display = True
+                        self.query_one("#duplicate_cancel", Button).display = True
+                        self.show_error(
+                            f"DUPLICATE: matches {duplicate['query_id']} "
+                            "(same category, cube, X, Y, VALUES, Filters). "
+                            "Press ADD ANYWAY or CANCEL DUPLICATE."
+                        )
+                        return
+
+                    # Stable, monotonic IDs: never reuse removed Query IDs.
+                    sequence = int(envelope["next_query_sequence"])
+                    existing_ids = {item["query_id"] for item in entries}
+                    query_id = f"Q{sequence:03d}"
+                    while query_id in existing_ids:
+                        sequence += 1
+                        query_id = f"Q{sequence:03d}"
+                    config["query_id"] = query_id
+                    plan = build_selected_task_plan(config)
+                    entries.append({
+                        "query_id": query_id,
+                        "query": config,
+                        "task_plan": plan,
+                        "applied_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    envelope["next_query_sequence"] = sequence + 1
+                    save_applied_queries(
+                        selection, envelope, backup_legacy=legacy,
+                    )
+
                 self.cancel_duplicate()
                 self.query_one("#designer_preview", Static).update(
-                    f"APPLIED {entry['query_id']} / {config['code']}/{config.get('cube_type','FY')} "
-                    f"/ {config['cube']}\n"
+                    f"APPLIED {query_id} / {config['code']}/"
+                    f"{config.get('cube_type', 'FY')} / {config['cube']}\n"
                     f"Prepared {len(plan['assignments'])} worker allocations. "
                     "Task count is DYNAMIC until member discovery.\n"
-                    f"APPLIED QUERIES: {len(entries)}. Designer remains open.")
+                    f"APPLIED QUERIES: {len(entries)}. "
+                    "Designer remains open."
+                )
             except Exception as exc:
-                self.show_error(f"APPLY FAILED: {type(exc).__name__}: {exc}")
+                self.show_error(
+                    f"APPLY FAILED: {type(exc).__name__}: {exc}"
+                )
 
         def catalog_refreshed(self, code: str, cube_type: str,
                               catalog: dict | None, error: str | None):
@@ -6091,7 +6093,7 @@ def main() -> int:
 
     parser.add_argument("--designer", action="store_true",
                         help="Open the dedicated Textual query designer")
-    parser.add_argument("--selection-file", type=str, default="output/query_selection.json")
+    parser.add_argument("--selection-file", type=str, default="output/applied_queries.json")
     parser.add_argument("--category", choices=list(PROFILES), default="MV")
 
     parser.add_argument(

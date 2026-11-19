@@ -2102,7 +2102,7 @@ def applied_list_write_lock(path: Path):
     with lock_path.open("a+b") as handle:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
-            handle.write(b"\\0")
+            handle.write(b"\0")
             handle.flush()
         acquired = False
         start = time.monotonic()
@@ -2288,7 +2288,7 @@ def save_applied_queries(path: Path, document: dict, *,
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
         temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\\n",
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8")
         os.replace(temporary, path)
     finally:
@@ -4492,14 +4492,18 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         def _write_applied_list(self, entries: list[dict]) -> None:
             path = self.selection_file()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"revision": uuid.uuid4().hex, "queries": entries}
-            temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-            temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
-                            encoding="utf-8")
-            temp.replace(path)
+            with applied_list_write_lock(path):
+                envelope, legacy = read_applied_queries(path)
+                # This helper is only used for changes initiated from the App;
+                # refuse to overwrite if the on-disk revision moved.
+                if (self.selection_revision is not None
+                        and path.exists()
+                        and envelope["revision"] != self.selection_revision):
+                    raise ValueError("Applied List changed in Designer; refresh and retry")
+                envelope["queries"] = entries
+                save_applied_queries(path, envelope, backup_legacy=legacy)
             self.applied_queries = entries
-            self.selection_revision = payload["revision"]
+            self.selection_revision = envelope["revision"]
             self.update_query_summary()
 
         def manage_applied(self, action: str) -> None:
@@ -4511,49 +4515,63 @@ def launch_terminal_ui(args, return_app: bool = False):
             if selected is None:
                 self.info("Select an Applied Query first.", "warning")
                 return
-            entries = list(self.applied_queries)
-            index = next((i for i, e in enumerate(entries)
-                          if e["query_id"] == selected.id), -1)
-            if index < 0:
-                return
-            if action == "remove":
-                entries.pop(index)
-            else:
-                other = index - 1 if action == "up" else index + 1
-                if not 0 <= other < len(entries):
-                    return
-                entries[index], entries[other] = entries[other], entries[index]
-            self._write_applied_list(entries)
-            self.info(f"Applied Query {selected.id}: {action}", "success")
+            path = self.selection_file()
+            try:
+                with applied_list_write_lock(path):
+                    envelope, legacy = read_applied_queries(path)
+                    entries = envelope["queries"]
+                    index = next((i for i, item in enumerate(entries)
+                                  if item["query_id"] == selected.id), -1)
+                    if index < 0:
+                        raise ValueError("Applied Query changed; select it again")
+                    if action == "remove":
+                        entries.pop(index)
+                    elif action in ("up", "down"):
+                        other = index + (-1 if action == "up" else 1)
+                        if not 0 <= other < len(entries):
+                            return
+                        entries[index], entries[other] = entries[other], entries[index]
+                    else:
+                        raise ValueError("Unknown Applied Query action")
+                    save_applied_queries(path, envelope, backup_legacy=legacy)
+                self.applied_queries = envelope["queries"]
+                self.selection_revision = envelope["revision"]
+                self.applied_config = (self.applied_queries[-1]["query"]
+                                       if self.applied_queries else None)
+                self.update_query_summary()
+                self.info(f"Applied Query {selected.id}: {action}", "success")
+            except (OSError, ValueError, TimeoutError) as exc:
+                self.info(f"Cannot edit Applied List: {exc}", "warning")
 
         def poll_applied_selection(self) -> None:
+            path = self.selection_file()
+            if not path.is_file():
+                return
             try:
-                envelope = json.loads(self.selection_file().read_text(encoding="utf-8"))
-                revision = envelope.get("revision")
+                envelope, legacy = read_applied_queries(path)
+                revision = envelope["revision"]
                 if revision == self.selection_revision:
                     return
-                entries = envelope.get("queries", [])
-                if not isinstance(entries, list):
-                    raise ValueError("Invalid Applied Query List")
-                from oic_parallel_collector import build_selected_task_plan
-                for item in entries:
-                    cfg = validate_query(item["query"])
-                    if item["query_id"] != cfg.get("query_id"):
-                        raise ValueError("Query ID mismatch")
-                    plan = item.get("task_plan", {})
-                    if (plan.get("query_hash") != query_hash(cfg) or
-                        len(plan.get("assignments", [])) != int(cfg["workers"])):
-                        raise ValueError(f"Stale task plan: {item['query_id']}")
-            except FileNotFoundError:
+                entries = envelope["queries"]
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                message = str(exc)
+                if getattr(self, "_applied_last_error", None) != message:
+                    self._applied_last_error = message
+                    self.info(f"Applied List cannot be read: {message}", "warning")
                 return
-            except (KeyError, ValueError, TypeError, OSError) as exc:
-                self.info(f"Applied list rejected: {exc}", "warning")
-                return
+            self._applied_last_error = None
             self.applied_queries = entries
             self.applied_config = entries[-1]["query"] if entries else None
             self.selection_revision = revision
             self.update_query_summary()
-            self.info(f"Applied Query List updated: {len(entries)} queries.", "success")
+            if legacy:
+                self.info(
+                    f"Loaded {len(entries)} legacy Applied Queries. "
+                    "Original file will be backed up and upgraded on next edit/APPLY.",
+                    "warning",
+                )
+            else:
+                self.info(f"Applied Query List updated: {len(entries)} queries.", "success")
 
 
         # oic_collector.py

@@ -46,6 +46,7 @@ TOKEN_URL = BASE_URL + "/WebForm/Dashboard/Pivot/PivotCube.asmx/GenToken"
 DEFAULT_WORKERS = 4
 MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 MAX_ATTEMPTS = 3
+PREPARE_BACKOFF_SECONDS = 15
 STARTUP_TIMEOUT = 60
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36")
@@ -221,6 +222,10 @@ class PrepareMonitor:
         timing=f" | {metrics['response_bytes']:,} bytes" if "response_bytes" in metrics else ""
         if "response_wait_estimate" in metrics:
             timing+=f" | response wait estimate {metrics['response_wait_estimate']:.2f}s"
+        if metrics.get("ttfb_seconds") is not None:
+            timing+=f" | TTFB {metrics['ttfb_seconds']:.2f}s"
+        if metrics.get("download_bytes") is not None:
+            timing+=f" | downloaded {metrics['download_bytes']:,} bytes"
         log(f"{row['cube']} | {row['kind']} | {'OK' if ok else 'FAILED'} | "
             f"{time.monotonic()-row['started']:.2f}s{timing} | {error or ''}")
 
@@ -262,7 +267,7 @@ class PrepareMonitor:
         overview.append(f"{phase}  |  {cube}  |  {elapsed//3600:02}:{elapsed//60%60:02}:{elapsed%60:02}\n",style="bold cyan")
         overview.append(f"Catalogs {len(catalogs)}/15  |  Fields {total_fields:,}  |  Source {source}\n")
         overview.append(f"Inventories ready {ready}/15  |  Validated hierarchies {done:,}  |  Members {members:,}\n")
-        overview.append(detail,style="yellow")
+        overview.append("MDX FIRST | "+detail,style="yellow")
         height=self.console.height
         compact=height<40
         overview.no_wrap=True
@@ -462,17 +467,18 @@ def extract_error_details(body):
     return "XMLA_FAULT_UNKNOWN"
 
 
-def bounded_error_body(response):
-    result=bytearray()
-    for chunk in response.iter_content():
-        remaining=65536-len(result)
-        result.extend(chunk[:remaining])
-        if len(result)>=65536:
-            break
-    return bytes(result)
+def xmla_operation(payload):
+    prefix=payload[:1024]
+    if isinstance(prefix,str):
+        prefix=prefix.encode("utf-8")
+    if b":Discover" in prefix or b"<Discover" in prefix:
+        return "DISCOVER"
+    if b":Execute" in prefix or b"<Execute" in prefix:
+        return "EXECUTE"
+    return "UNKNOWN"
 
 
-def classify_http(status,headers,endpoint="XMLA",body=b""):
+def classify_http(status,headers,endpoint="XMLA",body=b"",operation=None):
     delay=max(5,retry_after(headers.get("Retry-After")))
     diagnostic=extract_error_details(body)
     if status==401:
@@ -489,7 +495,7 @@ def classify_http(status,headers,endpoint="XMLA",body=b""):
         kind=diagnostic if diagnostic not in (None,"XMLA_FAULT_UNKNOWN") else "HTTP_500_UNKNOWN"
     else:
         kind=diagnostic or "INVALID_QUERY"
-    return CollectionError(kind,f"{endpoint} HTTP {status}"+(f" | {diagnostic}" if diagnostic else ""),
+    return CollectionError(kind,f"{endpoint} {operation or ''} HTTP {status}".replace("  "," ")+(f" | {diagnostic}" if diagnostic else "")+f" | retry_after={retry_after(headers.get('Retry-After')):.1f}s",
                            delay,endpoint=endpoint,http_status=status)
 
 
@@ -542,7 +548,8 @@ class OICClient:
     def reconnect(self):
         if self.session is not None:
             self.session.close()
-        info_names=("NAMELOOKUP_TIME","CONNECT_TIME","APPCONNECT_TIME","PRETRANSFER_TIME","STARTTRANSFER_TIME","TOTAL_TIME")
+        info_names=("NAMELOOKUP_TIME","CONNECT_TIME","APPCONNECT_TIME","PRETRANSFER_TIME","STARTTRANSFER_TIME","TOTAL_TIME",
+                    "SIZE_DOWNLOAD_T","NUM_CONNECTS","HTTP_VERSION")
         infos=[getattr(CurlInfo,n) for n in info_names if hasattr(CurlInfo,n)]
         self.session=curl_requests.Session(verify=True,curl_infos=infos,
             curl_options={CurlOpt.TCP_KEEPALIVE:1})
@@ -609,82 +616,130 @@ class OICClient:
         token_start=time.monotonic()
         self.ensure_token()
         auth_seconds=time.monotonic()-token_start
+        operation=xmla_operation(payload)
         for attempt in range(2):
-            started=time.monotonic()
             self.observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0)
+            response=None
+            stream=None
+            temporary=None
+            size=0
+            prefix=bytearray()
+            body=bytearray() if destination is None else None
+            first_body=None
+            last_body=None
+            write_seconds=0.0
+            callback_error=None
+            oversized=False
+            retry_auth=False
             try:
-                with self.session.stream("POST",XMLA_URL,data=payload,
+                if destination:
+                    destination.parent.mkdir(parents=True,exist_ok=True)
+                    temporary=destination.with_name(destination.name+"."+uuid.uuid4().hex+".partial")
+                    stream=temporary.open("wb",buffering=256*1024)
+
+                def receive(chunk):
+                    nonlocal size,first_body,last_body,write_seconds,callback_error,oversized
+                    if not chunk:
+                        return 0
+                    now=time.monotonic()
+                    if first_body is None:
+                        first_body=now
+                    size+=len(chunk)
+                    if size>MAX_RESPONSE_BYTES:
+                        oversized=True
+                        return 0
+                    if len(prefix)<65536:
+                        prefix.extend(chunk[:65536-len(prefix)])
+                    try:
+                        if stream is not None:
+                            t=time.monotonic()
+                            written=stream.write(chunk)
+                            write_seconds+=time.monotonic()-t
+                            if written!=len(chunk):
+                                callback_error=OSError("Short response write")
+                                return 0
+                        else:
+                            body.extend(chunk)
+                    except OSError as exc:
+                        callback_error=exc
+                        return 0
+                    last_body=time.monotonic()
+                    self.observe("RECEIVING",bytes=size)
+                    return len(chunk)
+
+                transfer_started=time.monotonic()
+                response=self.session.post(XMLA_URL,data=payload,
                     headers={"Accept":"text/plain, */*; q=0.01","Content-Type":"text/xml",
                              "X-Requested-With":"XMLHttpRequest","Origin":BASE_URL,"Referer":self.referer(),
                              "Authorization":"Bearer "+self.token,"Cookie":self.cookie},
-                    timeout=(15,timeout),allow_redirects=False) as response:
-                    headers_at=time.monotonic()
-                    self.observe("HEADERS RECEIVED",http_status=response.status_code)
-                    if response.status_code!=200:
-                        error=classify_http(response.status_code,response.headers,"XMLA",bounded_error_body(response))
-                        if error.kind=="AUTH_TOKEN_EXPIRED" and attempt==0:
-                            retry_auth=True
-                        else:
-                            raise error
+                    timeout=(15,timeout),allow_redirects=False,
+                    content_callback=receive,accept_encoding="gzip, deflate, br")
+                received=time.monotonic()
+                # The callback API returns headers only after transfer.
+                self.observe("HTTP RESPONSE COMPLETE",http_status=response.status_code,bytes=size)
+                if oversized:
+                    raise CollectionError("RESPONSE_TOO_LARGE","100 MiB limit")
+                if callback_error is not None:
+                    raise callback_error
+                if response.status_code!=200:
+                    error=classify_http(response.status_code,response.headers,"XMLA",bytes(prefix),operation)
+                    if error.kind=="AUTH_TOKEN_EXPIRED" and attempt==0:
+                        retry_auth=True
                     else:
-                        retry_auth=False
-                        size=0
-                        body=bytearray() if destination is None else None
-                        temporary=None
+                        raise error
+                else:
+                    finalize_seconds=0.0
+                    if stream is not None:
+                        t=time.monotonic()
+                        stream.flush()
+                        write_seconds+=time.monotonic()-t
+                        t=time.monotonic()
+                        os.fsync(stream.fileno())
+                        stream.close()
                         stream=None
-                        write_seconds=0.0
-                        try:
-                            if destination:
-                                destination.parent.mkdir(parents=True,exist_ok=True)
-                                temporary=destination.with_name(destination.name+"."+uuid.uuid4().hex+".partial")
-                                stream=temporary.open("wb")
-                            for chunk in response.iter_content():
-                                if not chunk:
-                                    continue
-                                size+=len(chunk)
-                                self.observe("RECEIVING",bytes=size)
-                                if size>MAX_RESPONSE_BYTES:
-                                    raise CollectionError("RESPONSE_TOO_LARGE","100 MiB limit")
-                                if stream:
-                                    t=time.monotonic()
-                                    stream.write(chunk)
-                                    write_seconds+=time.monotonic()-t
-                                else:
-                                    body.extend(chunk)
-                            received=time.monotonic()
-                            if stream:
-                                stream.flush()
-                                os.fsync(stream.fileno())
-                                stream.close()
-                                stream=None
-                                temporary.replace(destination)
-                            metrics={"duration":time.monotonic()-overall,"http_status":200,
-                                     "response_bytes":size,"token_refresh_seconds":auth_seconds,
-                                     "header_wait_seconds":headers_at-started,
-                                     "receive_seconds":received-headers_at,"file_write_seconds":write_seconds}
-                            infos=getattr(response,"infos",{}) or {}
-                            for name,key in (("NAMELOOKUP_TIME","dns_seconds"),("CONNECT_TIME","connect_seconds"),
-                                             ("APPCONNECT_TIME","tls_complete_seconds"),("PRETRANSFER_TIME","pretransfer_seconds"),
-                                             ("STARTTRANSFER_TIME","ttfb_seconds"),("TOTAL_TIME","curl_total_seconds")):
-                                value=infos.get(getattr(CurlInfo,name,None))
-                                if isinstance(value,(int,float)) and value>=0:
-                                    metrics[key]=value
-                            if "ttfb_seconds" in metrics and "pretransfer_seconds" in metrics:
-                                metrics["response_wait_estimate"]=max(0,metrics["ttfb_seconds"]-metrics["pretransfer_seconds"])
-                            return (bytes(body) if body is not None else None),metrics
-                        finally:
-                            if stream:
-                                stream.close()
-                            if temporary:
-                                temporary.unlink(missing_ok=True)
-                if retry_auth:
-                    t=time.monotonic()
-                    self.refresh_token()
-                    auth_seconds+=time.monotonic()-t
+                        temporary.replace(destination)
+                        finalize_seconds=time.monotonic()-t
+                    metrics={"duration":time.monotonic()-overall,"http_status":200,
+                             "operation":operation,"http_engine":"curl_cffi_callback",
+                             "response_bytes":size,"token_refresh_seconds":auth_seconds,
+                             "header_wait_seconds":None,
+                             "first_body_seconds":first_body-transfer_started if first_body is not None else None,
+                             "receive_seconds":last_body-first_body if last_body is not None and first_body is not None else None,
+                             "file_write_seconds":write_seconds,"finalize_seconds":finalize_seconds,
+                             "transfer_wall_seconds":received-transfer_started,
+                             "content_encoding":response.headers.get("Content-Encoding","")}
+                    infos=getattr(response,"infos",{}) or {}
+                    for name,key in (("NAMELOOKUP_TIME","dns_seconds"),("CONNECT_TIME","connect_seconds"),
+                                     ("APPCONNECT_TIME","tls_complete_seconds"),("PRETRANSFER_TIME","pretransfer_seconds"),
+                                     ("STARTTRANSFER_TIME","ttfb_seconds"),("TOTAL_TIME","curl_total_seconds"),
+                                     ("SIZE_DOWNLOAD_T","download_bytes"),("NUM_CONNECTS","new_connections"),
+                                     ("HTTP_VERSION","http_version")):
+                        value=infos.get(getattr(CurlInfo,name,None))
+                        if isinstance(value,(int,float)) and value>=0:
+                            metrics[key]=value
+                    if "ttfb_seconds" in metrics and "pretransfer_seconds" in metrics:
+                        metrics["response_wait_estimate"]=max(0,metrics["ttfb_seconds"]-metrics["pretransfer_seconds"])
+                    return (bytes(body) if body is not None else None),metrics
             except RequestException as exc:
+                if oversized:
+                    raise CollectionError("RESPONSE_TOO_LARGE","100 MiB limit") from None
+                if callback_error is not None:
+                    raise CollectionError("DISK_FULL" if callback_error.errno==28 else "STORAGE_ERROR",
+                                          type(callback_error).__name__) from None
                 raise classify_network(exc) from None
             except OSError as exc:
                 raise CollectionError("DISK_FULL" if exc.errno==28 else "STORAGE_ERROR",type(exc).__name__) from None
+            finally:
+                if response is not None:
+                    response.close()
+                if stream is not None:
+                    stream.close()
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+            if retry_auth:
+                t=time.monotonic()
+                self.refresh_token()
+                auth_seconds+=time.monotonic()-t
         raise CollectionError("ACCESS_DENIED","Authentication retry exhausted")
 
     def discover(self,profile,payload,timeout):
@@ -1154,6 +1209,7 @@ def run_prepare(db):
 
         health_checks={}
         unknown_streak=0
+        prepare_pressure=threading.Event()
 
         def monitored_call(profile,payload,timeout,phase,detail,attempt):
             cube=f"{profile['code']}/{profile['cube_type']}"
@@ -1184,54 +1240,71 @@ def run_prepare(db):
             finally:
                 monitor.request_finished(key,True,error="Cooldown ended")
 
-        def check_cube_health(profile):
-            from oic_all_dim_prepare import build_discover_request,parse_discover_rows
+        def check_cube_health(profile,force=False):
+            from oic_all_dim_prepare import count_batch
             cube=f"{profile['code']}/{profile['cube_type']}"
             last=health_checks.get(cube)
-            if last is not None and time.monotonic()-last<60:
+            if not force and last is not None and time.monotonic()-last<60:
                 return True
+            year=profile.get("year")
+            if not year:
+                raise CollectionError("SERVER_UNAVAILABLE","No verified year hierarchy for health check")
             try:
-                data=monitored_call(profile,build_discover_request(profile,"MDSCHEMA_HIERARCHIES"),
-                                    30,"HEALTH_CHECK","Small hierarchy metadata request",1)
-                if not parse_discover_rows(data):
-                    raise ValueError("Empty health response")
-            except (RuntimeError,ValueError) as exc:
-                if getattr(exc,"kind","") in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","ACCESS_DENIED","TLS_ERROR","AUTH_ENDPOINT_ERROR","RATE_LIMITED"):
+                counts=count_batch(
+                    lambda p,payload,timeout: monitored_call(
+                        p,payload,min(timeout,30),"HEALTH_CHECK","Small MDX year cardinality",1),
+                    profile,[year])
+                if counts.get(year,0)<=0:
+                    raise ValueError("Empty MDX year cardinality")
+            except CollectionError as exc:
+                if exc.kind in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","ACCESS_DENIED","TLS_ERROR",
+                                "AUTH_ENDPOINT_ERROR","RATE_LIMITED","SERVER_UNAVAILABLE"):
                     raise
-                raise CollectionError("SERVER_UNAVAILABLE","XMLA health check failed",5,endpoint="XMLA") from exc
+                raise CollectionError("SERVER_UNAVAILABLE","MDX health check failed",max(5,exc.delay),
+                                      endpoint=exc.endpoint,http_status=exc.http_status) from exc
+            except (RuntimeError,ValueError) as exc:
+                raise CollectionError("SERVER_UNAVAILABLE","Invalid MDX health response",5,endpoint="XMLA") from exc
             health_checks[cube]=time.monotonic()
+            monitor.emit("activity",message=f"{cube} | MDX EXECUTE HEALTH OK")
             return True
 
         def transport(profile,payload,timeout):
             nonlocal unknown_streak
             phase,detail=monitor.context()
+            operation=xmla_operation(payload)
             for attempt in range(1,MAX_ATTEMPTS+1):
                 try:
-                    data=monitored_call(profile,payload,timeout,phase,detail,attempt)
+                    data=monitored_call(profile,payload,timeout,phase,f"{operation} | {detail}",attempt)
                     unknown_streak=0
                     return data
                 except CollectionError as exc:
                     kind=exc.kind
                     if kind in ("QUERY_SCOPE_ERROR","QUERY_FAULT","DISCOVER_NOT_SUPPORTED","RESPONSE_TOO_LARGE"):
                         raise
+                    if (kind=="SERVER_UNAVAILABLE" and exc.http_status==503 and
+                            exc.endpoint=="XMLA" and operation=="DISCOVER"):
+                        cooldown(profile,max(PREPARE_BACKOFF_SECONDS,exc.delay),str(exc))
+                        check_cube_health(profile,force=True)
+                        raise CollectionError("DISCOVERY_SCOPE_UNCONFIRMED",
+                                              "Discover HTTP 503; small MDX Execute succeeded",
+                                              endpoint="XMLA",http_status=503) from exc
                     if kind in ("HTTP_500_UNKNOWN","RESPONSE_TIMEOUT","XMLA_FAULT_UNKNOWN") and exc.endpoint!="GEN_TOKEN":
-                        # Do not repeat the same large request three times.
-                        # A responsive small query permits a bounded local fallback,
-                        # but is not proof the original error was size-related.
                         unknown_streak+=1
-                        cooldown(profile,max(5,exc.delay),"Unclassified XMLA failure; checking endpoint")
                         if unknown_streak>3:
                             raise CollectionError("SERVER_UNAVAILABLE","Repeated unexplained XMLA failures; stopping",5) from exc
+                        cooldown(profile,max(PREPARE_BACKOFF_SECONDS,exc.delay),"Unclassified XMLA failure; checking MDX endpoint")
                         check_cube_health(profile)
                         raise CollectionError("DISCOVERY_SCOPE_UNCONFIRMED",
-                                              f"{kind}; small metadata request succeeded",5,endpoint="XMLA",
+                                              f"{kind}; small MDX Execute succeeded",5,endpoint="XMLA",
                                               http_status=exc.http_status) from exc
                     if kind not in ("RATE_LIMITED","SERVER_UNAVAILABLE","NETWORK_ERROR","DNS_ERROR",
                                     "CONNECTION_RESET","AUTH_ENDPOINT_ERROR","AUTH_TOKEN_EXPIRED") or attempt>=MAX_ATTEMPTS:
                         raise
                     if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
                         client.reconnect()
-                    cooldown(profile,max(2**attempt,exc.delay,5),str(exc))
+                    minimum=(PREPARE_BACKOFF_SECONDS*2**(attempt-1)
+                             if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE") else 5)
+                    cooldown(profile,max(minimum,exc.delay),str(exc))
             raise RuntimeError("Discovery retry budget exhausted")
 
         def probe(req,profile,parallel=False):
@@ -1241,6 +1314,8 @@ def run_prepare(db):
             probe_client=None
             key=req["id"]
             try:
+                if prepare_pressure.is_set():
+                    raise CollectionError("SERVER_UNAVAILABLE","Preparation probes paused after server pressure")
                 probe_client=OICClient() if parallel else client
                 existing=probe_db.get_request(key)
                 scope=req["scope"]
@@ -1254,6 +1329,11 @@ def run_prepare(db):
                 probe_client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
                 claimed=probe_db.claim_probe(key)
                 result=execute_resilient(probe_db,probe_client,claimed,probe=True)
+                if result.get("error") in ("SERVER_UNAVAILABLE","RATE_LIMITED"):
+                    prepare_pressure.set()
+                    monitor.request_finished(key,False,result,error=result.get("error"))
+                    raise CollectionError(result["error"],"Preparation probes paused",
+                                          max(PREPARE_BACKOFF_SECONDS,result.get("delay",0)))
                 if result.get("pressure"):
                     delay=max(10,result.get("delay",0))
                     monitor.retry(key,delay)
@@ -1276,6 +1356,15 @@ def run_prepare(db):
         ready=prepare_all(db,transport,probe,OUTPUT,log,emit=monitor.emit)
         status="READY" if ready else "INCOMPLETE"
         return 0 if ready else 1
+    except CollectionError as exc:
+        if exc.kind not in ("SERVER_UNAVAILABLE","RATE_LIMITED"):
+            raise
+        status="PAUSED"
+        log(f"PREPARE PAUSED | {exc} | committed checkpoints retained")
+        monitor.emit("activity",message=f"PAUSED | {exc}")
+        if exc.delay:
+            wait_seconds(exc.delay)
+        return 1
     except KeyboardInterrupt:
         status="STOPPED"
         raise

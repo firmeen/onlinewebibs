@@ -68,7 +68,8 @@ import shutil
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
                        validate_query, build_mdx as selected_mdx, query_hash,
                         cube_status, cube_profile, cube_options, CUBE_TYPES,
-                        verify_field, catalog_verification_summary)
+                        verify_field, catalog_verification_summary,
+                        export_verified_catalogs)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2445,9 +2446,10 @@ def launch_terminal_ui(args, return_app: bool = False):
         /* ACTIONS */
 
         #toolbar {
-            height: 3;
+            height: 4;
             margin-top: 1;
             align: left middle;
+            overflow-x: auto;
         }
 
         #toolbar Button {
@@ -2816,6 +2818,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
                     yield Button("OPEN QUERY DESIGNER", id="open_designer")
                     yield Button("REFRESH CATALOGS", id="refresh_all_catalogs")
+                    yield Button("EXPORT VERIFIED CATALOG", id="export_verified_catalog")
                     yield Button(
                         "START COLLECTION",
                         id="start",
@@ -3754,6 +3757,18 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.open_query_designer()
             elif button_id == "refresh_all_catalogs":
                 self.discover_all_catalogs(force=True)
+            elif button_id == "export_verified_catalog":
+                button = self.query_one("#export_verified_catalog", Button)
+                if button.disabled:
+                    return
+                if self.catalog_running:
+                    self.info("Catalog refresh is running; export is not started.", "warning")
+                    return
+                button.disabled = True
+                button.label = "EXPORTING..."
+                self.query_one("#refresh_all_catalogs", Button).disabled = True
+                self.info("Exporting saved field verification reports...")
+                self.export_catalog_worker()
 
         # ====================================================
         # SELECTED INSURANCE CLASSES
@@ -4705,6 +4720,35 @@ def launch_terminal_ui(args, return_app: bool = False):
                 f"SELECTABLE: {totals['selectable']:,} | CUBES AVAILABLE: "
                 f"{available}/{len(QUERY_PROFILES) * len(CUBE_TYPES)}\n"
                 + "\n".join(lines))
+
+        @work(thread=True, group="catalog-export", exclusive=True)
+        def export_catalog_worker(self) -> None:
+            result = None
+            error = None
+            try:
+                result = export_verified_catalogs()
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+            finally:
+                self.call_from_thread(self.catalog_export_finished, result, error)
+
+        def catalog_export_finished(self, result: dict | None, error: str | None) -> None:
+            button = self.query_one("#export_verified_catalog", Button)
+            button.label = "EXPORT VERIFIED CATALOG"
+            button.disabled = False
+            self.query_one("#refresh_all_catalogs", Button).disabled = False
+            if error is not None:
+                self.info(f"Catalog export failed: {error}", "error")
+                return
+            if result is None:
+                self.info("Catalog export returned no result.", "error")
+                return
+            self.info(
+                f"EXPORT COMPLETED | CUBES: {result['cubes']} | "
+                f"FIELDS: {result['fields']:,} | DESTINATION: {result['directory']}",
+                "success",
+            )
+            self.update_catalog_summary()
 
         @work(thread=True, group="five-cube-discovery", exclusive=True)
         def discover_all_catalogs(self, force: bool = False) -> None:

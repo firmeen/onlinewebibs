@@ -2,62 +2,68 @@
 # -*- coding: utf-8 -*-
 
 """
-OIC HIGH-PERFORMANCE REQUEST LOAD ENGINE
-========================================
-
-Standalone MV/FY XMLA Request Engine.
+OIC HIGH-PERFORMANCE LOAD ENGINE v2.0.0
+=======================================
 
 INSTALL
 -------
-python -m pip install curl_cffi rich
+python -m pip install curl_cffi rich openpyxl
 
 COMMANDS
 --------
 python oic_load_engine.py
-python oic_load_engine.py --workers 4
 python oic_load_engine.py --workers 4 --mode benchmark
 python oic_load_engine.py --workers 4 --mode run
 
-AUTHENTICATION
---------------
-Reuse existing .env:
+FEATURES
+--------
+- Standalone Python file
+- Existing .env authentication
+- Verified MV/FY field mappings
+- Native curl_cffi callback
+- Persistent HTTP connections
+- HTTP/2 and compression negotiation
+- Exact axis discovery
+- Original MDX Subset engine
+- Explicit member-set MDX optimization
+- Reduced MDX metadata
+- Multi-region benchmark sampling
+- Chunk size optimization
+- Concurrency optimization
+- Bounded request scheduling
+- Conservative request-rate control
+- Adaptive concurrency reduction
+- Detailed HTTP timing
+- Benchmark recovery
+- Dataset equivalence validation
+- Rich live terminal monitor
+- Worker relative progress bars
+- Raw XML output
+- Actual data CSV export
+- Actual data Excel export
+- Write-only Excel workbook
+- Independent CSV/Excel export timing
+- Partial dataset recovery on graceful stop
 
-    OIC_COOKIE=...
-    OIC_BEARER_TOKEN=...
+IMPORTANT
+---------
+This version preserves AllMembers, null values and all seven
+selected measures.
 
-FIXED QUERY
------------
-Category : MV
-Cube     : FY
+No NON EMPTY filtering is applied automatically.
 
-X / ROWS:
-    1. แบรนด์/ยี่ห้อ
-    2. ประเภทกรมธรรม์
+No unverified measure-unit conversion is performed.
 
-Y / COLUMNS:
-    1. ปีบัญชี
+Excel and data CSV exports occur after extraction finishes.
+Export duration is excluded from request benchmark measurements.
 
-VALUES:
-    1. จำนวนเคลม
-    2. เงินเอาประกันภัย (ล้าน)
-    3. เบี้ยประกันภัย (ล้าน)
-    4. จำนวนกรมธรรม์
-    5. จำนวนเคลมที่ยังไม่ปิด
-    6. จำนวนเคลมที่มีการรับคืน
-    7. จำนวนกรมธรรม์ที่มีเคลม
+Explicit member-set MDX and axis discovery must be validated
+against the live OIC server before production use.
 
-The fixed field mappings are resolved from the existing local
-verified MV/FY catalog. Missing or ambiguous mappings stop execution.
+Server-side latency improvements are not guaranteed.
 
-No existing collector modules are imported or modified.
-No credentials are written to reports.
-No automatic changes are made to .env.
-
-Performance improvements must be verified by actual benchmarks.
-The engine cannot guarantee lower OLAP server processing time.
-
-Benchmark results depend on server load, cache and network conditions.
-Raw measure values are preserved without unverified unit conversions.
+Local rate limits are conservative application limits,
+not official OIC service limits.
 """
 
 from __future__ import annotations
@@ -69,24 +75,32 @@ import hashlib
 import json
 import math
 import os
-import queue
 import re
 import statistics
 import threading
 import time
 import uuid
 
-from dataclasses import dataclass
+from collections import deque
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    wait,
+)
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any
 from xml.etree import ElementTree as ET
 
 from curl_cffi import CurlInfo
 from curl_cffi import requests as curl_requests
 from curl_cffi.requests.exceptions import RequestException
+
+from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
+from openpyxl.styles import Font, PatternFill
 
 from rich import box
 from rich.bar import Bar
@@ -102,15 +116,15 @@ from rich.text import Text
 # ============================================================
 
 APP_NAME = "OIC HIGH-PERFORMANCE LOAD ENGINE"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 ROOT = Path(__file__).resolve().parent
 
 ENV_FILE = ROOT / ".env"
-
 OUTPUT_ROOT = ROOT / "output" / "load_engine"
 
 BASE_URL = "https://onlinewebibs.oic.or.th"
+HOSTNAME = "onlinewebibs.oic.or.th"
 
 XMLA_URL = BASE_URL + "/xmla-proxy/api/xmla-proxy"
 
@@ -138,8 +152,6 @@ REFERER = (
     + f"?Class={OIC_CLASS}"
 )
 
-HOSTNAME = "onlinewebibs.oic.or.th"
-
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -151,28 +163,32 @@ MAX_WORKERS = 8
 
 CONNECT_TIMEOUT = 15
 REQUEST_TIMEOUT = 90
+DISCOVERY_TIMEOUT = 120
 
 TOKEN_REFRESH_MARGIN = 60
 
 MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 
-# Conservative local limits, not official OIC service limits.
-# Do not increase beyond the service's authorized usage policy.
 MAX_REQUESTS_PER_SECOND = 4.0
 WORKER_REQUEST_DELAY = 1.0
 
 MAX_ATTEMPTS = 2
-SLOW_REQUEST_MS = 5000
 
-BENCHMARK_X_MEMBERS = 10
-BENCHMARK_Y_MEMBERS = 4
+SLOW_REQUEST_MS = 5000
+VERY_SLOW_REQUEST_MS = 15000
+
+BENCHMARK_REGION_SIZE = 20
+BENCHMARK_MAX_PROFILE_SECONDS = 240
+BENCHMARK_PAUSE_SECONDS = 2
 
 DEFAULT_X_CHUNK = 5
-DEFAULT_Y_CHUNK = 10
+DEFAULT_Y_CHUNK = 4
 
 MAX_TASKS_PER_RUN = 100_000
+MAX_AXIS_TUPLES = 250_000
+MAX_EXPORT_ROWS = 1_000_000
 
-RECENT_HISTORY_LIMIT = 100
+RECENT_HISTORY_LIMIT = 500
 RECENT_WINDOW_SECONDS = 60
 
 REFRESH_INTERVAL = 1.0
@@ -182,14 +198,6 @@ XMLA_NS = "urn:schemas-microsoft-com:xml-analysis"
 MD_NS = "urn:schemas-microsoft-com:xml-analysis:mddataset"
 
 ET.register_namespace("soap", SOAP_NS)
-
-IDENTIFIER_PATTERN = re.compile(
-    r"^\[[^\]\r\n]+\]\.\[[^\]\r\n]+\]$"
-)
-
-MEASURE_PATTERN = re.compile(
-    r"^\[Measures\]\.\[[^\]\r\n]+\]$"
-)
 
 X_CAPTIONS = (
     "แบรนด์/ยี่ห้อ",
@@ -216,6 +224,24 @@ CATALOG_PATHS = (
     ROOT / "output" / "field_verification" / "MV_FY.json",
 )
 
+IDENTIFIER_PATTERN = re.compile(
+    r"^\[[^\]\r\n]+\]\.\[[^\]\r\n]+\]$"
+)
+
+MEASURE_PATTERN = re.compile(
+    r"^\[Measures\]\.\[[^\]\r\n]+\]$",
+    re.IGNORECASE,
+)
+
+MEMBER_PART = r"\[(?:[^\]\r\n]|\]\])*\]"
+
+MEMBER_PATTERN = re.compile(
+    MEMBER_PART
+    + r"(?:(?:\.?&|\.)"
+    + MEMBER_PART
+    + r")*"
+)
+
 XMLA_HEADERS = {
     "Accept": "text/plain, */*; q=0.01",
     "Content-Type": "text/xml",
@@ -232,7 +258,7 @@ TOKEN_HEADERS = {
     "Referer": REFERER,
 }
 
-CURL_TIMING_NAMES = (
+CURL_INFO_NAMES = (
     "NAMELOOKUP_TIME",
     "CONNECT_TIME",
     "APPCONNECT_TIME",
@@ -240,33 +266,18 @@ CURL_TIMING_NAMES = (
     "STARTTRANSFER_TIME",
     "TOTAL_TIME",
     "SIZE_DOWNLOAD_T",
+    "SIZE_UPLOAD_T",
     "NUM_CONNECTS",
     "HTTP_VERSION",
 )
 
 CURL_INFOS = [
     getattr(CurlInfo, name)
-    for name in CURL_TIMING_NAMES
+    for name in CURL_INFO_NAMES
     if hasattr(CurlInfo, name)
 ]
 
-CSV_FIELDS = (
-    "profile",
-    "engine",
-    "worker_id",
-    "request_id",
-    "attempt",
-    "x_offset",
-    "y_offset",
-    "x_chunk",
-    "y_chunk",
-    "started_at",
-    "completed_at",
-    "status",
-    "http_status",
-    "http_version",
-    "content_type",
-    "content_encoding",
+TIMING_FIELDS = (
     "queue_wait_ms",
     "rate_wait_ms",
     "token_lock_wait_ms",
@@ -286,9 +297,29 @@ CSV_FIELDS = (
     "transfer_ms",
     "execute_ms",
     "task_total_ms",
+)
+
+REQUEST_CSV_FIELDS = (
+    "profile",
+    "query_strategy",
+    "worker_id",
+    "request_id",
+    "attempt",
+    "x_offset",
+    "y_offset",
+    "x_chunk",
+    "y_chunk",
+    "started_at",
+    "completed_at",
+    "status",
+    "http_status",
+    "http_version",
+    "content_type",
+    "content_encoding",
+    *TIMING_FIELDS,
     "response_bytes",
     "download_bytes",
-    "download_kib_per_sec",
+    "upload_bytes",
     "new_connections",
     "x_members",
     "y_members",
@@ -301,9 +332,19 @@ CSV_FIELDS = (
     "error",
 )
 
+DATA_HEADERS = (
+    *X_CAPTIONS,
+    *Y_CAPTIONS,
+    *MEASURE_CAPTIONS,
+    "X1 Unique Name",
+    "X2 Unique Name",
+    "Y1 Unique Name",
+)
+
 console = Console(highlight=False)
 
 STOP_EVENT = threading.Event()
+THREAD_LOCAL = threading.local()
 
 
 # ============================================================
@@ -322,11 +363,15 @@ class ResponseError(EngineError):
     pass
 
 
+class ResponseTooLarge(EngineError):
+    pass
+
+
 class StopRequested(EngineError):
     pass
 
 
-class ResponseTooLarge(EngineError):
+class ServiceBusyError(EngineError):
     pass
 
 
@@ -341,20 +386,26 @@ class QuerySpec:
     y: tuple[str, ...]
     measures: tuple[str, ...]
 
-    x_captions: tuple[str, ...]
-    y_captions: tuple[str, ...]
-    measure_captions: tuple[str, ...]
-
     mapping_source: str
     query_hash: str
+
+
+@dataclass(frozen=True)
+class Member:
+
+    unique_name: str
+    caption: str
+    hierarchy: str
 
 
 @dataclass(frozen=True)
 class Profile:
 
     name: str
-    engine: str
+    strategy: str
+
     workers: int
+
     x_chunk: int
     y_chunk: int
 
@@ -370,26 +421,44 @@ class RequestTask:
     x_chunk: int
     y_chunk: int
 
-    queued_at: float
+
+@dataclass
+class AxisCatalog:
+
+    x: list[tuple[Member, ...]]
+    y: list[tuple[Member, ...]]
+
+    snapshot: str | None
+    digest: str
+
+    @property
+    def x_count(self):
+
+        return len(self.x)
+
+    @property
+    def y_count(self):
+
+        return len(self.y)
 
 
 # ============================================================
 # GENERAL UTILITIES
 # ============================================================
 
-def utc_now() -> str:
+def utc_now():
 
     return datetime.now(timezone.utc).isoformat(
         timespec="milliseconds"
     )
 
 
-def local_time() -> str:
+def local_time():
 
     return datetime.now().strftime("%H:%M:%S")
 
 
-def elapsed_ms(started: float) -> float:
+def elapsed_ms(started):
 
     return round(
         (time.perf_counter() - started) * 1000,
@@ -397,7 +466,7 @@ def elapsed_ms(started: float) -> float:
     )
 
 
-def format_duration(seconds: float | int) -> str:
+def format_duration(seconds):
 
     seconds = max(0, int(seconds))
 
@@ -407,89 +476,109 @@ def format_duration(seconds: float | int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
-def format_ms(value: Any) -> str:
+def format_ms(value):
 
     if value is None:
-
         return "—"
 
-    value = float(value)
-
     if value >= 1000:
-
         return f"{value / 1000:,.2f}s"
 
-    return f"{value:,.0f}ms"
+    return f"{value:,.1f}ms"
 
 
-def format_bytes(value: int | float) -> str:
+def format_bytes(value):
 
     value = float(value)
 
     for unit in ("B", "KiB", "MiB", "GiB"):
 
         if value < 1024 or unit == "GiB":
-
             return f"{value:,.2f} {unit}"
 
         value /= 1024
 
-    return f"{value:,.2f} GiB"
 
-
-def percentile(values: list[float], percent: float):
+def percentile(values, percent=95):
 
     if not values:
-
         return None
 
     ordered = sorted(values)
 
-    position = max(
-        0,
-        min(
-            len(ordered) - 1,
+    index = min(
+        len(ordered) - 1,
+        max(
+            0,
             math.ceil(
                 len(ordered) * percent / 100
             ) - 1,
         ),
     )
 
-    return round(ordered[position], 3)
+    return round(ordered[index], 3)
 
 
-def mean_or_none(values: list[float]):
+def mean_or_none(values):
 
-    return round(statistics.mean(values), 3) if values else None
-
-
-def normalize_caption(value: str) -> str:
-
-    return re.sub(
-        r"\s+",
-        "",
-        str(value or ""),
-    ).casefold()
+    return (
+        round(statistics.mean(values), 3)
+        if values
+        else None
+    )
 
 
-def read_json(path: Path) -> dict:
+def check_stop(stop_event=None):
+
+    if STOP_EVENT.is_set():
+
+        raise StopRequested(
+            "Stop requested"
+        )
+
+    if stop_event is not None and stop_event.is_set():
+
+        raise StopRequested(
+            "Profile stopped"
+        )
+
+
+def interruptible_sleep(seconds, stop_event=None):
+
+    deadline = time.monotonic() + max(0, seconds)
+
+    while True:
+
+        check_stop(stop_event)
+
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            return
+
+        STOP_EVENT.wait(
+            min(remaining, 0.25)
+        )
+
+
+def read_json(path):
 
     try:
 
-        data = json.loads(
+        result = json.loads(
             path.read_text(
                 encoding="utf-8-sig"
             )
         )
 
-        return data if isinstance(data, dict) else {}
+        return result if isinstance(result, dict) else {}
 
     except (OSError, ValueError, TypeError):
 
         return {}
 
 
-def write_json(path: Path, data: dict) -> None:
+def write_json(path, data):
 
     path.parent.mkdir(
         parents=True,
@@ -508,6 +597,7 @@ def write_json(path: Path, data: dict) -> None:
                 ensure_ascii=False,
                 indent=2,
                 allow_nan=False,
+                default=str,
             ),
             encoding="utf-8",
         )
@@ -521,68 +611,140 @@ def write_json(path: Path, data: dict) -> None:
         )
 
 
-def check_stop() -> None:
+def digest_json(value):
 
-    if STOP_EVENT.is_set():
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
-        raise StopRequested(
-            "Stop requested"
+
+def safe_error(exc):
+
+    if isinstance(exc, EngineError):
+
+        return str(exc)[:300]
+
+    if isinstance(exc, RequestException):
+
+        return (
+            type(exc).__name__
+            + " | CURL="
+            + str(
+                getattr(exc, "code", "UNKNOWN")
+            )
         )
 
+    if isinstance(exc, OSError):
 
-def interruptible_sleep(seconds: float) -> None:
-
-    if STOP_EVENT.wait(max(0, seconds)):
-
-        raise StopRequested(
-            "Stop requested"
+        return (
+            type(exc).__name__
+            + " | errno="
+            + str(exc.errno)
         )
 
+    return type(exc).__name__
 
-def parse_timestamp(value: str | None):
+
+def normalize_caption(value):
+
+    return re.sub(
+        r"\s+",
+        "",
+        str(value or ""),
+    ).casefold()
+
+
+def local_name(tag):
+
+    return tag.rsplit("}", 1)[-1]
+
+
+def canonical_value(value):
+
+    if value is None:
+        return None
+
+    value = str(value).strip()
 
     if not value:
-
         return None
 
     try:
 
-        return datetime.fromisoformat(
-            value.replace("Z", "+00:00")
+        number = Decimal(value)
+
+        if not number.is_finite():
+            return value
+
+        if number == 0:
+            return "0"
+
+        sign, digits, exponent = number.as_tuple()
+
+        digits = list(digits)
+
+        while len(digits) > 1 and digits[-1] == 0:
+
+            digits.pop()
+            exponent += 1
+
+        return str(
+            Decimal(
+                (
+                    sign,
+                    tuple(digits),
+                    exponent,
+                )
+            )
         )
+
+    except InvalidOperation:
+
+        return value
+
+
+def retry_after_seconds(value, default=15.0):
+
+    if not value:
+        return default
+
+    try:
+
+        seconds = float(value)
+
+        if math.isfinite(seconds):
+            return max(0.0, seconds)
 
     except (ValueError, TypeError):
 
-        return None
+        pass
 
+    try:
 
-def safe_error(exc: Exception) -> str:
+        retry_at = parsedate_to_datetime(value)
 
-    # Do not include HTTP headers, request dumps,
-    # cookies, JWTs or complete server responses.
+        if retry_at.tzinfo is None:
 
-    if isinstance(
-        exc,
-        (
-            AuthenticationError,
-            ResponseError,
-            ResponseTooLarge,
-            StopRequested,
-        ),
-    ):
+            retry_at = retry_at.replace(
+                tzinfo=timezone.utc
+            )
 
-        return str(exc)[:200]
-
-    if isinstance(exc, RequestException):
-
-        code = getattr(exc, "code", None)
-
-        return (
-            f"{type(exc).__name__}"
-            + (f" | curl code={code}" if code else "")
+        return max(
+            0.0,
+            (
+                retry_at
+                - datetime.now(timezone.utc)
+            ).total_seconds(),
         )
 
-    return type(exc).__name__
+    except Exception:
+
+        return default
 
 
 # ============================================================
@@ -599,20 +761,13 @@ def parse_args():
         "--workers",
         type=int,
         default=DEFAULT_WORKERS,
-        help=(
-            "Maximum parallel workers "
-            f"(1-{MAX_WORKERS})"
-        ),
+        help=f"Maximum workers: 1-{MAX_WORKERS}",
     )
 
     parser.add_argument(
         "--mode",
         choices=("benchmark", "run"),
         default="benchmark",
-        help=(
-            "Benchmark the fixed MV/FY query "
-            "or extract its full dataset"
-        ),
     )
 
     args = parser.parse_args()
@@ -630,7 +785,7 @@ def parse_args():
 # ENVIRONMENT
 # ============================================================
 
-def load_env() -> dict[str, str]:
+def load_env():
 
     values = dict(os.environ)
 
@@ -643,15 +798,12 @@ def load_env() -> dict[str, str]:
             line = line.strip()
 
             if not line or line.startswith("#"):
-
                 continue
 
             if line.startswith("export "):
-
                 line = line[7:].strip()
 
             if "=" not in line:
-
                 continue
 
             key, value = line.split("=", 1)
@@ -669,21 +821,19 @@ def load_env() -> dict[str, str]:
 
             values[key] = value
 
-    cookie = values.get(
+    if not values.get(
         "OIC_COOKIE",
         "",
-    ).strip()
-
-    if not cookie:
+    ).strip():
 
         raise AuthenticationError(
-            "OIC_COOKIE is missing from .env"
+            "OIC_COOKIE missing from .env"
         )
 
     return values
 
 
-def jwt_exp(token: str) -> int:
+def jwt_exp(token):
 
     try:
 
@@ -694,7 +844,6 @@ def jwt_exp(token: str) -> int:
         parts = token.split(".")
 
         if len(parts) != 3:
-
             return 0
 
         payload = parts[1]
@@ -703,11 +852,11 @@ def jwt_exp(token: str) -> int:
             (-len(payload)) % 4
         )
 
-        decoded = base64.urlsafe_b64decode(
-            payload.encode("ascii")
+        data = json.loads(
+            base64.urlsafe_b64decode(
+                payload.encode("ascii")
+            )
         )
-
-        data = json.loads(decoded)
 
         return int(data.get("exp", 0))
 
@@ -717,32 +866,33 @@ def jwt_exp(token: str) -> int:
 
 
 # ============================================================
-# VERIFIED FIXED QUERY
+# VERIFIED FIELD MAPPING
 # ============================================================
 
-def catalog_timestamp(data: dict) -> str:
-
-    return str(
-        data.get("report_updated_at")
-        or data.get("updated_at")
-        or data.get("finished_at")
-        or data.get("refreshed_at")
-        or ""
-    )
-
-
-def valid_catalog(data: dict) -> bool:
+def valid_catalog(data):
 
     return (
         data.get(
             "code",
             data.get("insurance_code"),
         ) == CATEGORY
-        and data.get("cube_type", "FY") == CUBE_TYPE
+
+        and data.get(
+            "cube_type",
+            "FY",
+        ) == CUBE_TYPE
+
         and data.get("catalog") == CATALOG
+
         and data.get("cube") == CUBE
-        and isinstance(data.get("fields"), list)
+
+        and isinstance(
+            data.get("fields"),
+            list,
+        )
+
         and bool(data["fields"])
+
         and data.get("status") not in (
             "ERROR",
             "UNAVAILABLE",
@@ -751,40 +901,33 @@ def valid_catalog(data: dict) -> bool:
 
 
 def selectable_verified_field(
-    field: dict,
-    expected_type: str,
-) -> bool:
+    field,
+    expected_type,
+):
 
     if field.get("type") != expected_type:
-
         return False
 
     if field.get("status") != "VERIFIED":
-
         return False
 
     if field.get("source") == "PROFILE":
-
         return False
 
     if field.get("verification_method") != "XMLA_EXECUTE":
-
         return False
 
     if not field.get("verified_at"):
-
         return False
 
     mdx = field.get("mdx")
 
     if not isinstance(mdx, str):
-
         return False
 
     if expected_type == "MEASURE":
 
         if not MEASURE_PATTERN.fullmatch(mdx):
-
             return False
 
         details = field.get("details") or {}
@@ -821,7 +964,7 @@ def selectable_verified_field(
 
         return False
 
-    elif mdx.startswith("[Measures]."):
+    elif mdx.casefold().startswith("[measures]."):
 
         return False
 
@@ -829,34 +972,29 @@ def selectable_verified_field(
 
 
 def resolve_field(
-    fields: list[dict],
-    caption: str,
-    expected_type: str,
-) -> str:
+    fields,
+    caption,
+    expected_type,
+):
 
     target = normalize_caption(caption)
 
-    matches = []
+    matches = [
+        field
+        for field in fields
+        if normalize_caption(
+            field.get(
+                "caption",
+                field.get("display", ""),
+            )
+        ) == target
 
-    for field in fields:
-
-        name = field.get(
-            "caption",
-            field.get("display", ""),
-        )
-
-        if normalize_caption(name) != target:
-
-            continue
-
-        if selectable_verified_field(
+        and selectable_verified_field(
             field,
             expected_type,
-        ):
+        )
+    ]
 
-            matches.append(field)
-
-    # Prefer original OIC captions over additional XMLA metadata.
     original = [
         field
         for field in matches
@@ -864,7 +1002,6 @@ def resolve_field(
     ]
 
     if original:
-
         matches = original
 
     identifiers = {
@@ -875,22 +1012,19 @@ def resolve_field(
     if not identifiers:
 
         raise EngineError(
-            f"Missing verified {expected_type} mapping: "
-            f"{caption}"
+            f"Missing verified {expected_type}: {caption}"
         )
 
     if len(identifiers) != 1:
 
         raise EngineError(
-            f"Ambiguous verified mapping: {caption}"
+            f"Ambiguous field mapping: {caption}"
         )
 
     return next(iter(identifiers))
 
 
-def load_fixed_query() -> QuerySpec:
-
-    candidates = []
+def load_fixed_query():
 
     recovery_dir = (
         ROOT
@@ -905,21 +1039,29 @@ def load_fixed_query() -> QuerySpec:
         ),
     ]
 
+    candidates = []
+
     for path in paths:
 
         if not path.is_file():
-
             continue
 
         data = read_json(path)
 
         if not valid_catalog(data):
-
             continue
+
+        updated_at = str(
+            data.get("report_updated_at")
+            or data.get("updated_at")
+            or data.get("finished_at")
+            or data.get("refreshed_at")
+            or ""
+        )
 
         candidates.append(
             (
-                catalog_timestamp(data),
+                updated_at,
                 path.stat().st_mtime_ns,
                 path,
                 data,
@@ -929,12 +1071,9 @@ def load_fixed_query() -> QuerySpec:
     if not candidates:
 
         raise EngineError(
-            "No valid local MV/FY verification catalog found. "
-            "Export the verified catalog or retain "
-            "output/field_verification/MV_FY.json."
+            "Verified MV/FY catalog not found"
         )
 
-    # Use the newest valid catalog.
     _, _, path, catalog = max(
         candidates,
         key=lambda item: item[:2],
@@ -978,10 +1117,10 @@ def load_fixed_query() -> QuerySpec:
     if len(set(measures)) != len(measures):
 
         raise EngineError(
-            "Duplicate measure identifiers"
+            "Duplicate measures"
         )
 
-    canonical = {
+    query_hash = digest_json({
         "category": CATEGORY,
         "cube_type": CUBE_TYPE,
         "catalog": CATALOG,
@@ -990,33 +1129,110 @@ def load_fixed_query() -> QuerySpec:
         "y": y,
         "measures": measures,
         "schema_version": 2,
-    }
-
-    query_hash = hashlib.sha256(
-        json.dumps(
-            canonical,
-            sort_keys=True,
-            ensure_ascii=False,
-        ).encode("utf-8")
-    ).hexdigest()[:16]
+    })[:16]
 
     return QuerySpec(
         x=x,
         y=y,
         measures=measures,
-        x_captions=X_CAPTIONS,
-        y_captions=Y_CAPTIONS,
-        measure_captions=MEASURE_CAPTIONS,
         mapping_source=str(path),
         query_hash=query_hash,
     )
 
 
 # ============================================================
-# CURL SESSION
+# GLOBAL REQUEST CONTROL
 # ============================================================
 
-def create_session(cookie: str):
+class RequestControl:
+
+    def __init__(self):
+
+        self.lock = threading.Lock()
+
+        self.next_request_at = 0.0
+        self.cooldown_until = 0.0
+
+        self.cooldown_reason = ""
+        self.service_busy = False
+
+    def wait_slot(self, stop_event=None):
+
+        started = time.perf_counter()
+
+        while True:
+
+            check_stop(stop_event)
+
+            with self.lock:
+
+                if self.service_busy:
+
+                    raise ServiceBusyError(
+                        "Server requested backoff; "
+                        "current run stopped"
+                    )
+
+                now = time.monotonic()
+
+                allowed_at = max(
+                    self.next_request_at,
+                    self.cooldown_until,
+                )
+
+                remaining = allowed_at - now
+
+                if remaining <= 0:
+
+                    self.next_request_at = (
+                        now
+                        + 1.0 / MAX_REQUESTS_PER_SECOND
+                    )
+
+                    return elapsed_ms(started)
+
+            interruptible_sleep(
+                min(remaining, 0.25),
+                stop_event,
+            )
+
+    def set_cooldown(
+        self,
+        seconds,
+        reason,
+        *,
+        halt=False,
+    ):
+
+        with self.lock:
+
+            self.cooldown_until = max(
+                self.cooldown_until,
+                time.monotonic()
+                + max(0, seconds),
+            )
+
+            self.cooldown_reason = reason
+
+            if halt:
+                self.service_busy = True
+
+    def remaining(self):
+
+        with self.lock:
+
+            return max(
+                0.0,
+                self.cooldown_until
+                - time.monotonic(),
+            )
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
+def create_session(cookie):
 
     session = curl_requests.Session(
         verify=True,
@@ -1039,7 +1255,6 @@ def create_session(cookie: str):
         )
 
         if not separator or not name:
-
             continue
 
         session.cookies.set(
@@ -1054,125 +1269,15 @@ def create_session(cookie: str):
 
 
 # ============================================================
-# GLOBAL REQUEST CONTROL
-# ============================================================
-
-class RequestControl:
-
-    def __init__(self):
-
-        self.lock = threading.Lock()
-
-        self.next_request_at = 0.0
-        self.cooldown_until = 0.0
-
-        self.cooldown_reason = ""
-
-    def wait_slot(self) -> float:
-
-        started = time.perf_counter()
-
-        while True:
-
-            check_stop()
-
-            with self.lock:
-
-                now = time.monotonic()
-
-                allowed_at = max(
-                    self.next_request_at,
-                    self.cooldown_until,
-                )
-
-                remaining = allowed_at - now
-
-                if remaining <= 0:
-
-                    self.next_request_at = (
-                        now
-                        + 1.0 / MAX_REQUESTS_PER_SECOND
-                    )
-
-                    return elapsed_ms(started)
-
-            interruptible_sleep(
-                min(0.25, remaining)
-            )
-
-    def set_cooldown(
-        self,
-        seconds: float,
-        reason: str,
-    ):
-
-        with self.lock:
-
-            self.cooldown_until = max(
-                self.cooldown_until,
-                time.monotonic() + max(0, seconds),
-            )
-
-            self.cooldown_reason = reason
-
-    def remaining(self) -> float:
-
-        with self.lock:
-
-            return max(
-                0.0,
-                self.cooldown_until
-                - time.monotonic(),
-            )
-
-
-def retry_after_seconds(
-    value: str | None,
-    default: float,
-) -> float:
-
-    if not value:
-
-        return default
-
-    try:
-
-        return max(
-            0,
-            float(value),
-        )
-
-    except ValueError:
-
-        pass
-
-    try:
-
-        retry_at = parsedate_to_datetime(value)
-
-        return max(
-            0.0,
-            (
-                retry_at
-                - datetime.now(timezone.utc)
-            ).total_seconds(),
-        )
-
-    except Exception:
-
-        return default
-
-
-# ============================================================
-# AUTHENTICATION
+# AUTHENTICATION MANAGER
 # ============================================================
 
 class AuthenticationManager:
 
     def __init__(
         self,
-        env: dict,
-        control: RequestControl,
+        env,
+        control,
     ):
 
         self.cookie = env["OIC_COOKIE"]
@@ -1184,43 +1289,72 @@ class AuthenticationManager:
             "Bearer "
         ).strip()
 
-        self.lock = threading.Lock()
-
         self.control = control
+
+        self.lock = threading.Lock()
 
         self.refresh_count = 0
         self.refresh_total_ms = 0.0
 
-    def refresh_token(self, session) -> float:
+    def refresh_token(
+        self,
+        session,
+        stop_event=None,
+    ):
 
         started = time.perf_counter()
 
-        self.control.wait_slot()
+        self.control.wait_slot(
+            stop_event
+        )
 
         response = session.post(
             TOKEN_URL,
+
             json={
                 "_tk": "Init",
+
                 "_pageUrl": (
                     PAGE_PATH
                     + f"?Class={OIC_CLASS}"
                 ),
             },
+
             headers=TOKEN_HEADERS,
+
             timeout=(
                 CONNECT_TIMEOUT,
                 45,
             ),
+
             allow_redirects=False,
         )
 
         try:
 
-            if response.status_code != 200:
+            status = response.status_code
+
+            if status in (429, 503):
+
+                self.control.set_cooldown(
+                    retry_after_seconds(
+                        response.headers.get(
+                            "Retry-After"
+                        ),
+                        30,
+                    ),
+                    f"GenToken HTTP {status}",
+                    halt=True,
+                )
+
+                raise ServiceBusyError(
+                    f"GenToken HTTP {status}"
+                )
+
+            if status != 200:
 
                 raise AuthenticationError(
-                    "GenToken HTTP "
-                    f"{response.status_code}"
+                    f"GenToken HTTP {status}"
                 )
 
             try:
@@ -1255,7 +1389,7 @@ class AuthenticationManager:
             if jwt_exp(token) <= time.time() + 30:
 
                 raise AuthenticationError(
-                    "GenToken returned invalid or expired JWT"
+                    "Invalid or expired JWT"
                 )
 
             self.token = token
@@ -1263,7 +1397,6 @@ class AuthenticationManager:
             duration = elapsed_ms(started)
 
             self.refresh_count += 1
-
             self.refresh_total_ms += duration
 
             return duration
@@ -1275,21 +1408,26 @@ class AuthenticationManager:
     def get_token(
         self,
         session,
-        *,
-        rejected_token: str | None = None,
-    ) -> tuple[str, float, float]:
+        rejected_token=None,
+        stop_event=None,
+    ):
 
-        waiting = time.perf_counter()
+        started = time.perf_counter()
 
         with self.lock:
 
-            lock_wait_ms = elapsed_ms(waiting)
+            check_stop(stop_event)
+
+            lock_wait_ms = elapsed_ms(
+                started
+            )
 
             refresh_ms = 0.0
 
             expired = (
                 jwt_exp(self.token)
-                <= time.time() + TOKEN_REFRESH_MARGIN
+                <= time.time()
+                + TOKEN_REFRESH_MARGIN
             )
 
             rejected = (
@@ -1299,10 +1437,9 @@ class AuthenticationManager:
 
             if expired or rejected:
 
-                check_stop()
-
                 refresh_ms = self.refresh_token(
-                    session
+                    session,
+                    stop_event,
                 )
 
             return (
@@ -1313,17 +1450,21 @@ class AuthenticationManager:
 
 
 # ============================================================
-# MDX BUILDER
+# MDX QUERY OPTIMIZATION
 # ============================================================
 
-def build_axis_set(
-    identifiers: tuple[str, ...],
-) -> str:
+def build_axis_set(identifiers):
 
     members = [
         identifier + ".AllMembers"
         for identifier in identifiers
     ]
+
+    if not members:
+
+        raise EngineError(
+            "Empty dimension set"
+        )
 
     result = members[0]
 
@@ -1336,25 +1477,113 @@ def build_axis_set(
     return result
 
 
-def build_mdx(
-    query: QuerySpec,
-    task: RequestTask,
-) -> str:
+def validate_member_identifier(value):
+
+    if not MEMBER_PATTERN.fullmatch(value):
+
+        raise ResponseError(
+            "Unsupported member identifier syntax"
+        )
+
+    return value
+
+
+def build_explicit_set(members):
+
+    items = []
+
+    for member_tuple in members:
+
+        identifiers = [
+            validate_member_identifier(
+                member.unique_name
+            )
+            for member in member_tuple
+        ]
+
+        if len(identifiers) == 1:
+
+            items.append(
+                identifiers[0]
+            )
+
+        else:
+
+            items.append(
+                "("
+                + ",".join(identifiers)
+                + ")"
+            )
+
+    if not items:
+
+        raise EngineError(
+            "Cannot build empty MDX member set"
+        )
+
+    return (
+        "{"
+        + ",".join(items)
+        + "}"
+    )
+
+
+def build_count_mdx(query):
 
     x_set = build_axis_set(query.x)
     y_set = build_axis_set(query.y)
 
-    x = (
-        f"Subset({x_set},"
-        f"{task.x_offset},"
-        f"{task.x_chunk})"
+    return (
+        "WITH "
+        "MEMBER [Measures].[__LoadEngineXCount] "
+        f"AS Count({x_set}) "
+
+        "MEMBER [Measures].[__LoadEngineYCount] "
+        f"AS Count({y_set}) "
+
+        "SELECT {"
+        "[Measures].[__LoadEngineXCount],"
+        "[Measures].[__LoadEngineYCount]"
+        "} ON COLUMNS "
+
+        f"FROM [{CUBE}] "
+
+        "CELL PROPERTIES VALUE"
     )
 
-    y = (
-        f"Subset({y_set},"
-        f"{task.y_offset},"
-        f"{task.y_chunk})"
+
+def build_axis_discovery_mdx(identifiers):
+
+    axis_set = build_axis_set(
+        identifiers
     )
+
+    return (
+        "WITH "
+        "MEMBER [Measures].[__LoadEngineAxis] AS 0 "
+
+        "SELECT "
+        "{[Measures].[__LoadEngineAxis]} "
+        "ON COLUMNS, "
+
+        f"{axis_set} "
+
+        "DIMENSION PROPERTIES "
+        "HIERARCHY_UNIQUE_NAME "
+        "ON ROWS "
+
+        f"FROM [{CUBE}] "
+
+        "CELL PROPERTIES VALUE"
+    )
+
+
+def build_mdx(
+    query,
+    axes,
+    task,
+    strategy,
+):
 
     measures = (
         "{"
@@ -1362,47 +1591,89 @@ def build_mdx(
         + "}"
     )
 
-    return (
-        f"SELECT {y} "
-        "DIMENSION PROPERTIES "
-        "PARENT_UNIQUE_NAME,"
-        "HIERARCHY_UNIQUE_NAME,"
-        "MEMBER_VALUE ON COLUMNS, "
-        f"CrossJoin({x},{measures}) "
-        "DIMENSION PROPERTIES "
-        "PARENT_UNIQUE_NAME,"
-        "HIERARCHY_UNIQUE_NAME,"
-        "MEMBER_VALUE ON ROWS "
-        f"FROM [{CUBE}] "
-        "CELL PROPERTIES "
-        "VALUE,FORMAT_STRING,LANGUAGE"
+    if strategy == "subset":
+
+        x_set = (
+            f"Subset("
+            f"{build_axis_set(query.x)},"
+            f"{task.x_offset},"
+            f"{task.x_chunk})"
+        )
+
+        y_set = (
+            f"Subset("
+            f"{build_axis_set(query.y)},"
+            f"{task.y_offset},"
+            f"{task.y_chunk})"
+        )
+
+        return (
+            f"SELECT {y_set} "
+
+            "DIMENSION PROPERTIES "
+            "PARENT_UNIQUE_NAME,"
+            "HIERARCHY_UNIQUE_NAME,"
+            "MEMBER_VALUE ON COLUMNS, "
+
+            f"CrossJoin({x_set},{measures}) "
+
+            "DIMENSION PROPERTIES "
+            "PARENT_UNIQUE_NAME,"
+            "HIERARCHY_UNIQUE_NAME,"
+            "MEMBER_VALUE ON ROWS "
+
+            f"FROM [{CUBE}] "
+
+            "CELL PROPERTIES "
+            "VALUE,FORMAT_STRING,LANGUAGE"
+        )
+
+    if strategy != "explicit":
+
+        raise EngineError(
+            f"Unknown MDX strategy: {strategy}"
+        )
+
+    x_members = axes.x[
+        task.x_offset:
+        task.x_offset + task.x_chunk
+    ]
+
+    y_members = axes.y[
+        task.y_offset:
+        task.y_offset + task.y_chunk
+    ]
+
+    x_set = build_explicit_set(
+        x_members
     )
 
+    y_set = build_explicit_set(
+        y_members
+    )
 
-def build_count_mdx(
-    query: QuerySpec,
-) -> str:
-
-    x_set = build_axis_set(query.x)
-
-    y_set = build_axis_set(query.y)
+    # Avoid repeatedly evaluating the entire
+    # CrossJoin and Subset expression.
+    #
+    # Preserve original members and measures.
+    # Do not apply NON EMPTY automatically.
+    #
+    # Reduced properties must pass the
+    # dataset equivalence benchmark.
 
     return (
-        "WITH "
-        "MEMBER [Measures].[__LoadEngineXCount] "
-        f"AS Count({x_set}) "
-        "MEMBER [Measures].[__LoadEngineYCount] "
-        f"AS Count({y_set}) "
-        "SELECT {"
-        "[Measures].[__LoadEngineXCount],"
-        "[Measures].[__LoadEngineYCount]"
-        "} ON COLUMNS "
+        f"SELECT {y_set} ON COLUMNS, "
+
+        f"CrossJoin({x_set},{measures}) "
+        "ON ROWS "
+
         f"FROM [{CUBE}] "
+
         "CELL PROPERTIES VALUE"
     )
 
 
-def build_soap(mdx: str) -> bytes:
+def build_soap(mdx):
 
     envelope = ET.Element(
         f"{{{SOAP_NS}}}Envelope"
@@ -1455,13 +1726,10 @@ def build_soap(mdx: str) -> bytes:
 
 
 # ============================================================
-# CURL TIMING EXTRACTION
+# CURL TIMING INFORMATION
 # ============================================================
 
-def get_curl_info(
-    response,
-    name: str,
-):
+def get_curl_info(response, name):
 
     enum = getattr(
         CurlInfo,
@@ -1470,21 +1738,15 @@ def get_curl_info(
     )
 
     if enum is None:
-
         return None
 
-    infos = getattr(
-        response,
-        "infos",
-        {},
-    ) or {}
-
-    return infos.get(enum)
+    return (
+        getattr(response, "infos", {})
+        or {}
+    ).get(enum)
 
 
-def extract_curl_timings(
-    response,
-) -> dict:
+def extract_curl_timings(response):
 
     def milliseconds(name):
 
@@ -1494,10 +1756,22 @@ def extract_curl_timings(
         )
 
         if not isinstance(value, (int, float)):
-
             return None
 
-        return round(value * 1000, 3)
+        return round(
+            value * 1000,
+            3,
+        )
+
+    def difference(end, start):
+
+        if end is None or start is None:
+            return None
+
+        return round(
+            max(0.0, end - start),
+            3,
+        )
 
     dns = milliseconds(
         "NAMELOOKUP_TIME"
@@ -1523,46 +1797,44 @@ def extract_curl_timings(
         "TOTAL_TIME"
     )
 
-    downloaded = get_curl_info(
-        response,
-        "SIZE_DOWNLOAD_T",
-    )
-
     connections = get_curl_info(
         response,
         "NUM_CONNECTS",
     )
 
-    def difference(a, b):
+    downloaded = get_curl_info(
+        response,
+        "SIZE_DOWNLOAD_T",
+    )
 
-        if a is None or b is None:
+    uploaded = get_curl_info(
+        response,
+        "SIZE_UPLOAD_T",
+    )
 
-            return None
-
-        return round(
-            max(0.0, a - b),
-            3,
-        )
+    reused = connections == 0
 
     return {
-        "dns_ms": dns,
-
-        "connect_ms": difference(
-            connect,
-            dns,
+        "dns_ms": (
+            0.0 if reused else dns
         ),
 
-        "tls_ms": difference(
-            tls,
-            connect,
+        "connect_ms": (
+            0.0
+            if reused
+            else difference(connect, dns)
+        ),
+
+        "tls_ms": (
+            0.0
+            if reused or tls == 0
+            else difference(tls, connect)
         ),
 
         "pretransfer_ms": pretransfer,
 
         "ttfb_ms": ttfb,
 
-        # Includes network transit and upstream processing.
-        # This is not a measurement of pure OLAP CPU time.
         "response_wait_estimate_ms": difference(
             ttfb,
             pretransfer,
@@ -1572,19 +1844,34 @@ def extract_curl_timings(
 
         "download_bytes": (
             int(downloaded)
-            if isinstance(downloaded, (int, float))
+            if isinstance(
+                downloaded,
+                (int, float),
+            )
+            else None
+        ),
+
+        "upload_bytes": (
+            int(uploaded)
+            if isinstance(
+                uploaded,
+                (int, float),
+            )
             else None
         ),
 
         "new_connections": (
             int(connections)
-            if isinstance(connections, (int, float))
+            if isinstance(
+                connections,
+                (int, float),
+            )
             else None
         ),
     }
 
 
-def http_version_name(value) -> str:
+def http_version_name(value):
 
     versions = {
         0: "UNKNOWN",
@@ -1607,26 +1894,28 @@ def http_version_name(value) -> str:
 
 
 # ============================================================
-# HIGH-PERFORMANCE HTTP EXECUTION
+# NATIVE CALLBACK REQUEST ENGINE
 # ============================================================
 
 def execute_request(
     session,
-    token: str,
-    payload: bytes,
-    destination: Path,
-    engine: str,
-) -> dict:
+    token,
+    payload,
+    destination,
+    *,
+    timeout=REQUEST_TIMEOUT,
+    stop_event=None,
+):
 
     started = time.perf_counter()
-
-    temporary = destination.with_name(
-        destination.name + ".partial"
-    )
 
     destination.parent.mkdir(
         parents=True,
         exist_ok=True,
+    )
+
+    temporary = destination.with_name(
+        destination.name + ".partial"
     )
 
     headers = dict(XMLA_HEADERS)
@@ -1639,38 +1928,30 @@ def execute_request(
 
     response_bytes = 0
 
-    file_write_ms = 0.0
-
     first_body_at = None
-    first_body_ms = None
     last_body_at = None
 
-    header_wait_ms = None
+    file_write_ms = 0.0
     finalize_ms = None
 
     limit_exceeded = False
     callback_error = None
-
-    status = None
-    content_type = ""
-    content_encoding = ""
-
-    metrics = {}
 
     try:
 
         with temporary.open(
             "wb",
             buffering=256 * 1024,
-        ) as file:
+        ) as handle:
 
-            def content_callback(chunk: bytes):
+            transfer_started = time.perf_counter()
+
+            def content_callback(chunk):
 
                 nonlocal response_bytes
-                nonlocal file_write_ms
                 nonlocal first_body_at
-                nonlocal first_body_ms
                 nonlocal last_body_at
+                nonlocal file_write_ms
                 nonlocal limit_exceeded
                 nonlocal callback_error
 
@@ -1678,22 +1959,21 @@ def execute_request(
 
                     return 0
 
+                if (
+                    stop_event is not None
+                    and stop_event.is_set()
+                ):
+
+                    return 0
+
                 if not chunk:
 
                     return 0
 
-                now = time.perf_counter()
-
                 if first_body_at is None:
 
-                    first_body_at = now
-
-                    first_body_ms = round(
-                        (
-                            now
-                            - transfer_started
-                        ) * 1000,
-                        3,
+                    first_body_at = (
+                        time.perf_counter()
                     )
 
                 response_bytes += len(chunk)
@@ -1704,11 +1984,15 @@ def execute_request(
 
                     return 0
 
-                write_started = time.perf_counter()
+                write_started = (
+                    time.perf_counter()
+                )
 
                 try:
 
-                    written = file.write(chunk)
+                    written = handle.write(
+                        chunk
+                    )
 
                 except OSError as exc:
 
@@ -1718,239 +2002,148 @@ def execute_request(
 
                 finally:
 
-                    file_write_ms += elapsed_ms(
-                        write_started
-                    )
+                    file_write_ms += (
+                        time.perf_counter()
+                        - write_started
+                    ) * 1000
 
-                last_body_at = time.perf_counter()
+                last_body_at = (
+                    time.perf_counter()
+                )
 
                 return written
 
-            transfer_started = time.perf_counter()
+            response = session.post(
+                XMLA_URL,
 
-            if engine == "callback":
+                data=payload,
 
-                # Native libcurl callback avoids the
-                # streaming iterator's intermediate queue.
-                #
-                # Curl timing reference:
-                # https://curl-cffi.readthedocs.io/en/stable/api.html
+                headers=headers,
 
-                response = session.post(
-                    XMLA_URL,
-                    data=payload,
-                    headers=headers,
-                    content_callback=content_callback,
-                    timeout=(
-                        CONNECT_TIMEOUT,
-                        REQUEST_TIMEOUT,
-                    ),
-                    allow_redirects=False,
-                    accept_encoding="gzip, deflate, br",
-                )
+                content_callback=content_callback,
 
-                # curl_infos are collected after the
-                # synchronous transfer completes.
-                metrics = extract_curl_timings(
-                    response
-                )
+                timeout=(
+                    CONNECT_TIMEOUT,
+                    timeout,
+                ),
 
-            elif engine == "iterator":
+                allow_redirects=False,
 
-                # Reference engine: matches the existing
-                # collector's streaming iterator approach.
-
-                with session.stream(
-                    "POST",
-                    XMLA_URL,
-                    data=payload,
-                    headers=headers,
-                    timeout=(
-                        CONNECT_TIMEOUT,
-                        REQUEST_TIMEOUT,
-                    ),
-                    allow_redirects=False,
-                    accept_encoding="gzip, deflate, br",
-                ) as stream_response:
-
-                    response = stream_response
-
-                    header_wait_ms = elapsed_ms(
-                        transfer_started
-                    )
-
-                    for chunk in response.iter_content():
-
-                        if not chunk:
-
-                            continue
-
-                        written = content_callback(
-                            chunk
-                        )
-
-                        if written != len(chunk):
-
-                            if STOP_EVENT.is_set():
-
-                                raise StopRequested(
-                                    "Request interrupted"
-                                )
-
-                            if limit_exceeded:
-
-                                raise ResponseTooLarge(
-                                    "Response exceeded configured limit"
-                                )
-
-                            raise ResponseError(
-                                "Response write failed"
-                            )
-
-                # Streaming response timing snapshots
-                # may not represent the final transfer.
-                # Do not report unavailable CurlInfo values.
-                metrics = {
-                    "transfer_ms": elapsed_ms(
-                        transfer_started
-                    ),
-                }
-
-            else:
-
-                raise EngineError(
-                    "Unknown HTTP engine"
-                )
+                accept_encoding=(
+                    "gzip, deflate, br"
+                ),
+            )
 
             transfer_wall_ms = elapsed_ms(
                 transfer_started
             )
 
+            timings = extract_curl_timings(
+                response
+            )
+
             flush_started = time.perf_counter()
 
-            file.flush()
+            handle.flush()
 
-            file_write_ms += elapsed_ms(
-                flush_started
-            )
+            file_write_ms += (
+                time.perf_counter()
+                - flush_started
+            ) * 1000
 
-        if STOP_EVENT.is_set():
-
-            raise StopRequested(
-                "Request interrupted"
-            )
+        check_stop(stop_event)
 
         if limit_exceeded:
 
             raise ResponseTooLarge(
-                "Response exceeded configured limit"
+                "XMLA response exceeded local size limit"
             )
 
-        if callback_error is not None:
+        if callback_error:
 
             raise ResponseError(
-                "Unable to write XML response"
+                "Unable to save XML response"
             )
 
         status = int(
             response.status_code
         )
 
-        content_type = response.headers.get(
-            "Content-Type",
-            "",
-        )
-
-        content_encoding = response.headers.get(
-            "Content-Encoding",
-            "",
-        )
-
-        retry_after = response.headers.get(
-            "Retry-After"
-        )
-
-        version = getattr(
-            response,
-            "http_version",
-            None,
-        )
-
         if status == 200:
 
-            finalize_started = time.perf_counter()
+            finalize_started = (
+                time.perf_counter()
+            )
 
-            temporary.replace(destination)
+            temporary.replace(
+                destination
+            )
 
             finalize_ms = elapsed_ms(
                 finalize_started
             )
 
-        # Callback API does not expose the exact
-        # headers-complete timestamp.
-        # Keep header_wait_ms unavailable in callback mode.
-        # TTFB and first_body_ms are measured separately.
+        first_body_ms = (
+            round(
+                (
+                    first_body_at
+                    - transfer_started
+                ) * 1000,
+                3,
+            )
+            if first_body_at is not None
+            else None
+        )
 
-        receive_ms = None
-
-        if (
-            first_body_at is not None
-            and last_body_at is not None
-        ):
-
-            receive_ms = round(
+        receive_ms = (
+            round(
                 (
                     last_body_at
                     - first_body_at
                 ) * 1000,
                 3,
             )
-
-        download_bytes = metrics.get(
-            "download_bytes"
+            if (
+                first_body_at is not None
+                and last_body_at is not None
+            )
+            else None
         )
 
-        download_kib_per_sec = None
-
-        if (
-            download_bytes is not None
-            and metrics.get("transfer_ms")
-            and metrics.get("ttfb_ms") is not None
-        ):
-
-            download_duration = max(
-                0.0,
-                metrics["transfer_ms"]
-                - metrics["ttfb_ms"],
-            )
-
-            if download_duration > 0:
-
-                download_kib_per_sec = round(
-                    download_bytes / 1024
-                    / (download_duration / 1000),
-                    3,
-                )
-
         return {
-            **metrics,
+            **timings,
 
             "http_status": status,
 
             "http_version": http_version_name(
-                version
+                getattr(
+                    response,
+                    "http_version",
+                    None,
+                )
             ),
 
-            "content_type": content_type,
-            "content_encoding": content_encoding,
+            "content_type": response.headers.get(
+                "Content-Type",
+                "",
+            ),
 
-            "retry_after": retry_after,
+            "content_encoding": response.headers.get(
+                "Content-Encoding",
+                "",
+            ),
 
-            "header_wait_ms": header_wait_ms,
+            "retry_after": response.headers.get(
+                "Retry-After"
+            ),
+
+            # Native callback exposes exact libcurl
+            # first-byte timing, not an independent
+            # headers-complete event.
+            "header_wait_ms": None,
 
             "first_body_ms": first_body_ms,
 
-            # Includes callback/file handling time.
             "receive_ms": receive_ms,
 
             "file_write_ms": round(
@@ -1966,10 +2159,6 @@ def execute_request(
 
             "response_bytes": response_bytes,
 
-            "download_kib_per_sec": (
-                download_kib_per_sec
-            ),
-
             "response_file": (
                 str(destination)
                 if status == 200
@@ -1979,22 +2168,18 @@ def execute_request(
 
     except RequestException:
 
-        if STOP_EVENT.is_set():
-
-            raise StopRequested(
-                "Request interrupted"
-            )
+        check_stop(stop_event)
 
         if limit_exceeded:
 
             raise ResponseTooLarge(
-                "Response exceeded configured limit"
+                "Response exceeded local byte limit"
             )
 
-        if callback_error is not None:
+        if callback_error:
 
             raise ResponseError(
-                "Unable to write XML response"
+                "XML file write failed"
             )
 
         raise
@@ -2017,34 +2202,35 @@ def execute_request(
 
 
 # ============================================================
-# XMLA RESPONSE PROCESSING
+# XMLA PARSER
 # ============================================================
 
-def local_name(tag: str) -> str:
-
-    return tag.rsplit("}", 1)[-1]
-
-
-def load_xml_dataset(
-    path: Path,
-):
+def load_xml_dataset(path):
 
     try:
 
-        root = ET.parse(path).getroot()
+        root = ET.parse(
+            path
+        ).getroot()
 
-    except (OSError, ET.ParseError) as exc:
+    except (
+        OSError,
+        ET.ParseError,
+    ) as exc:
 
         raise ResponseError(
-            "Invalid XML response"
+            "Invalid XMLA response"
         ) from exc
 
     for element in root.iter():
 
-        if local_name(element.tag) == "Fault":
+        if local_name(element.tag) in (
+            "Fault",
+            "Error",
+        ):
 
             raise ResponseError(
-                "XMLA SOAP Fault"
+                "XMLA response contains SOAP or OLAP error"
             )
 
     dataset = root.find(
@@ -2057,21 +2243,10 @@ def load_xml_dataset(
             "XMLA multidimensional dataset missing"
         )
 
-    for element in dataset.iter():
-
-        if local_name(element.tag) == "Error":
-
-            raise ResponseError(
-                "XMLA dataset contains an error"
-            )
-
     return root, dataset
 
 
-def read_axis(
-    dataset,
-    axis_name: str,
-) -> list[list[dict]]:
+def read_axis(dataset, axis_name):
 
     axis = dataset.find(
         f"./{{{MD_NS}}}Axes/"
@@ -2105,29 +2280,33 @@ def read_axis(
             if not unique_name:
 
                 raise ResponseError(
-                    "XMLA member has no unique identifier"
+                    "XMLA member has no unique name"
                 )
 
-            members.append({
-                "hierarchy": member.get(
-                    "Hierarchy",
-                    "",
-                ),
+            members.append(
+                Member(
+                    unique_name=unique_name,
 
-                "unique_name": unique_name,
+                    caption=member.findtext(
+                        f"{{{MD_NS}}}Caption",
+                        default=unique_name,
+                    ),
 
-                "caption": member.findtext(
-                    f"{{{MD_NS}}}Caption",
-                    default="",
-                ),
-            })
+                    hierarchy=member.get(
+                        "Hierarchy",
+                        "",
+                    ),
+                )
+            )
 
-        tuples.append(members)
+        tuples.append(
+            tuple(members)
+        )
 
     return tuples
 
 
-def read_cells(dataset) -> dict[int, str | None]:
+def read_cells(dataset):
 
     cells = {}
 
@@ -2148,19 +2327,13 @@ def read_cells(dataset) -> dict[int, str | None]:
         except ValueError as exc:
 
             raise ResponseError(
-                "Invalid XMLA CellOrdinal"
+                "Invalid CellOrdinal"
             ) from exc
 
-        if ordinal < 0:
+        if ordinal < 0 or ordinal in cells:
 
             raise ResponseError(
-                "Negative XMLA CellOrdinal"
-            )
-
-        if ordinal in cells:
-
-            raise ResponseError(
-                "Duplicate XMLA CellOrdinal"
+                "Invalid or duplicate CellOrdinal"
             )
 
         value = cell.find(
@@ -2176,55 +2349,50 @@ def read_cells(dataset) -> dict[int, str | None]:
     return cells
 
 
-def is_measure(member: dict) -> bool:
+def read_snapshot(root):
+
+    return next(
+        (
+            element.text.strip()
+            for element in root.iter()
+
+            if (
+                local_name(element.tag)
+                == "LastDataUpdate"
+
+                and element.text
+            )
+        ),
+        None,
+    )
+
+
+def tuple_key(members):
+
+    return tuple(
+        member.unique_name
+        for member in members
+    )
+
+
+def is_measure(member):
 
     return (
-        member["hierarchy"].casefold()
+        member.hierarchy.casefold()
         == "[measures]"
-        or member["unique_name"].casefold().startswith(
+
+        or member.unique_name.casefold().startswith(
             "[measures]."
         )
     )
 
 
-def canonical_value(value):
-
-    if value is None:
-
-        return None
-
-    value = str(value).strip()
-
-    if not value:
-
-        return None
-
-    try:
-
-        number = Decimal(value)
-
-        if number.is_finite():
-
-            if number == 0:
-
-                return "0"
-
-            return str(number.normalize())
-
-    except InvalidOperation:
-
-        pass
-
-    return value
-
-
 def parse_response(
-    path: Path,
-    query: QuerySpec,
-    task: RequestTask,
-    *,
-    capture_values: bool,
-) -> dict:
+    path,
+    query,
+    axes,
+    task,
+):
 
     started = time.perf_counter()
 
@@ -2246,27 +2414,58 @@ def parse_response(
         dataset
     )
 
-    x_members = set()
+    snapshot = read_snapshot(
+        root
+    )
 
-    row_keys = []
+    if (
+        axes.snapshot
+        and snapshot
+        and snapshot != axes.snapshot
+    ):
 
-    allowed_measures = {
-        identifier.casefold()
-        for identifier in query.measures
+        raise ResponseError(
+            "Cube snapshot changed during extraction"
+        )
+
+    expected_x = {
+        tuple_key(item)
+        for item in axes.x[
+            task.x_offset:
+            task.x_offset + task.x_chunk
+        ]
     }
 
-    measures_by_row = {}
+    expected_y = {
+        tuple_key(item)
+        for item in axes.y[
+            task.y_offset:
+            task.y_offset + task.y_chunk
+        ]
+    }
+
+    measure_indexes = {
+        name.casefold(): index
+
+        for index, name in enumerate(
+            query.measures
+        )
+    }
+
+    row_keys = []
+    returned_x = set()
+    measures_by_x = {}
 
     for row in axis1:
 
         dimensions = tuple(
-            member["unique_name"]
+            member
             for member in row
             if not is_measure(member)
         )
 
         measures = [
-            member["unique_name"]
+            member
             for member in row
             if is_measure(member)
         ]
@@ -2274,32 +2473,51 @@ def parse_response(
         if len(dimensions) != len(query.x):
 
             raise ResponseError(
-                "Unexpected X dimension count"
+                "Unexpected row dimension count"
             )
 
         if len(measures) != 1:
 
             raise ResponseError(
-                "Expected one measure per XMLA row tuple"
+                "Expected one measure per row tuple"
             )
 
-        measure = measures[0]
+        x_key = tuple_key(
+            dimensions
+        )
 
-        if measure.casefold() not in allowed_measures:
+        measure_name = (
+            measures[0]
+            .unique_name
+            .casefold()
+        )
+
+        if measure_name not in measure_indexes:
 
             raise ResponseError(
-                "Unexpected XMLA measure"
+                "Unexpected measure in XMLA response"
             )
 
-        x_members.add(dimensions)
-
-        measures_by_row.setdefault(
-            dimensions,
-            set(),
-        ).add(measure.casefold())
+        measure_index = measure_indexes[
+            measure_name
+        ]
 
         row_keys.append(
-            dimensions + (measure,)
+            (
+                x_key,
+                measure_index,
+            )
+        )
+
+        returned_x.add(
+            x_key
+        )
+
+        measures_by_x.setdefault(
+            x_key,
+            set(),
+        ).add(
+            measure_index
         )
 
     column_keys = []
@@ -2309,77 +2527,111 @@ def parse_response(
         if len(column) != len(query.y):
 
             raise ResponseError(
-                "Unexpected Y dimension count"
+                "Unexpected column dimension count"
             )
 
         column_keys.append(
-            tuple(
-                member["unique_name"]
-                for member in column
-            )
+            tuple_key(column)
         )
 
     if len(set(row_keys)) != len(row_keys):
 
         raise ResponseError(
-            "Duplicate XMLA row tuple"
+            "Duplicate row tuple"
         )
 
     if len(set(column_keys)) != len(column_keys):
 
         raise ResponseError(
-            "Duplicate XMLA column tuple"
+            "Duplicate column tuple"
         )
 
-    for returned in measures_by_row.values():
+    returned_y = set(
+        column_keys
+    )
 
-        if returned != allowed_measures:
+    if returned_x != expected_x:
+
+        raise ResponseError(
+            "X axis member coverage mismatch"
+        )
+
+    if returned_y != expected_y:
+
+        raise ResponseError(
+            "Y axis member coverage mismatch"
+        )
+
+    expected_measures = set(
+        range(
+            len(query.measures)
+        )
+    )
+
+    for returned_measures in measures_by_x.values():
+
+        if returned_measures != expected_measures:
 
             raise ResponseError(
                 "Incomplete measure set"
             )
 
-    x_count = len(x_members)
-
-    y_count = len(column_keys)
-
-    max_cell_ordinal = (
+    ordinal_limit = (
         len(row_keys)
         * len(column_keys)
     )
 
     if any(
-        ordinal >= max_cell_ordinal
+        ordinal >= ordinal_limit
         for ordinal in cells
     ):
 
         raise ResponseError(
-            "CellOrdinal outside XMLA axes"
+            "CellOrdinal outside returned axes"
         )
 
-    if x_count != task.x_chunk:
+    rows = {}
 
-        raise ResponseError(
-            f"X coverage mismatch: "
-            f"expected {task.x_chunk}, "
-            f"received {x_count}"
-        )
+    non_null_cells = 0
 
-    if y_count != task.y_chunk:
-
-        raise ResponseError(
-            f"Y coverage mismatch: "
-            f"expected {task.y_chunk}, "
-            f"received {y_count}"
-        )
-
-    non_null_cells = sum(
-        value is not None
-        and bool(str(value).strip())
-        for value in cells.values()
+    column_count = len(
+        column_keys
     )
 
-    if x_count == 0 or y_count == 0:
+    for row_index, (
+        x_key,
+        measure_index,
+    ) in enumerate(row_keys):
+
+        for column_index, y_key in enumerate(
+            column_keys
+        ):
+
+            ordinal = (
+                row_index
+                * column_count
+                + column_index
+            )
+
+            value = canonical_value(
+                cells.get(ordinal)
+            )
+
+            if value is not None:
+
+                non_null_cells += 1
+
+            key = x_key + y_key
+
+            if key not in rows:
+
+                rows[key] = [
+                    None
+                ] * len(query.measures)
+
+            rows[key][measure_index] = value
+
+    if not returned_x or not returned_y:
 
         chunk_kind = "EMPTY_PAGE"
 
@@ -2391,45 +2643,11 @@ def parse_response(
 
         chunk_kind = "DATA"
 
-    comparison_values = {}
-
-    if capture_values:
-
-        column_count = len(column_keys)
-
-        for row_index, row_key in enumerate(
-            row_keys
-        ):
-
-            for col_index, col_key in enumerate(
-                column_keys
-            ):
-
-                ordinal = (
-                    row_index * column_count
-                    + col_index
-                )
-
-                key = row_key + col_key
-
-                comparison_values[key] = (
-                    canonical_value(
-                        cells.get(ordinal)
-                    )
-                )
-
-    last_data_update = next(
-        (
-            element.text
-            for element in root.iter()
-            if local_name(element.tag) == "LastDataUpdate"
-        ),
-        None,
-    )
-
     return {
-        "x_members": x_count,
-        "y_members": y_count,
+        "rows": rows,
+
+        "x_members": len(returned_x),
+        "y_members": len(returned_y),
 
         "axis0_tuples": len(axis0),
         "axis1_tuples": len(axis1),
@@ -2440,149 +2658,197 @@ def parse_response(
 
         "chunk_kind": chunk_kind,
 
+        "last_data_update": snapshot,
+
         "parse_ms": elapsed_ms(started),
-
-        "last_data_update": last_data_update,
-
-        "comparison_values": comparison_values,
     }
 
 
 # ============================================================
-# INITIAL CUBE VALIDATION AND MEMBER COUNTS
+# AUTHENTICATED DISCOVERY REQUEST
 # ============================================================
 
-def discover_axis_counts(
-    query: QuerySpec,
-    auth: AuthenticationManager,
-    control: RequestControl,
-    run_dir: Path,
-) -> tuple[int, int, dict]:
+def discovery_request(
+    session,
+    auth,
+    control,
+    mdx,
+    destination,
+):
+
+    rejected_token = None
+
+    for attempt in range(
+        1,
+        MAX_ATTEMPTS + 1,
+    ):
+
+        check_stop()
+
+        token, lock_wait, refresh_ms = (
+            auth.get_token(
+                session,
+                rejected_token,
+            )
+        )
+
+        rate_wait = control.wait_slot()
+
+        result = execute_request(
+            session,
+
+            token,
+
+            build_soap(mdx),
+
+            destination,
+
+            timeout=DISCOVERY_TIMEOUT,
+        )
+
+        result.update({
+            "token_lock_wait_ms": lock_wait,
+
+            "token_refresh_ms": refresh_ms,
+
+            "rate_wait_ms": rate_wait,
+
+            "attempt": attempt,
+        })
+
+        status = result["http_status"]
+
+        if status == 200:
+
+            return result
+
+        if status in (401, 403):
+
+            if attempt >= MAX_ATTEMPTS:
+
+                raise AuthenticationError(
+                    f"XMLA authentication HTTP {status}"
+                )
+
+            rejected_token = token
+
+            continue
+
+        if status in (429, 503):
+
+            control.set_cooldown(
+                retry_after_seconds(
+                    result.get("retry_after"),
+                    30,
+                ),
+
+                f"Discovery HTTP {status}",
+
+                halt=True,
+            )
+
+            raise ServiceBusyError(
+                f"Discovery HTTP {status}"
+            )
+
+        raise ResponseError(
+            f"Discovery HTTP {status}"
+        )
+
+    raise ResponseError(
+        "Discovery attempts exhausted"
+    )
+
+
+# ============================================================
+# EXACT AXIS DISCOVERY
+# ============================================================
+
+def discover_axes(
+    query,
+    auth,
+    control,
+    run_dir,
+):
 
     session = create_session(
         auth.cookie
     )
 
-    destination = (
+    discovery_dir = (
         run_dir
-        / "responses"
-        / "axis_counts.xml"
+        / "discovery"
     )
 
-    rejected_token = None
+    discovery_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    results = {}
+
+    snapshots = set()
 
     try:
 
-        payload = build_soap(
-            build_count_mdx(query)
+        count_path = (
+            discovery_dir
+            / "axis_counts.xml"
         )
 
-        for attempt in range(MAX_ATTEMPTS):
+        results["counts"] = discovery_request(
+            session,
 
-            check_stop()
+            auth,
 
-            token, lock_wait, refresh_ms = (
-                auth.get_token(
-                    session,
-                    rejected_token=rejected_token,
-                )
-            )
+            control,
 
-            rate_wait = control.wait_slot()
+            build_count_mdx(query),
 
-            result = execute_request(
-                session,
-                token,
-                payload,
-                destination,
-                "callback",
-            )
-
-            result.update({
-                "token_lock_wait_ms": lock_wait,
-                "token_refresh_ms": refresh_ms,
-                "rate_wait_ms": rate_wait,
-            })
-
-            status = result["http_status"]
-
-            if status == 200:
-
-                break
-
-            if status in (401, 403):
-
-                if attempt + 1 >= MAX_ATTEMPTS:
-
-                    raise AuthenticationError(
-                        "XMLA authentication rejected"
-                    )
-
-                rejected_token = token
-
-                continue
-
-            if status in (429, 503):
-
-                seconds = retry_after_seconds(
-                    result.get("retry_after"),
-                    default=15,
-                )
-
-                control.set_cooldown(
-                    seconds,
-                    f"HTTP {status}",
-                )
-
-                if attempt + 1 < MAX_ATTEMPTS:
-
-                    continue
-
-            raise ResponseError(
-                f"Axis count HTTP {status}"
-            )
-
-        started = time.perf_counter()
-
-        _, dataset = load_xml_dataset(
-            destination
+            count_path,
         )
 
-        columns = read_axis(
+        root, dataset = load_xml_dataset(
+            count_path
+        )
+
+        snapshot = read_snapshot(
+            root
+        )
+
+        if snapshot:
+
+            snapshots.add(snapshot)
+
+        count_axis = read_axis(
             dataset,
             "Axis0",
         )
 
-        cells = read_cells(dataset)
-
-        if len(columns) != 2:
-
-            raise ResponseError(
-                "Unexpected axis-count result"
-            )
+        count_cells = read_cells(
+            dataset
+        )
 
         counts = {}
 
-        for ordinal, column in enumerate(
-            columns
+        for ordinal, member_tuple in enumerate(
+            count_axis
         ):
 
-            if len(column) != 1:
+            if len(member_tuple) != 1:
 
                 raise ResponseError(
                     "Invalid axis-count tuple"
                 )
 
-            identifier = column[0][
-                "unique_name"
-            ].casefold()
-
-            raw = cells.get(ordinal)
+            raw = count_cells.get(
+                ordinal
+            )
 
             if raw is None:
 
                 raise ResponseError(
-                    "Axis-count value is null"
+                    "Axis count is null"
                 )
 
             try:
@@ -2597,7 +2863,9 @@ def discover_axis_counts(
 
             if (
                 not number.is_finite()
+
                 or number < 0
+
                 or number != number.to_integral_value()
             ):
 
@@ -2605,7 +2873,11 @@ def discover_axis_counts(
                     "Invalid axis cardinality"
                 )
 
-            counts[identifier] = int(number)
+            counts[
+                member_tuple[0]
+                .unique_name
+                .casefold()
+            ] = int(number)
 
         x_count = counts.get(
             "[measures].[__loadenginexcount]"
@@ -2618,21 +2890,199 @@ def discover_axis_counts(
         if x_count is None or y_count is None:
 
             raise ResponseError(
-                "Unable to determine X/Y cardinality"
+                "Unable to discover X/Y cardinality"
             )
 
-        result.update({
-            "x_members": x_count,
-            "y_members": y_count,
-            "parse_ms": elapsed_ms(started),
+        if not x_count or not y_count:
+
+            raise ResponseError(
+                "Fixed query returned empty axes"
+            )
+
+        if (
+            x_count > MAX_AXIS_TUPLES
+            or y_count > MAX_AXIS_TUPLES
+        ):
+
+            raise EngineError(
+                "Axis cardinality exceeded local limit"
+            )
+
+        if x_count * y_count > MAX_EXPORT_ROWS:
+
+            raise EngineError(
+                "Dataset exceeds local export row limit"
+            )
+
+        discovered = {}
+
+        for axis_name, identifiers, expected in (
+            ("x", query.x, x_count),
+            ("y", query.y, y_count),
+        ):
+
+            console.print(
+                f"[cyan]DISCOVER {axis_name.upper()}[/cyan]"
+                f" | {expected:,} expected tuples"
+            )
+
+            path = (
+                discovery_dir
+                / f"axis_{axis_name}.xml"
+            )
+
+            results[axis_name] = discovery_request(
+                session,
+
+                auth,
+
+                control,
+
+                build_axis_discovery_mdx(
+                    identifiers
+                ),
+
+                path,
+            )
+
+            root, dataset = load_xml_dataset(
+                path
+            )
+
+            snapshot = read_snapshot(
+                root
+            )
+
+            if snapshot:
+
+                snapshots.add(snapshot)
+
+            axis = read_axis(
+                dataset,
+                "Axis1",
+            )
+
+            if len(axis) != expected:
+
+                raise ResponseError(
+                    f"{axis_name.upper()} axis discovery "
+                    f"returned {len(axis):,}/{expected:,} tuples"
+                )
+
+            for members in axis:
+
+                if len(members) != len(identifiers):
+
+                    raise ResponseError(
+                        "Axis dimension count mismatch"
+                    )
+
+                for member in members:
+
+                    validate_member_identifier(
+                        member.unique_name
+                    )
+
+            keys = [
+                tuple_key(members)
+                for members in axis
+            ]
+
+            if len(set(keys)) != len(keys):
+
+                raise ResponseError(
+                    "Duplicate discovered axis tuples"
+                )
+
+            discovered[axis_name] = axis
+
+        if len(snapshots) > 1:
+
+            raise ResponseError(
+                "Cube snapshot changed during discovery"
+            )
+
+        snapshot = next(
+            iter(snapshots),
+            None,
+        )
+
+        axis_digest = digest_json({
+            "x": [
+                tuple_key(item)
+                for item in discovered["x"]
+            ],
+
+            "y": [
+                tuple_key(item)
+                for item in discovered["y"]
+            ],
         })
+
+        axes = AxisCatalog(
+            x=discovered["x"],
+
+            y=discovered["y"],
+
+            snapshot=snapshot,
+
+            digest=axis_digest,
+        )
 
         write_json(
             run_dir / "axis_discovery.json",
-            result,
+            {
+                "query_hash": query.query_hash,
+
+                "axis_digest": axis_digest,
+
+                "snapshot": snapshot,
+
+                "x_members": axes.x_count,
+
+                "y_members": axes.y_count,
+
+                "measures": len(
+                    query.measures
+                ),
+
+                "expected_rows": (
+                    axes.x_count
+                    * axes.y_count
+                ),
+
+                "expected_coordinates": (
+                    axes.x_count
+                    * axes.y_count
+                    * len(query.measures)
+                ),
+
+                "requests": results,
+            },
         )
 
-        return x_count, y_count, result
+        write_json(
+            run_dir / "axis_members.json",
+            {
+                "x": [
+                    [
+                        asdict(member)
+                        for member in members
+                    ]
+                    for members in axes.x
+                ],
+
+                "y": [
+                    [
+                        asdict(member)
+                        for member in members
+                    ]
+                    for members in axes.y
+                ],
+            },
+        )
+
+        return axes
 
     finally:
 
@@ -2640,81 +3090,115 @@ def discover_axis_counts(
 
 
 # ============================================================
-# WORKER STATE AND PERFORMANCE METRICS
+# WORKER STATE
 # ============================================================
 
 class EngineState:
 
     def __init__(
         self,
-        profile: Profile,
-        total_tasks: int,
+        profile,
+        total_tasks,
     ):
 
         self.profile = profile
 
         self.total_tasks = total_tasks
 
-        self.lock = threading.Lock()
-
         self.started = time.monotonic()
 
-        self.workers = {
-            wid: {
-                "worker_id": wid,
+        self.lock = threading.Lock()
+
+        self.workers = {}
+
+        for worker_id in range(
+            1,
+            profile.workers + 1,
+        ):
+
+            self.workers[worker_id] = {
+                "worker_id": worker_id,
+
                 "status": "STARTING",
-                "phase": "INITIALIZING",
+                "phase": "IDLE",
+
                 "x_offset": None,
                 "y_offset": None,
-                "requests": 0,
+
                 "completed": 0,
                 "failed": 0,
+                "requests": 0,
+
                 "cells": 0,
-                "bytes": 0,
+
                 "last_http": None,
+
                 "last_request_ms": None,
                 "last_ttfb_ms": None,
+
                 "request_started": None,
-                "last_event": "Initializing",
+
+                "last_event": "Waiting for task",
                 "event_time": local_time(),
             }
-            for wid in range(
-                1,
-                profile.workers + 1,
-            )
-        }
 
-        self.requests = []
+        self.events = deque(
+            maxlen=20
+        )
 
-        self.recent_requests = []
+        self.recent = deque(
+            maxlen=RECENT_HISTORY_LIMIT
+        )
 
-        self.events = []
+        self.durations = []
 
-        self.completed_tasks = 0
-        self.failed_tasks = 0
+        self.timing_sums = {}
+        self.timing_counts = {}
 
-        self.data_chunks = 0
-        self.empty_pages = 0
-        self.no_cell_chunks = 0
+        self.requests = 0
+
+        self.successful_requests = 0
+        self.failed_requests = 0
+        self.stopped_requests = 0
+
+        self.completed = 0
+        self.failed = 0
 
         self.cells = 0
         self.non_null_cells = 0
 
         self.response_bytes = 0
+        self.download_bytes = 0
+
+        self.data_chunks = 0
+        self.no_cell_chunks = 0
+        self.empty_pages = 0
+
+        self.slow_requests = 0
+
+        self.connection_samples = 0
+        self.reused_transfers = 0
+        self.new_connections = 0
 
         self.fatal_error = None
 
+        self.active_limit = profile.workers
+
     def update_worker(
         self,
-        worker_id: int,
+        worker_id,
         **values,
     ):
 
         with self.lock:
 
-            worker = self.workers[worker_id]
+            worker = self.workers[
+                worker_id
+            ]
 
-            worker.update(values)
+            worker.update(
+                values
+            )
 
             if "last_event" in values:
 
@@ -2724,31 +3208,38 @@ class EngineState:
 
                 self.events.append({
                     "time": worker["event_time"],
+
                     "worker": worker_id,
-                    "message": worker["last_event"],
+
+                    "message": worker[
+                        "last_event"
+                    ],
                 })
 
-                self.events = self.events[-20:]
-
-    def add_request(
+    def record_request(
         self,
-        record: dict,
+        record,
     ):
 
         with self.lock:
 
-            sample = dict(record)
+            self.requests += 1
 
-            self.requests.append(sample)
-
-            self.recent_requests.append(sample)
-
-            self.recent_requests = (
-                self.recent_requests[
-                    -RECENT_HISTORY_LIMIT
-                    * self.profile.workers:
-                ]
+            status = record.get(
+                "status"
             )
+
+            if status == "OK":
+
+                self.successful_requests += 1
+
+            elif status == "STOPPED":
+
+                self.stopped_requests += 1
+
+            else:
+
+                self.failed_requests += 1
 
             worker = self.workers[
                 record["worker_id"]
@@ -2756,24 +3247,93 @@ class EngineState:
 
             worker["requests"] += 1
 
-            worker["last_request_ms"] = (
-                record.get("execute_ms")
+            duration = record.get(
+                "execute_ms"
             )
 
-            worker["last_ttfb_ms"] = (
-                record.get("ttfb_ms")
+            if duration is not None:
+
+                self.durations.append(
+                    duration
+                )
+
+                if duration >= SLOW_REQUEST_MS:
+
+                    self.slow_requests += 1
+
+            worker["last_request_ms"] = duration
+
+            worker["last_ttfb_ms"] = record.get(
+                "ttfb_ms"
             )
+
+            worker["request_started"] = None
 
             if record.get("http_status") is not None:
 
-                worker["last_http"] = (
-                    record["http_status"]
+                worker["last_http"] = record[
+                    "http_status"
+                ]
+
+            for field in TIMING_FIELDS:
+
+                value = record.get(
+                    field
                 )
+
+                if not isinstance(
+                    value,
+                    (int, float),
+                ):
+
+                    continue
+
+                self.timing_sums[field] = (
+                    self.timing_sums.get(
+                        field,
+                        0.0,
+                    )
+                    + value
+                )
+
+                self.timing_counts[field] = (
+                    self.timing_counts.get(
+                        field,
+                        0,
+                    )
+                    + 1
+                )
+
+            connections = record.get(
+                "new_connections"
+            )
+
+            if connections is not None:
+
+                self.connection_samples += 1
+
+                self.new_connections += connections
+
+                if connections == 0:
+
+                    self.reused_transfers += 1
+
+            self.recent.append({
+                "time": time.monotonic(),
+
+                "execute_ms": duration,
+
+                "ttfb_ms": record.get(
+                    "ttfb_ms"
+                ),
+
+                "status": status,
+            })
 
     def finish_task(
         self,
-        worker_id: int,
-        result: dict | None,
+        worker_id,
+        result,
     ):
 
         with self.lock:
@@ -2784,56 +3344,68 @@ class EngineState:
 
             if result is None:
 
-                self.failed_tasks += 1
+                self.failed += 1
 
                 worker["failed"] += 1
 
+                worker["phase"] = "IDLE"
+
+                worker["status"] = "FAILED"
+
+                worker["request_started"] = None
+
                 return
 
-            self.completed_tasks += 1
+            self.completed += 1
 
             worker["completed"] += 1
 
-            cells = result.get(
-                "cells",
-                0,
-            )
+            worker["cells"] += result[
+                "non_null_cells"
+            ]
 
-            non_null = result.get(
-                "non_null_cells",
-                0,
-            )
+            self.cells += result[
+                "cells"
+            ]
 
-            received = result.get(
+            self.non_null_cells += result[
+                "non_null_cells"
+            ]
+
+            self.response_bytes += result.get(
                 "response_bytes",
                 0,
             )
 
-            self.cells += cells
+            self.download_bytes += (
+                result.get(
+                    "download_bytes"
+                )
+                or 0
+            )
 
-            self.non_null_cells += non_null
-
-            self.response_bytes += received
-
-            worker["cells"] += cells
-
-            worker["bytes"] += received
-
-            kind = result.get("chunk_kind")
+            kind = result[
+                "chunk_kind"
+            ]
 
             if kind == "DATA":
 
                 self.data_chunks += 1
 
-            elif kind == "EMPTY_PAGE":
-
-                self.empty_pages += 1
-
             elif kind == "NO_CELLS":
 
                 self.no_cell_chunks += 1
 
-    def set_fatal(self, message: str):
+            elif kind == "EMPTY_PAGE":
+
+                self.empty_pages += 1
+
+            worker["phase"] = "IDLE"
+            worker["status"] = "RUNNING"
+
+            worker["request_started"] = None
+
+    def set_fatal(self, message):
 
         with self.lock:
 
@@ -2841,55 +3413,118 @@ class EngineState:
 
                 self.fatal_error = message
 
-    def snapshot(self) -> dict:
+    def set_active_limit(self, value):
+
+        with self.lock:
+
+            self.active_limit = value
+
+    def snapshot(self):
 
         with self.lock:
 
             return {
-                "profile": self.profile.name,
-
                 "elapsed": max(
-                    0.0,
-                    time.monotonic() - self.started,
+                    0.001,
+                    time.monotonic()
+                    - self.started,
                 ),
 
                 "total_tasks": self.total_tasks,
 
-                "completed_tasks": self.completed_tasks,
+                "completed_tasks": self.completed,
 
-                "failed_tasks": self.failed_tasks,
+                "failed_tasks": self.failed,
 
-                "data_chunks": self.data_chunks,
+                "requests": self.requests,
 
-                "empty_pages": self.empty_pages,
+                "successful_requests": (
+                    self.successful_requests
+                ),
 
-                "no_cell_chunks": self.no_cell_chunks,
+                "failed_requests": (
+                    self.failed_requests
+                ),
+
+                "stopped_requests": (
+                    self.stopped_requests
+                ),
 
                 "cells": self.cells,
 
-                "non_null_cells": self.non_null_cells,
+                "non_null_cells": (
+                    self.non_null_cells
+                ),
 
-                "response_bytes": self.response_bytes,
+                "response_bytes": (
+                    self.response_bytes
+                ),
 
-                "requests": [
-                    dict(item)
-                    for item in self.requests
-                ],
+                "download_bytes": (
+                    self.download_bytes
+                ),
 
-                "recent_requests": [
-                    dict(item)
-                    for item in self.recent_requests
-                ],
+                "data_chunks": self.data_chunks,
+
+                "no_cell_chunks": (
+                    self.no_cell_chunks
+                ),
+
+                "empty_pages": self.empty_pages,
+
+                "slow_requests": self.slow_requests,
+
+                "durations": list(
+                    self.durations
+                ),
+
+                "recent": list(
+                    self.recent
+                ),
+
+                "timing": {
+                    field: round(
+                        self.timing_sums[field]
+                        / self.timing_counts[field],
+                        3,
+                    )
+
+                    for field in self.timing_sums
+                },
+
+                "new_connections": (
+                    self.new_connections
+                ),
+
+                "connection_samples": (
+                    self.connection_samples
+                ),
+
+                "connection_reuse_percent": (
+                    round(
+                        self.reused_transfers
+                        / self.connection_samples
+                        * 100,
+                        2,
+                    )
+
+                    if self.connection_samples
+                    else None
+                ),
+
+                "active_limit": self.active_limit,
 
                 "workers": [
                     dict(worker)
-                    for worker in self.workers.values()
+
+                    for worker in (
+                        self.workers.values()
+                    )
                 ],
 
-                "events": [
-                    dict(event)
-                    for event in self.events
-                ],
+                "events": list(
+                    self.events
+                ),
 
                 "fatal_error": self.fatal_error,
             }
@@ -2899,83 +3534,38 @@ class EngineState:
 # METRICS AGGREGATION
 # ============================================================
 
-def aggregate_metrics(snapshot: dict) -> dict:
+def aggregate_metrics(snapshot):
 
-    requests = snapshot["requests"]
-
-    elapsed = max(
-        0.001,
-        snapshot["elapsed"],
+    durations = snapshot.pop(
+        "durations"
     )
 
-    durations = [
-        float(record["execute_ms"])
-        for record in requests
-        if record.get("execute_ms") is not None
-    ]
-
-    now = datetime.now(
-        timezone.utc
+    recent_records = snapshot.pop(
+        "recent"
     )
 
-    recent = []
+    now = time.monotonic()
 
-    for record in snapshot["recent_requests"]:
+    recent = [
+        record["execute_ms"]
 
-        completed = parse_timestamp(
-            record.get("completed_at")
-        )
+        for record in recent_records
 
         if (
-            completed is not None
-            and (
-                now - completed
-            ).total_seconds()
+            now - record["time"]
             <= RECENT_WINDOW_SECONDS
-        ):
+        )
 
-            recent.append(record)
-
-    recent_durations = [
-        float(record["execute_ms"])
-        for record in recent
-        if record.get("execute_ms") is not None
+        and record["execute_ms"] is not None
     ]
 
-    def average_metric(name):
-
-        values = [
-            float(record[name])
-            for record in requests
-            if record.get(name) is not None
-        ]
-
-        return mean_or_none(values)
-
-    known_connections = [
-        int(record["new_connections"])
-        for record in requests
-        if record.get("new_connections") is not None
+    elapsed = snapshot[
+        "elapsed"
     ]
 
-    reused_transfers = sum(
-        count == 0
-        for count in known_connections
-    )
-
-    connections_total = sum(
-        known_connections
-    )
-
-    reuse_percent = (
-        reused_transfers
-        / len(known_connections)
-        * 100
-        if known_connections
-        else None
-    )
-
-    workers = snapshot["workers"]
+    workers = snapshot[
+        "workers"
+    ]
 
     max_completed = max(
         (
@@ -2985,148 +3575,62 @@ def aggregate_metrics(snapshot: dict) -> dict:
         default=0,
     )
 
+    slow_inflight = 0
+
     for worker in workers:
 
         worker["relative_progress"] = (
-            worker["completed"] / max_completed
+            worker["completed"]
+            / max_completed
+
             if max_completed
             else 0.0
         )
 
-        request_started = worker.get(
+        started = worker.get(
             "request_started"
         )
 
+        current_ms = None
+
         if (
-            worker.get("phase") == "REQUESTING"
-            and request_started is not None
+            worker["phase"] == "REQUESTING"
+            and started is not None
         ):
 
-            worker["current_request_ms"] = (
-                round(
-                    (
-                        time.monotonic()
-                        - request_started
-                    ) * 1000,
-                    3,
-                )
+            current_ms = round(
+                max(
+                    0.0,
+                    now - started,
+                ) * 1000,
+                3,
             )
 
-        else:
+            if current_ms >= SLOW_REQUEST_MS:
 
-            worker["current_request_ms"] = None
+                slow_inflight += 1
 
-    ok_requests = sum(
-        record.get("status") == "OK"
-        for record in requests
-    )
-
-    failed_requests = sum(
-        record.get("status") == "ERROR"
-        for record in requests
-    )
-
-    finished_tasks = (
-        snapshot["completed_tasks"]
-        + snapshot["failed_tasks"]
-    )
-
-    slow_requests = sum(
-        value >= SLOW_REQUEST_MS
-        for value in durations
-    )
-
-    slow_inflight = sum(
-        worker.get("current_request_ms") is not None
-        and worker["current_request_ms"] >= SLOW_REQUEST_MS
-        for worker in workers
-    )
-
-    recent_window = min(
-        elapsed,
-        RECENT_WINDOW_SECONDS,
-    )
-
-    phases = {
-        phase: sum(
-            worker.get("phase") == phase
-            for worker in workers
+        worker["current_request_ms"] = (
+            current_ms
         )
-        for phase in (
-            "REQUESTING",
-            "AUTHENTICATING",
-            "PARSING",
-            "QUEUED",
-            "COOLDOWN",
-            "RETRYING",
-            "DELAY",
-            "FINISHED",
-        )
-    }
 
-    timing = {
-        name: average_metric(name)
-        for name in (
-            "queue_wait_ms",
-            "rate_wait_ms",
-            "token_lock_wait_ms",
-            "token_refresh_ms",
-            "dns_ms",
-            "connect_ms",
-            "tls_ms",
-            "pretransfer_ms",
-            "ttfb_ms",
-            "response_wait_estimate_ms",
-            "header_wait_ms",
-            "first_body_ms",
-            "receive_ms",
-            "file_write_ms",
-            "finalize_ms",
-            "parse_ms",
-            "transfer_ms",
-            "execute_ms",
-            "task_total_ms",
-        )
-    }
+    completed = snapshot[
+        "completed_tasks"
+    ]
 
-    return {
-        "elapsed": elapsed,
+    total = snapshot[
+        "total_tasks"
+    ]
 
-        "total_tasks": snapshot["total_tasks"],
+    remaining = max(
+        0,
+        total - completed
+        - snapshot["failed_tasks"],
+    )
 
-        "finished_tasks": finished_tasks,
+    chunk_rate = completed / elapsed
 
-        "completed_tasks": snapshot["completed_tasks"],
-
-        "failed_tasks": snapshot["failed_tasks"],
-
-        "data_chunks": snapshot["data_chunks"],
-
-        "empty_pages": snapshot["empty_pages"],
-
-        "no_cell_chunks": snapshot["no_cell_chunks"],
-
-        "requests": len(requests),
-
-        "successful_requests": ok_requests,
-
-        "failed_requests": failed_requests,
-
-        "request_rate": round(
-            len(requests) / elapsed,
-            3,
-        ),
-
-        "recent_request_rate": round(
-            len(recent) / max(
-                recent_window,
-                0.001,
-            ),
-            3,
-        ),
-
-        "recent_samples": len(recent),
-
+    snapshot.update({
         "average_ms": mean_or_none(
             durations
         ),
@@ -3141,32 +3645,35 @@ def aggregate_metrics(snapshot: dict) -> dict:
         ),
 
         "p95_ms": percentile(
-            durations,
-            95,
+            durations
         ),
 
         "max_ms": (
-            round(max(durations), 3)
+            max(durations)
             if durations
             else None
         ),
 
         "recent_average_ms": mean_or_none(
-            recent_durations
+            recent
         ),
 
         "recent_p95_ms": percentile(
-            recent_durations,
-            95,
+            recent
         ),
 
-        "slow_requests": slow_requests,
+        "recent_samples": len(
+            recent
+        ),
 
-        "slow_inflight_workers": slow_inflight,
+        "slow_inflight_workers": (
+            slow_inflight
+        ),
 
-        "cells": snapshot["cells"],
-
-        "non_null_cells": snapshot["non_null_cells"],
+        "requests_per_second": round(
+            snapshot["requests"] / elapsed,
+            3,
+        ),
 
         "cells_per_second": round(
             snapshot["non_null_cells"]
@@ -3174,42 +3681,196 @@ def aggregate_metrics(snapshot: dict) -> dict:
             3,
         ),
 
-        "response_bytes": snapshot["response_bytes"],
-
-        "bytes_per_second": round(
-            snapshot["response_bytes"]
-            / elapsed,
+        "chunks_per_second": round(
+            chunk_rate,
             3,
         ),
 
-        "new_connections": (
-            connections_total
-            if known_connections
+        "eta_seconds": (
+            round(
+                remaining / chunk_rate,
+                2,
+            )
+
+            if completed >= 10
+            and chunk_rate > 0
+
             else None
         ),
 
-        "connection_reuse_percent": (
-            round(reuse_percent, 2)
-            if reuse_percent is not None
-            else None
+        "completion_percent": (
+            round(
+                completed / total * 100,
+                3,
+            )
+            if total
+            else 100.0
+        ),
+    })
+
+    return snapshot
+
+
+# ============================================================
+# BOTTLENECK DIAGNOSIS
+# ============================================================
+
+def identify_bottleneck(metrics):
+
+    timing = metrics.get(
+        "timing",
+        {},
+    )
+
+    response_wait = timing.get(
+        "response_wait_estimate_ms"
+    )
+
+    if response_wait is None:
+
+        response_wait = timing.get(
+            "ttfb_ms"
+        )
+
+    if response_wait is None:
+
+        response_wait = timing.get(
+            "header_wait_ms"
+        )
+
+    if response_wait is None:
+
+        response_wait = timing.get(
+            "first_body_ms"
+        )
+
+    candidates = {
+        "RESPONSE_WAIT": response_wait,
+
+        "RESPONSE_RECEIVE": timing.get(
+            "receive_ms"
         ),
 
-        "connection_samples": len(
-            known_connections
+        "DNS_LOOKUP": timing.get(
+            "dns_ms"
         ),
 
-        "max_worker_chunks": max_completed,
+        "TCP_CONNECT": timing.get(
+            "connect_ms"
+        ),
 
-        "phases": phases,
+        "TLS_HANDSHAKE": timing.get(
+            "tls_ms"
+        ),
 
-        "timing": timing,
+        "FILE_WRITE": timing.get(
+            "file_write_ms"
+        ),
 
-        "workers": workers,
+        "XML_PARSE": timing.get(
+            "parse_ms"
+        ),
 
-        "events": snapshot["events"],
-
-        "fatal_error": snapshot["fatal_error"],
+        "TOKEN_REFRESH": timing.get(
+            "token_refresh_ms"
+        ),
     }
+
+    candidates = {
+        key: value
+
+        for key, value in candidates.items()
+
+        if value is not None
+    }
+
+    if not candidates:
+
+        return {
+            "name": "UNKNOWN",
+
+            "message": (
+                "Insufficient timing samples"
+            ),
+        }
+
+    name, duration = max(
+        candidates.items(),
+
+        key=lambda item: item[1],
+    )
+
+    execution = timing.get(
+        "execute_ms"
+    )
+
+    return {
+        "name": name,
+
+        "average_ms": round(
+            duration,
+            3,
+        ),
+
+        "relative_execute_percent": (
+            round(
+                duration / execution * 100,
+                2,
+            )
+            if execution
+            else None
+        ),
+
+        "scheduler_rate_wait_ms": timing.get(
+            "rate_wait_ms"
+        ),
+
+        "message": (
+            "Response waiting dominates. "
+            "OLAP execution, upstream queuing and "
+            "network transit remain possible causes."
+
+            if name == "RESPONSE_WAIT"
+
+            else f"Largest measured stage: {name}"
+        ),
+
+        "note": (
+            "Timing stages can overlap. "
+            "Response waiting is not pure server CPU time. "
+            "Excel and data CSV export are measured separately."
+        ),
+    }
+
+
+# ============================================================
+# THREAD-LOCAL PERSISTENT HTTP SESSIONS
+# ============================================================
+
+def initialize_worker(
+    auth,
+    worker_ids,
+    sessions,
+    session_lock,
+):
+
+    worker_id = worker_ids.popleft()
+
+    session = create_session(
+        auth.cookie
+    )
+
+    THREAD_LOCAL.worker_id = worker_id
+
+    THREAD_LOCAL.session = session
+
+    THREAD_LOCAL.last_request_at = 0.0
+
+    with session_lock:
+
+        sessions.append(
+            session
+        )
 
 
 # ============================================================
@@ -3217,657 +3878,815 @@ def aggregate_metrics(snapshot: dict) -> dict:
 # ============================================================
 
 def request_worker(
-    worker_id: int,
-    query: QuerySpec,
-    profile: Profile,
-    tasks: queue.Queue,
-    results: queue.Queue,
-    no_more_tasks: threading.Event,
-    profile_stop: threading.Event,
-    state: EngineState,
-    auth: AuthenticationManager,
-    control: RequestControl,
-    profile_dir: Path,
-    *,
-    capture_values: bool,
+    query,
+    axes,
+    profile,
+    task,
+    queued_at,
+    auth,
+    control,
+    state,
+    stop_event,
+    profile_dir,
 ):
 
-    session = None
+    worker_id = THREAD_LOCAL.worker_id
 
-    last_request_at = 0.0
+    session = THREAD_LOCAL.session
+
+    records = []
+
+    rejected_token = None
+
+    result = None
+
+    fatal_error = None
+    stopped = False
+
+    task_started = time.perf_counter()
+
+    queue_wait_ms = round(
+        (
+            task_started
+            - queued_at
+        ) * 1000,
+        3,
+    )
 
     try:
 
-        session = create_session(
-            auth.cookie
+        payload = build_soap(
+            build_mdx(
+                query,
+                axes,
+                task,
+                profile.strategy,
+            )
         )
 
-        state.update_worker(
-            worker_id,
-            status="RUNNING",
-            phase="QUEUED",
-            last_event="Persistent HTTP session ready",
+        destination = (
+            profile_dir
+            / "responses"
+            / f"{task.request_id}.xml"
         )
 
-        while not (
-            STOP_EVENT.is_set()
-            or profile_stop.is_set()
+        for attempt in range(
+            1,
+            MAX_ATTEMPTS + 1,
         ):
 
-            try:
+            check_stop(stop_event)
 
-                task = tasks.get(
-                    timeout=0.25
-                )
+            state.update_worker(
+                worker_id,
 
-            except queue.Empty:
+                status="RUNNING",
+                phase="AUTHENTICATING",
 
-                if no_more_tasks.is_set():
+                x_offset=task.x_offset,
+                y_offset=task.y_offset,
 
-                    break
+                request_started=None,
 
-                continue
-
-            task_started = time.perf_counter()
-
-            queue_wait_ms = round(
-                (
-                    task_started
-                    - task.queued_at
-                ) * 1000,
-                3,
+                last_event=(
+                    f"Preparing X={task.x_offset} "
+                    f"Y={task.y_offset}"
+                ),
             )
 
-            final_result = None
-            final_error = None
+            token, token_lock_ms, refresh_ms = (
+                auth.get_token(
+                    session,
+
+                    rejected_token,
+
+                    stop_event,
+                )
+            )
+
+            rejected_token = None
+
+            delay = max(
+                0.0,
+
+                THREAD_LOCAL.last_request_at
+                + WORKER_REQUEST_DELAY
+
+                - time.monotonic(),
+            )
+
+            delay_started = (
+                time.perf_counter()
+            )
+
+            if delay:
+
+                state.update_worker(
+                    worker_id,
+                    phase="DELAY",
+                )
+
+                interruptible_sleep(
+                    delay,
+                    stop_event,
+                )
+
+            delay_ms = elapsed_ms(
+                delay_started
+            )
+
+            state.update_worker(
+                worker_id,
+
+                phase=(
+                    "COOLDOWN"
+                    if control.remaining() > 0
+                    else "RATE_WAIT"
+                ),
+            )
+
+            rate_wait_ms = control.wait_slot(
+                stop_event
+            )
+
+            check_stop(stop_event)
+
+            started = time.perf_counter()
+
+            THREAD_LOCAL.last_request_at = (
+                time.monotonic()
+            )
+
+            record = {
+                "profile": profile.name,
+
+                "query_strategy": profile.strategy,
+
+                "worker_id": worker_id,
+
+                "request_id": task.request_id,
+
+                "attempt": attempt,
+
+                "x_offset": task.x_offset,
+                "y_offset": task.y_offset,
+
+                "x_chunk": task.x_chunk,
+                "y_chunk": task.y_chunk,
+
+                "started_at": utc_now(),
+
+                "queue_wait_ms": (
+                    queue_wait_ms
+                    if attempt == 1
+                    else 0.0
+                ),
+
+                "rate_wait_ms": round(
+                    rate_wait_ms + delay_ms,
+                    3,
+                ),
+
+                "token_lock_wait_ms": (
+                    token_lock_ms
+                ),
+
+                "token_refresh_ms": (
+                    refresh_ms
+                ),
+            }
+
+            state.update_worker(
+                worker_id,
+
+                status="RUNNING",
+                phase="REQUESTING",
+
+                request_started=(
+                    time.monotonic()
+                ),
+
+                last_event=(
+                    f"REQUEST "
+                    f"X={task.x_offset} "
+                    f"Y={task.y_offset} "
+                    f"SIZE={task.x_chunk}/{task.y_chunk}"
+                ),
+            )
+
+            retry = False
 
             try:
 
-                request_body = build_soap(
-                    build_mdx(
+                response = execute_request(
+                    session,
+
+                    token,
+
+                    payload,
+
+                    destination,
+
+                    stop_event=stop_event,
+                )
+
+                record.update(
+                    response
+                )
+
+                http_status = response[
+                    "http_status"
+                ]
+
+                state.update_worker(
+                    worker_id,
+
+                    last_http=http_status,
+
+                    request_started=None,
+                )
+
+                if http_status == 200:
+
+                    state.update_worker(
+                        worker_id,
+
+                        phase="PARSING",
+                    )
+
+                    parsed = parse_response(
+                        destination,
+
                         query,
+
+                        axes,
+
                         task,
                     )
-                )
 
-                rejected_token = None
-
-                destination = (
-                    profile_dir
-                    / "responses"
-                    / f"{task.request_id}.xml"
-                )
-
-                for attempt in range(
-                    1,
-                    MAX_ATTEMPTS + 1,
-                ):
-
-                    check_stop()
-
-                    if profile_stop.is_set():
-
-                        raise StopRequested(
-                            "Profile stopped"
-                        )
-
-                    state.update_worker(
-                        worker_id,
-                        status="RUNNING",
-                        phase="AUTHENTICATING",
-                        x_offset=task.x_offset,
-                        y_offset=task.y_offset,
-                        request_started=None,
-                        last_event=(
-                            f"Preparing X={task.x_offset} "
-                            f"Y={task.y_offset}"
-                        ),
+                    rows = parsed.pop(
+                        "rows"
                     )
 
-                    token, lock_wait, refresh_ms = (
-                        auth.get_token(
-                            session,
-                            rejected_token=rejected_token,
-                        )
+                    record.update(
+                        parsed
                     )
 
-                    rejected_token = None
+                    record["status"] = "OK"
 
-                    local_wait = max(
-                        0.0,
-                        last_request_at
-                        + WORKER_REQUEST_DELAY
-                        - time.monotonic(),
-                    )
+                    result = {
+                        **record,
 
-                    if local_wait:
-
-                        state.update_worker(
-                            worker_id,
-                            phase="DELAY",
-                        )
-
-                        interruptible_sleep(
-                            local_wait
-                        )
-
-                    if control.remaining() > 0:
-
-                        state.update_worker(
-                            worker_id,
-                            status="PAUSED",
-                            phase="COOLDOWN",
-                            last_event="Shared server cooldown",
-                        )
-
-                    rate_wait = control.wait_slot()
-
-                    if profile_stop.is_set():
-
-                        raise StopRequested(
-                            "Profile stopped"
-                        )
-
-                    request_started = (
-                        time.perf_counter()
-                    )
-
-                    last_request_at = (
-                        time.monotonic()
-                    )
-
-                    record = {
-                        "profile": profile.name,
-
-                        "engine": profile.engine,
-
-                        "worker_id": worker_id,
-
-                        "request_id": task.request_id,
-
-                        "attempt": attempt,
-
-                        "x_offset": task.x_offset,
-                        "y_offset": task.y_offset,
-
-                        "x_chunk": task.x_chunk,
-                        "y_chunk": task.y_chunk,
-
-                        "started_at": utc_now(),
-
-                        "queue_wait_ms": (
-                            queue_wait_ms
-                            if attempt == 1
-                            else 0
-                        ),
-
-                        "rate_wait_ms": (
-                            rate_wait
-                            + local_wait * 1000
-                        ),
-
-                        "token_lock_wait_ms": lock_wait,
-
-                        "token_refresh_ms": refresh_ms,
+                        "rows": rows,
                     }
 
-                    state.update_worker(
-                        worker_id,
-                        status="RUNNING",
-                        phase="REQUESTING",
-                        request_started=(
-                            time.monotonic()
-                        ),
-                        last_event=(
-                            f"REQUEST X={task.x_offset} "
-                            f"Y={task.y_offset}"
-                        ),
+                elif http_status in (401, 403):
+
+                    record["status"] = "ERROR"
+
+                    record["error"] = (
+                        f"Authentication HTTP {http_status}"
                     )
 
-                    retry = False
-                    fatal = False
+                    if attempt < MAX_ATTEMPTS:
 
-                    try:
+                        rejected_token = token
 
-                        response = execute_request(
-                            session,
-                            token,
-                            request_body,
-                            destination,
-                            profile.engine,
-                        )
+                        retry = True
 
-                        record.update(
-                            response
-                        )
+                    else:
 
-                        status = record[
-                            "http_status"
+                        fatal_error = record[
+                            "error"
                         ]
 
-                        state.update_worker(
-                            worker_id,
-                            request_started=None,
-                            last_http=status,
-                            last_request_ms=record.get(
-                                "execute_ms"
-                            ),
-                            last_ttfb_ms=record.get(
-                                "ttfb_ms"
-                            ),
-                        )
+                elif http_status in (429, 503):
 
-                        if status == 200:
+                    record["status"] = "ERROR"
 
-                            state.update_worker(
-                                worker_id,
-                                phase="PARSING",
-                            )
-
-                            parsed = parse_response(
-                                destination,
-                                query,
-                                task,
-                                capture_values=capture_values,
-                            )
-
-                            comparison_values = parsed.pop(
-                                "comparison_values"
-                            )
-
-                            record.update(parsed)
-
-                            record["status"] = "OK"
-
-                            final_result = {
-                                **record,
-                                "comparison_values": (
-                                    comparison_values
-                                ),
-                            }
-
-                        elif status in (401, 403):
-
-                            record["status"] = "ERROR"
-
-                            record["error"] = (
-                                f"Authentication HTTP {status}"
-                            )
-
-                            if attempt < MAX_ATTEMPTS:
-
-                                rejected_token = token
-
-                                retry = True
-
-                            else:
-
-                                fatal = True
-
-                        elif status in (429, 503):
-
-                            record["status"] = "ERROR"
-
-                            record["error"] = (
-                                f"Server HTTP {status}"
-                            )
-
-                            cooldown = retry_after_seconds(
-                                response.get(
-                                    "retry_after"
-                                ),
-                                default=15.0 * attempt,
-                            )
-
-                            control.set_cooldown(
-                                cooldown,
-                                f"HTTP {status}",
-                            )
-
-                            retry = (
-                                attempt < MAX_ATTEMPTS
-                            )
-
-                            if not retry:
-
-                                fatal = True
-
-                        elif status in (
-                            408,
-                            425,
-                            500,
-                            502,
-                            504,
-                        ):
-
-                            record["status"] = "ERROR"
-
-                            record["error"] = (
-                                f"Transient HTTP {status}"
-                            )
-
-                            retry = (
-                                attempt < MAX_ATTEMPTS
-                            )
-
-                        else:
-
-                            record["status"] = "ERROR"
-
-                            record["error"] = (
-                                f"HTTP {status}"
-                            )
-
-                    except StopRequested:
-
-                        record["status"] = "STOPPED"
-
-                        record["error"] = "Stopped"
-
-                        raise
-
-                    except RequestException as exc:
-
-                        record["status"] = "ERROR"
-
-                        record["error"] = safe_error(
-                            exc
-                        )
-
-                        retry = (
-                            attempt < MAX_ATTEMPTS
-                        )
-
-                    except (
-                        ResponseError,
-                        ResponseTooLarge,
-                    ) as exc:
-
-                        record["status"] = "ERROR"
-
-                        record["error"] = safe_error(
-                            exc
-                        )
-
-                        # Invalid datasets and oversize
-                        # responses are not blindly retried.
-                        retry = False
-
-                    finally:
-
-                        record.setdefault(
-                            "execute_ms",
-                            elapsed_ms(
-                                request_started
-                            ),
-                        )
-
-                        record["completed_at"] = (
-                            utc_now()
-                        )
-
-                        record["task_total_ms"] = round(
-                            (
-                                time.perf_counter()
-                                - task.queued_at
-                            ) * 1000,
-                            3,
-                        )
-
-                        record.setdefault(
-                            "status",
-                            "ERROR",
-                        )
-
-                        state.add_request(
-                            record
-                        )
-
-                        results.put((
-                            "REQUEST",
-                            dict(record),
-                        ))
-
-                        state.update_worker(
-                            worker_id,
-                            request_started=None,
-                        )
-
-                    if final_result is not None:
-
-                        duration = final_result.get(
-                            "execute_ms",
-                            0,
-                        )
-
-                        kind = final_result.get(
-                            "chunk_kind",
-                            "DATA",
-                        )
-
-                        prefix = (
-                            "SLOW"
-                            if duration >= SLOW_REQUEST_MS
-                            else "OK"
-                        )
-
-                        state.update_worker(
-                            worker_id,
-                            status="RUNNING",
-                            phase="QUEUED",
-                            last_event=(
-                                f"{prefix} HTTP 200 | "
-                                f"{format_ms(duration)} | "
-                                f"{kind} | "
-                                f"X={final_result['x_members']} "
-                                f"Y={final_result['y_members']} "
-                                f"cells={final_result['cells']}"
-                            ),
-                        )
-
-                        break
-
-                    final_error = record.get(
-                        "error",
-                        "Request failed",
+                    record["error"] = (
+                        f"Server HTTP {http_status}"
                     )
 
-                    if fatal:
+                    control.set_cooldown(
+                        retry_after_seconds(
+                            response.get(
+                                "retry_after"
+                            ),
+                            30,
+                        ),
 
-                        state.set_fatal(
-                            final_error
-                        )
+                        record["error"],
 
-                        profile_stop.set()
+                        halt=True,
+                    )
 
-                        break
+                    fatal_error = (
+                        record["error"]
+                        + " | Server backoff required"
+                    )
+
+                elif http_status in (
+                    408,
+                    425,
+                    500,
+                    502,
+                    504,
+                ):
+
+                    record["status"] = "ERROR"
+
+                    record["error"] = (
+                        f"Transient HTTP {http_status}"
+                    )
+
+                    retry = (
+                        attempt < MAX_ATTEMPTS
+                    )
 
                     if not retry:
 
-                        break
-
-                    state.update_worker(
-                        worker_id,
-                        status="RETRYING",
-                        phase="RETRYING",
-                        last_event=(
-                            f"Retry {attempt + 1}/"
-                            f"{MAX_ATTEMPTS} | "
-                            f"{final_error}"
-                        ),
-                    )
-
-                    interruptible_sleep(
-                        min(
-                            10,
-                            2 ** attempt,
-                        )
-                    )
-
-                state.finish_task(
-                    worker_id,
-                    final_result,
-                )
-
-                if final_result is not None:
-
-                    results.put((
-                        "RESULT",
-                        final_result,
-                    ))
+                        fatal_error = record[
+                            "error"
+                        ]
 
                 else:
 
-                    state.update_worker(
-                        worker_id,
-                        last_event=(
-                            "FAILED | "
-                            + (
-                                final_error
-                                or "No result"
-                            )
-                        ),
+                    record["status"] = "ERROR"
+
+                    record["error"] = (
+                        f"HTTP {http_status}"
                     )
+
+                    fatal_error = record[
+                        "error"
+                    ]
 
             except StopRequested:
 
-                break
+                record["status"] = "STOPPED"
 
-            except AuthenticationError as exc:
+                record["error"] = "Stopped"
 
-                state.set_fatal(
-                    safe_error(exc)
+                stopped = True
+
+            except RequestException as exc:
+
+                record["status"] = "ERROR"
+
+                record["error"] = safe_error(
+                    exc
                 )
 
-                state.finish_task(
-                    worker_id,
-                    None,
+                retry = (
+                    attempt < MAX_ATTEMPTS
                 )
 
-                state.update_worker(
-                    worker_id,
-                    status="FAILED",
-                    phase="FINISHED",
-                    last_event=safe_error(exc),
+                if not retry:
+
+                    fatal_error = (
+                        record["error"]
+                    )
+
+            except (
+                ResponseError,
+                ResponseTooLarge,
+            ) as exc:
+
+                record["status"] = "ERROR"
+
+                record["error"] = safe_error(
+                    exc
                 )
 
-                profile_stop.set()
+                # Do not blindly repeat expensive
+                # or structurally invalid queries.
 
-                break
+                fatal_error = record[
+                    "error"
+                ]
 
             except Exception as exc:
 
-                state.finish_task(
-                    worker_id,
-                    None,
+                record["status"] = "ERROR"
+
+                record["error"] = safe_error(
+                    exc
                 )
 
-                state.set_fatal(
-                    safe_error(exc)
+                fatal_error = record[
+                    "error"
+                ]
+
+            finally:
+
+                record.setdefault(
+                    "execute_ms",
+
+                    elapsed_ms(
+                        started
+                    ),
+                )
+
+                record["completed_at"] = utc_now()
+
+                record["task_total_ms"] = round(
+                    (
+                        time.perf_counter()
+                        - queued_at
+                    ) * 1000,
+                    3,
+                )
+
+                state.record_request(
+                    record
+                )
+
+                records.append(
+                    dict(record)
+                )
+
+            if result is not None:
+
+                duration = result.get(
+                    "execute_ms",
+                    0.0,
+                )
+
+                prefix = (
+                    "SLOW"
+                    if duration >= SLOW_REQUEST_MS
+                    else "OK"
                 )
 
                 state.update_worker(
                     worker_id,
-                    status="FAILED",
-                    phase="FINISHED",
-                    last_event=safe_error(exc),
-                )
 
-                profile_stop.set()
+                    phase="IDLE",
+
+                    last_event=(
+                        f"{prefix} HTTP 200 | "
+                        f"{format_ms(duration)} | "
+                        f"TTFB "
+                        f"{format_ms(result.get('ttfb_ms'))} | "
+                        f"{result['chunk_kind']}"
+                    ),
+                )
 
                 break
 
-            finally:
+            if stopped or fatal_error:
 
-                tasks.task_done()
+                break
 
-        current = state.snapshot()
+            if not retry:
 
-        worker = next(
-            item
-            for item in current["workers"]
-            if item["worker_id"] == worker_id
-        )
+                break
 
-        if STOP_EVENT.is_set():
+            state.update_worker(
+                worker_id,
 
-            status = "STOPPED"
+                status="RETRYING",
 
-        elif worker["failed"]:
+                phase="RETRYING",
 
-            status = (
-                "PARTIAL"
-                if worker["completed"]
-                else "FAILED"
+                last_event=(
+                    f"Retry {attempt + 1}/"
+                    f"{MAX_ATTEMPTS}"
+                ),
             )
 
-        elif profile_stop.is_set():
+            interruptible_sleep(
+                min(
+                    10,
+                    2 ** attempt,
+                ),
+                stop_event,
+            )
 
-            status = "STOPPED"
+    except StopRequested:
 
-        else:
+        stopped = True
 
-            status = "COMPLETED"
+    except (
+        AuthenticationError,
+        ServiceBusyError,
+    ) as exc:
 
-        state.update_worker(
-            worker_id,
-            status=status,
-            phase="FINISHED",
-            request_started=None,
-            last_event=status,
+        fatal_error = safe_error(
+            exc
         )
 
     except Exception as exc:
 
-        state.set_fatal(
-            safe_error(exc)
+        fatal_error = safe_error(
+            exc
         )
+
+    if fatal_error:
+
+        state.set_fatal(
+            fatal_error
+        )
+
+        stop_event.set()
+
+    if stopped:
 
         state.update_worker(
             worker_id,
-            status="FAILED",
-            phase="FINISHED",
+
+            status="STOPPED",
+
+            phase="IDLE",
+
             request_started=None,
-            last_event=safe_error(exc),
+
+            last_event="STOPPED",
         )
 
-        profile_stop.set()
+    else:
 
-    finally:
-
-        if session is not None:
-
-            session.close()
-
-
-# ============================================================
-# RICH LIVE MONITOR
-# ============================================================
-
-def status_color(status: str) -> str:
+        state.finish_task(
+            worker_id,
+            result,
+        )
 
     return {
-        "STARTING": "dim",
-        "RUNNING": "bright_cyan",
-        "RETRYING": "yellow",
-        "PAUSED": "yellow",
-        "COMPLETED": "green",
-        "PARTIAL": "yellow",
-        "FAILED": "red",
-        "STOPPED": "dim",
-    }.get(
-        status,
-        "white",
+        "worker_id": worker_id,
+
+        "task": task,
+
+        "records": records,
+
+        "result": result,
+
+        "fatal_error": fatal_error,
+
+        "stopped": stopped,
+    }
+
+
+# ============================================================
+# BENCHMARK REGIONS
+# ============================================================
+
+def build_benchmark_regions(x_total):
+
+    size = min(
+        BENCHMARK_REGION_SIZE,
+        x_total,
+    )
+
+    candidates = [
+        (
+            0,
+            size,
+        ),
+
+        (
+            max(
+                0,
+                x_total // 2
+                - size // 2,
+            ),
+            size,
+        ),
+
+        (
+            max(
+                0,
+                x_total - size,
+            ),
+            size,
+        ),
+    ]
+
+    intervals = sorted(
+        (
+            start,
+            min(
+                start + count,
+                x_total,
+            ),
+        )
+
+        for start, count in candidates
+    )
+
+    merged = []
+
+    for start, end in intervals:
+
+        if merged and start <= merged[-1][1]:
+
+            merged[-1][1] = max(
+                merged[-1][1],
+                end,
+            )
+
+        else:
+
+            merged.append([
+                start,
+                end,
+            ])
+
+    return [
+        (
+            start,
+            end - start,
+        )
+        for start, end in merged
+    ]
+
+
+def build_benchmark_profiles(
+    max_workers,
+    axes,
+):
+
+    all_years = axes.y_count
+
+    profiles = [
+        Profile(
+            "01_REFERENCE_SUBSET",
+
+            "subset",
+
+            1,
+
+            5,
+
+            all_years,
+        ),
+
+        Profile(
+            "02_EXPLICIT_SMALL",
+
+            "explicit",
+
+            1,
+
+            5,
+
+            all_years,
+        ),
+
+        Profile(
+            "03_EXPLICIT_BALANCED",
+
+            "explicit",
+
+            1,
+
+            10,
+
+            all_years,
+        ),
+
+        Profile(
+            "04_EXPLICIT_MEDIUM",
+
+            "explicit",
+
+            1,
+
+            20,
+
+            all_years,
+        ),
+    ]
+
+    if max_workers >= 2:
+
+        profiles.append(
+            Profile(
+                "05_EXPLICIT_PARALLEL_2",
+
+                "explicit",
+
+                2,
+
+                10,
+
+                all_years,
+            )
+        )
+
+    if max_workers > 2:
+
+        profiles.append(
+            Profile(
+                "06_EXPLICIT_PARALLEL_MAX",
+
+                "explicit",
+
+                max_workers,
+
+                10,
+
+                all_years,
+            )
+        )
+
+    return profiles
+
+
+def generate_tasks(
+    query,
+    axes,
+    profile,
+    regions,
+):
+
+    for region_start, region_size in regions:
+
+        region_end = (
+            region_start
+            + region_size
+        )
+
+        for x_offset in range(
+            region_start,
+            region_end,
+            profile.x_chunk,
+        ):
+
+            x_chunk = min(
+                profile.x_chunk,
+
+                region_end
+                - x_offset,
+            )
+
+            for y_offset in range(
+                0,
+
+                axes.y_count,
+
+                profile.y_chunk,
+            ):
+
+                y_chunk = min(
+                    profile.y_chunk,
+
+                    axes.y_count
+                    - y_offset,
+                )
+
+                request_id = (
+                    f"{query.query_hash}"
+                    f"_x{x_offset:06d}"
+                    f"_y{y_offset:06d}"
+                    f"_xs{x_chunk:04d}"
+                    f"_ys{y_chunk:04d}"
+                )
+
+                yield RequestTask(
+                    request_id=request_id,
+
+                    x_offset=x_offset,
+
+                    y_offset=y_offset,
+
+                    x_chunk=x_chunk,
+
+                    y_chunk=y_chunk,
+                )
+
+
+def count_tasks(
+    axes,
+    profile,
+    regions,
+):
+
+    return sum(
+        math.ceil(
+            count / profile.x_chunk
+        )
+
+        * math.ceil(
+            axes.y_count
+            / profile.y_chunk
+        )
+
+        for _, count in regions
     )
 
 
-def latency_color(value) -> str:
+# ============================================================
+# RICH UI UTILITIES
+# ============================================================
+
+def latency_color(value):
 
     if value is None:
 
         return "dim"
 
-    if value >= 15000:
+    if value >= VERY_SLOW_REQUEST_MS:
 
         return "bright_red"
 
@@ -3882,22 +4701,44 @@ def latency_color(value) -> str:
     return "white"
 
 
-def make_panel(
-    content,
-    title: str,
-):
+def status_color(status):
 
-    return Panel(
-        content,
-        title=title,
-        border_style="cyan",
-        padding=(0, 1),
+    return {
+        "STARTING": "dim",
+
+        "RUNNING": "bright_cyan",
+
+        "RETRYING": "yellow",
+
+        "PAUSED": "yellow",
+
+        "COMPLETED": "green",
+
+        "FAILED": "red",
+
+        "STOPPED": "dim",
+    }.get(
+        status,
+        "white",
     )
 
 
-def kv_table(
-    values: list[tuple],
-):
+def make_panel(content, title, height=None):
+
+    return Panel(
+        content,
+
+        title=title,
+
+        border_style="cyan",
+
+        padding=(0, 1),
+
+        height=height,
+    )
+
+
+def kv_table(values):
 
     table = Table.grid(
         expand=True
@@ -3905,548 +4746,699 @@ def kv_table(
 
     table.add_column(
         style="dim",
+
         ratio=1,
     )
 
     table.add_column(
+        ratio=1,
+
         justify="right",
-        ratio=2,
     )
 
-    for key, value in values:
+    for name, value in values:
 
         table.add_row(
-            Text(str(key)),
-            value if isinstance(value, Text)
-            else Text(str(value)),
+            Text(str(name)),
+
+            (
+                value
+                if isinstance(
+                    value,
+                    Text,
+                )
+
+                else Text(str(value))
+            ),
         )
 
     return table
 
 
-def render_monitor(
-    query: QuerySpec,
-    profile: Profile,
-    metrics: dict,
-    control: RequestControl,
-    auth: AuthenticationManager,
-    *,
-    mode: str,
-    x_total: int,
-    y_total: int,
-    benchmark_results: list[dict],
+def paired_panels(
+    first,
+    first_title,
+    second,
+    second_title,
+    height,
 ):
+
+    if console.size.width < 100:
+
+        return Group(
+            make_panel(
+                first,
+                first_title,
+            ),
+
+            make_panel(
+                second,
+                second_title,
+            ),
+        )
+
+    table = Table.grid(
+        expand=True
+    )
+
+    table.add_column(
+        ratio=1
+    )
+
+    table.add_column(
+        ratio=1
+    )
+
+    table.add_row(
+        make_panel(
+            first,
+            first_title,
+            height,
+        ),
+
+        make_panel(
+            second,
+            second_title,
+            height,
+        ),
+    )
+
+    return table
+
+
+# ============================================================
+# LIVE TERMINAL MONITOR
+# ============================================================
+
+def render_monitor(
+    profile,
+    axes,
+    state,
+    control,
+    mode,
+    benchmark_results,
+):
+
+    metrics = aggregate_metrics(
+        state.snapshot()
+    )
 
     width = console.size.width
     height = console.size.height
 
-    workers = metrics["workers"]
+    timing = metrics[
+        "timing"
+    ]
 
-    completed = metrics["completed_tasks"]
+    completed = metrics[
+        "completed_tasks"
+    ]
 
-    failed = metrics["failed_tasks"]
+    total = metrics[
+        "total_tasks"
+    ]
 
-    task_total = metrics["total_tasks"]
-
-    active = sum(
-        worker["status"] in (
-            "RUNNING",
-            "RETRYING",
-            "PAUSED",
-        )
-        for worker in workers
-    )
-
-    timing = metrics["timing"]
+    workers = metrics[
+        "workers"
+    ]
 
     header = Panel(
         Text(
             APP_NAME
+
+            + f" | v{APP_VERSION}"
+
             + "\n"
-            + "MV / FY | XMLA / MDX | "
-            + "CURL_CFFI PERFORMANCE LAB",
+
+            + "MV/FY | XMLA / MDX | NATIVE CURL CALLBACK",
+
             justify="center",
+
             style="bold bright_cyan",
         ),
+
         border_style="cyan",
     )
 
     overview = kv_table([
-        ("Mode", mode.upper()),
+        (
+            "Mode",
 
-        ("Profile", profile.name),
+            mode.upper(),
+        ),
 
-        ("Engine", profile.engine.upper()),
+        (
+            "Profile",
 
-        ("Cookie", Text(
-            "VALID",
-            style="green",
-        )),
+            profile.name,
+        ),
 
-        ("JWT", Text(
-            "VALID"
-            if jwt_exp(auth.token) > time.time()
-            else "REFRESH REQUIRED",
-            style=(
-                "green"
-                if jwt_exp(auth.token) > time.time()
-                else "yellow"
+        (
+            "MDX strategy",
+
+            profile.strategy.upper(),
+        ),
+
+        (
+            "Parallel limit",
+
+            f"{metrics['active_limit']}/"
+            f"{profile.workers}",
+        ),
+
+        (
+            "Elapsed",
+
+            format_duration(
+                metrics["elapsed"]
             ),
-        )),
+        ),
 
-        ("Workers", f"{active}/{profile.workers}"),
+        (
+            "ETA",
 
-        ("Elapsed", format_duration(
-            metrics["elapsed"]
-        )),
+            format_duration(
+                metrics["eta_seconds"]
+            )
+
+            if metrics["eta_seconds"] is not None
+            else "—",
+        ),
     ])
 
     configuration = kv_table([
-        ("Category", "MV"),
+        (
+            "Cube",
 
-        ("Cube", "FY"),
+            "MV / FY",
+        ),
 
-        ("X1", query.x_captions[0]),
+        (
+            "X1",
 
-        ("X2", query.x_captions[1]),
+            X_CAPTIONS[0],
+        ),
 
-        ("Y1", query.y_captions[0]),
+        (
+            "X2",
 
-        ("Measures", len(query.measures)),
+            X_CAPTIONS[1],
+        ),
+
+        (
+            "Y1",
+
+            Y_CAPTIONS[0],
+        ),
+
+        (
+            "Measures",
+
+            len(MEASURE_CAPTIONS),
+        ),
 
         (
             "Chunk X/Y",
-            f"{profile.x_chunk}/{profile.y_chunk}",
+
+            f"{profile.x_chunk}/"
+            f"{profile.y_chunk}",
         ),
 
         (
-            "Scope X/Y",
-            f"{x_total:,}/{y_total:,}",
+            "Axis X/Y",
+
+            f"{axes.x_count:,}/"
+            f"{axes.y_count:,}",
         ),
     ])
 
-    top = Table.grid(
-        expand=True
+    top = paired_panels(
+        overview,
+
+        "01 / ENGINE OVERVIEW",
+
+        configuration,
+
+        "02 / FIXED QUERY",
+
+        height=9,
     )
 
-    top.add_column(
-        ratio=1
-    )
+    progress = make_panel(
+        Group(
+            Text.assemble(
+                (
+                    f"{completed:,}/{total:,} COMPLETED",
 
-    top.add_column(
-        ratio=1
-    )
+                    "bold green",
+                ),
 
-    top.add_row(
-        make_panel(
-            overview,
-            "01 / ENGINE OVERVIEW",
+                " | ",
+
+                (
+                    f"{metrics['failed_tasks']:,} FAILED",
+
+                    "red"
+                    if metrics["failed_tasks"]
+                    else "dim",
+                ),
+
+                " | ",
+
+                (
+                    f"{metrics['completion_percent']:.2f}%",
+
+                    "cyan",
+                ),
+            ),
+
+            Bar(
+                size=max(
+                    1,
+                    total,
+                ),
+
+                begin=0,
+
+                end=completed,
+
+                color="cyan",
+
+                bgcolor="grey23",
+            ),
+
+            Text(
+                f"Data {metrics['data_chunks']:,}"
+
+                f" | No cells {metrics['no_cell_chunks']:,}"
+
+                f" | Empty {metrics['empty_pages']:,}"
+
+                " | Excel export: AFTER EXTRACTION",
+
+                style="dim",
+            ),
         ),
 
-        make_panel(
-            configuration,
-            "02 / FIXED QUERY",
-        ),
-    )
-
-    progress_lines = []
-
-    progress_lines.append(
-        Text.assemble(
-            (
-                f"{completed:,}/{task_total:,} "
-                "COMPLETED",
-                "bold green",
-            ),
-
-            " | ",
-
-            (
-                f"{failed:,} FAILED",
-                "red" if failed else "dim",
-            ),
-        )
-    )
-
-    progress_lines.append(
-        Bar(
-            size=max(
-                1,
-                task_total,
-            ),
-            begin=0,
-            end=completed,
-            color="cyan",
-            bgcolor="grey23",
-        )
-    )
-
-    progress_percent = (
-        completed / task_total * 100
-        if task_total
-        else 100
-    )
-
-    progress_lines.append(
-        Text(
-            f"Completion: {progress_percent:.2f}%"
-            f" | Data: {metrics['data_chunks']:,}"
-            f" | Empty: {metrics['empty_pages']:,}"
-            f" | No cells: {metrics['no_cell_chunks']:,}",
-            style="dim",
-        )
-    )
-
-    progress_panel = make_panel(
-        Group(*progress_lines),
         "03 / EXTRACTION PROGRESS",
     )
 
-    latency = metrics[
-        "average_ms"
-    ]
-
     performance = kv_table([
-        ("Requests", f"{metrics['requests']:,}"),
+        (
+            "Requests",
 
-        ("Requests/sec", (
-            f"{metrics['request_rate']:.2f}"
-        )),
-
-        ("Cells/sec", Text(
-            f"{metrics['cells_per_second']:.2f}",
-            style="bold green",
-        )),
-
-        ("Average latency", Text(
-            format_ms(latency),
-            style=latency_color(latency),
-        )),
-
-        ("Median latency", format_ms(
-            metrics["median_ms"]
-        )),
-
-        ("P95 latency", Text(
-            format_ms(metrics["p95_ms"]),
-            style=latency_color(
-                metrics["p95_ms"]
-            ),
-        )),
-
-        ("Recent average", format_ms(
-            metrics["recent_average_ms"]
-        )),
-
-        ("Recent P95", format_ms(
-            metrics["recent_p95_ms"]
-        )),
-
-        ("Slow requests", metrics[
-            "slow_requests"
-        ]),
-
-        ("Non-null cells", f"{metrics['non_null_cells']:,}"),
-
-        ("Saved XML", format_bytes(
-            metrics["response_bytes"]
-        )),
-
-        ("Cooldown", (
-            f"{control.remaining():.1f}s"
-            if control.remaining()
-            else "NONE"
-        )),
-    ])
-
-    timing_table = Table.grid(
-        expand=True
-    )
-
-    timing_table.add_column(
-        style="dim",
-        ratio=2,
-    )
-
-    timing_table.add_column(
-        justify="right",
-        ratio=1,
-    )
-
-    timing_rows = [
-        ("Queue wait", "queue_wait_ms"),
-
-        ("Rate wait", "rate_wait_ms"),
-
-        ("Token refresh", "token_refresh_ms"),
-
-        ("DNS lookup", "dns_ms"),
-
-        ("TCP connect", "connect_ms"),
-
-        ("TLS handshake", "tls_ms"),
-
-        ("TTFB", "ttfb_ms"),
+            metrics["requests"],
+        ),
 
         (
-            "Response wait estimate",
-            "response_wait_estimate_ms",
+            "Requests/sec",
+
+            f"{metrics['requests_per_second']:.2f}",
         ),
 
-        ("Receive", "receive_ms"),
-
-        ("File write", "file_write_ms"),
-
-        ("Finalize XML", "finalize_ms"),
-
-        ("Parse XML", "parse_ms"),
-    ]
-
-    for label, key in timing_rows:
-
-        value = timing.get(key)
-
-        timing_table.add_row(
-            Text(label),
+        (
+            "Cells/sec",
 
             Text(
-                format_ms(value),
-                style=latency_color(value),
+                f"{metrics['cells_per_second']:.2f}",
+
+                style="bold green",
             ),
-        )
-
-    metric_grid = Table.grid(
-        expand=True
-    )
-
-    metric_grid.add_column(
-        ratio=1
-    )
-
-    metric_grid.add_column(
-        ratio=1
-    )
-
-    metric_grid.add_row(
-        make_panel(
-            performance,
-            "04 / PERFORMANCE",
         ),
 
-        make_panel(
-            timing_table,
-            "05 / TIMING BREAKDOWN",
+        (
+            "Average",
+
+            Text(
+                format_ms(
+                    metrics["average_ms"]
+                ),
+
+                style=latency_color(
+                    metrics["average_ms"]
+                ),
+            ),
         ),
-    )
 
-    worker_blocks = []
+        (
+            "P95",
 
-    normal_mode = (
-        height >= (
-            42 + len(workers) * 4
-        )
-        and width >= 90
-    )
+            Text(
+                format_ms(
+                    metrics["p95_ms"]
+                ),
 
-    for worker in workers:
+                style=latency_color(
+                    metrics["p95_ms"]
+                ),
+            ),
+        ),
 
-        worker_id = worker["worker_id"]
+        (
+            "Recent average",
 
-        status = worker["status"]
+            format_ms(
+                metrics["recent_average_ms"]
+            ),
+        ),
 
-        color = status_color(status)
+        (
+            "Recent P95",
 
-        last_ms = worker.get(
-            "last_request_ms"
-        )
+            format_ms(
+                metrics["recent_p95_ms"]
+            ),
+        ),
 
-        current_ms = worker.get(
-            "current_request_ms"
-        )
+        (
+            "Slow requests",
 
-        relative = worker.get(
-            "relative_progress",
-            0,
-        )
+            metrics["slow_requests"],
+        ),
 
-        x_offset = worker.get(
-            "x_offset"
-        )
+        (
+            "Non-null cells",
 
-        y_offset = worker.get(
-            "y_offset"
-        )
+            f"{metrics['non_null_cells']:,}",
+        ),
 
-        offset = (
-            f"{x_offset}/{y_offset}"
-            if x_offset is not None
-            else "—"
-        )
+        (
+            "Saved XML",
 
-        last_http = worker.get(
-            "last_http"
-        )
+            format_bytes(
+                metrics["response_bytes"]
+            ),
+        ),
 
-        left = Text.assemble(
+        (
+            "Downloaded",
+
+            format_bytes(
+                metrics["download_bytes"]
+            ),
+        ),
+
+        (
+            "Connection reuse",
+
             (
-                f"W{worker_id:02d}  ",
-                "bold white",
+                f"{metrics['connection_reuse_percent']:.1f}%"
+
+                if metrics["connection_reuse_percent"]
+                is not None
+
+                else "—"
             ),
-            (
-                status,
-                color,
-            ),
-        )
+        ),
+    ])
 
-        right = Text(
-            f"Last {format_ms(last_ms)}",
-            style=latency_color(last_ms),
-        )
-
-        row = Table.grid(
-            expand=True
-        )
-
-        row.add_column(
-            ratio=1
-        )
-
-        row.add_column(
-            justify="right"
-        )
-
-        row.add_row(
-            left,
-            right,
-        )
-
-        bar = Bar(
-            size=1000,
-            begin=0,
-            end=int(
-                relative * 1000
-            ),
-            color=color,
-            bgcolor="grey23",
-        )
-
-        details = Table.grid(
-            expand=True
-        )
-
-        details.add_column(
-            ratio=1
-        )
-
-        details.add_column(
-            justify="right"
-        )
-
-        details.add_row(
-            Text(
-                f"Offset {offset}"
-                f" | {worker['phase']}",
-                style="dim",
-            ),
+    timing_table = kv_table([
+        (
+            label,
 
             Text(
-                f"{worker['completed']:,} chunks"
-                f" | {worker['failed']:,} failed",
-                style=(
-                    "yellow"
-                    if worker["failed"]
-                    else "white"
+                format_ms(
+                    timing.get(key)
+                ),
+
+                style=latency_color(
+                    timing.get(key)
                 ),
             ),
         )
 
-        extra = Text.assemble(
+        for label, key in (
+            ("Queue wait", "queue_wait_ms"),
+
+            ("Rate wait", "rate_wait_ms"),
+
+            ("Token refresh", "token_refresh_ms"),
+
+            ("DNS", "dns_ms"),
+
+            ("TCP connect", "connect_ms"),
+
+            ("TLS", "tls_ms"),
+
+            ("TTFB", "ttfb_ms"),
+
             (
-                f"HTTP {last_http or '—'}",
-                "green"
-                if last_http == 200
-                else "dim",
+                "Response wait",
+                "response_wait_estimate_ms",
             ),
 
-            f" | TTFB "
-            f"{format_ms(worker.get('last_ttfb_ms'))}",
+            ("Receive", "receive_ms"),
 
-            (
-                f" | Current {format_ms(current_ms)}",
-                latency_color(current_ms),
-            ),
+            ("XML write", "file_write_ms"),
 
-            f" | Cells {worker['cells']:,}",
+            ("Finalize XML", "finalize_ms"),
+
+            ("XML parse", "parse_ms"),
+        )
+    ])
+
+    metric_panels = paired_panels(
+        performance,
+
+        "04 / PERFORMANCE",
+
+        timing_table,
+
+        "05 / TIMING BREAKDOWN",
+
+        height=14,
+    )
+
+    worker_blocks = []
+
+    compact = (
+        height < 45 + len(workers) * 4
+        or width < 100
+    )
+
+    for worker in workers:
+
+        worker_id = worker[
+            "worker_id"
+        ]
+
+        status = worker[
+            "status"
+        ]
+
+        phase = worker[
+            "phase"
+        ]
+
+        last_ms = worker[
+            "last_request_ms"
+        ]
+
+        current_ms = worker[
+            "current_request_ms"
+        ]
+
+        color = status_color(
+            status
         )
 
-        if normal_mode:
+        bar = Bar(
+            size=1000,
 
-            worker_blocks.extend([
-                row,
-                bar,
-                details,
-                extra,
-                Text(""),
-            ])
+            begin=0,
 
-        else:
+            end=int(
+                worker["relative_progress"]
+                * 1000
+            ),
 
-            compact = Table.grid(
+            color=color,
+
+            bgcolor="grey23",
+        )
+
+        offset = (
+            f"{worker['x_offset']}/"
+            f"{worker['y_offset']}"
+
+            if worker["x_offset"] is not None
+
+            else "—"
+        )
+
+        if compact:
+
+            table = Table.grid(
                 expand=True
             )
 
-            compact.add_column(
+            table.add_column(
                 width=5
             )
 
-            compact.add_column(
-                width=10
+            table.add_column(
+                width=14
             )
 
-            compact.add_column(
+            table.add_column(
                 ratio=1
             )
 
-            compact.add_column(
+            table.add_column(
                 justify="right"
             )
 
-            compact.add_row(
+            table.add_row(
                 Text(
                     f"W{worker_id:02d}",
                     style="bold",
                 ),
 
                 Text(
-                    status,
+                    phase,
                     style=color,
                 ),
 
                 bar,
 
                 Text(
-                    f"{worker['completed']:,}"
-                    f"/{worker['failed']:,}"
-                    f" | {format_ms(last_ms)}"
+                    f"{worker['completed']:,} OK"
+
+                    f" | {worker['failed']} ERR"
+
+                    f" | Last {format_ms(last_ms)}"
+
                     f" | Now {format_ms(current_ms)}",
-                    style=latency_color(last_ms),
+
+                    style=latency_color(
+                        current_ms
+                        if current_ms is not None
+                        else last_ms
+                    ),
                 ),
             )
 
             worker_blocks.append(
-                compact
+                table
             )
+
+        else:
+
+            row = Table.grid(
+                expand=True
+            )
+
+            row.add_column(
+                ratio=1
+            )
+
+            row.add_column(
+                justify="right"
+            )
+
+            row.add_row(
+                Text.assemble(
+                    (
+                        f"W{worker_id:02d}  ",
+                        "bold white",
+                    ),
+
+                    (
+                        status,
+                        color,
+                    ),
+                ),
+
+                Text(
+                    f"Last {format_ms(last_ms)}",
+
+                    style=latency_color(
+                        last_ms
+                    ),
+                ),
+            )
+
+            details = Table.grid(
+                expand=True
+            )
+
+            details.add_column(
+                ratio=1
+            )
+
+            details.add_column(
+                justify="right"
+            )
+
+            details.add_row(
+                Text(
+                    f"Offset {offset} | {phase}",
+
+                    style="dim",
+                ),
+
+                Text(
+                    f"{worker['completed']:,} chunks"
+
+                    f" | {worker['failed']} failed",
+                ),
+            )
+
+            extra = Text.assemble(
+                (
+                    f"HTTP {worker['last_http'] or '—'}",
+
+                    "green"
+
+                    if worker["last_http"] == 200
+
+                    else "dim",
+                ),
+
+                (
+                    f" | TTFB "
+                    f"{format_ms(worker['last_ttfb_ms'])}"
+                ),
+
+                (
+                    f" | Current "
+                    f"{format_ms(current_ms)}",
+
+                    latency_color(
+                        current_ms
+                    ),
+                ),
+
+                f" | Cells {worker['cells']:,}",
+            )
+
+            worker_blocks.extend([
+                row,
+
+                bar,
+
+                details,
+
+                extra,
+            ])
 
     worker_blocks.append(
         Text(
-            "Relative successful chunks versus leading worker.",
+            "Relative completed chunks, "
+            "not worker completion percentage.",
+
             style="dim",
         )
     )
 
     worker_panel = make_panel(
         Group(*worker_blocks),
+
         "06 / PARALLEL WORKERS",
+    )
+
+    diagnosis = identify_bottleneck(
+        metrics
     )
 
     alerts = []
@@ -4455,25 +5447,45 @@ def render_monitor(
 
         alerts.append(
             Text(
-                "SLOW IN-FLIGHT REQUESTS: "
-                f"{metrics['slow_inflight_workers']}",
+                "SLOW IN-FLIGHT: "
+
+                f"{metrics['slow_inflight_workers']} workers",
+
                 style="yellow",
             )
         )
 
-    recent_p95 = metrics[
-        "recent_p95_ms"
-    ]
-
-    if (
-        recent_p95 is not None
-        and recent_p95 >= SLOW_REQUEST_MS
-    ):
+    if diagnosis["name"] != "UNKNOWN":
 
         alerts.append(
             Text(
-                "HIGH TAIL LATENCY | "
-                f"P95 {format_ms(recent_p95)}",
+                f"BOTTLENECK: {diagnosis['name']}"
+
+                f" | {format_ms(diagnosis.get('average_ms'))}",
+
+                style=(
+                    "yellow"
+
+                    if diagnosis.get(
+                        "average_ms",
+                        0,
+                    ) >= SLOW_REQUEST_MS
+
+                    else "cyan"
+                ),
+            )
+        )
+
+    if metrics["active_limit"] < profile.workers:
+
+        alerts.append(
+            Text(
+                "CONCURRENCY REDUCED: "
+
+                f"{profile.workers}"
+
+                f" → {metrics['active_limit']}",
+
                 style="yellow",
             )
         )
@@ -4482,8 +5494,10 @@ def render_monitor(
 
         alerts.append(
             Text(
-                "SERVER COOLDOWN | "
+                "SERVER BACKOFF: "
+
                 f"{control.remaining():.1f}s",
+
                 style="yellow",
             )
         )
@@ -4493,6 +5507,7 @@ def render_monitor(
         alerts.append(
             Text(
                 metrics["fatal_error"],
+
                 style="red",
             )
         )
@@ -4502,82 +5517,123 @@ def render_monitor(
         alerts.append(
             Text(
                 "No active performance warnings",
+
                 style="green",
             )
         )
 
     alert_panel = make_panel(
         Group(*alerts),
-        "07 / PERFORMANCE ALERTS",
+
+        "07 / PERFORMANCE ANALYSIS",
     )
 
-    benchmark_table = Table(
-        box=box.SIMPLE,
-        expand=True,
-    )
+    sections = [
+        header,
 
-    for name in (
-        "Profile",
-        "W",
-        "Chunk",
-        "Elapsed",
-        "P95",
-        "Cells/s",
-        "Match",
-    ):
+        top,
 
-        benchmark_table.add_column(
-            name,
-            no_wrap=True,
+        progress,
+
+        metric_panels,
+
+        worker_panel,
+
+        alert_panel,
+    ]
+
+    if benchmark_results:
+
+        table = Table(
+            box=box.SIMPLE,
+
+            expand=True,
         )
 
-    for result in benchmark_results:
+        for column in (
+            "Profile",
 
-        equivalent = result.get(
-            "equivalent"
-        )
+            "W",
 
-        benchmark_table.add_row(
-            result["profile"],
+            "Chunk",
 
-            str(result["workers_count"]),
+            "Elapsed",
 
-            (
-                f"{result['x_chunk']}/"
-                f"{result['y_chunk']}"
-            ),
+            "P95",
 
-            format_duration(
-                result["elapsed"]
-            ),
+            "Cells/s",
 
-            format_ms(
-                result.get("p95_ms")
-            ),
+            "Match",
+        ):
 
-            f"{result['cells_per_second']:.2f}",
+            table.add_column(
+                column
+            )
 
-            Text(
-                "YES"
-                if equivalent is True
-                else "NO"
-                if equivalent is False
-                else "—",
-                style=(
-                    "green"
-                    if equivalent is True
-                    else "red"
-                    if equivalent is False
-                    else "dim"
+        for result in benchmark_results[-6:]:
+
+            equivalent = result.get(
+                "equivalent"
+            )
+
+            table.add_row(
+                result["profile"],
+
+                str(
+                    result["workers_count"]
                 ),
-            ),
-        )
 
-    activity = []
+                f"{result['x_chunk']}/"
+                f"{result['y_chunk']}",
 
-    for event in metrics["events"][-4:]:
+                format_duration(
+                    result["elapsed"]
+                ),
 
-        activity.append(
+                format_ms(
+                    result.get("p95_ms")
+                ),
+
+                f"{result['cells_per_second']:.2f}",
+
+                Text(
+                    "YES"
+
+                    if equivalent is True
+
+                    else "NO"
+
+                    if equivalent is False
+
+                    else "—",
+
+                    style=(
+                        "green"
+
+                        if equivalent is True
+
+                        else "red"
+
+                        if equivalent is False
+
+                        else "dim"
+                    ),
+                ),
+            )
+
+        if height >= 50:
+
+            sections.append(
+                make_panel(
+                    table,
+
+                    "08 / BENCHMARK RESULTS",
+                )
+            )
+
+    if height >= 42:
+
+        events = [
             Text.assemble(
                 (
                     event["time"] + " ",
@@ -4591,695 +5647,52 @@ def render_monitor(
 
                 event["message"],
             )
-        )
 
-    if not activity:
-
-        activity.append(
-            Text(
-                "Waiting for workers...",
-                style="dim",
-            )
-        )
-
-    sections = [
-        header,
-        top,
-        progress_panel,
-        metric_grid,
-        worker_panel,
-        alert_panel,
-    ]
-
-    if benchmark_results:
+            for event in metrics["events"][-3:]
+        ]
 
         sections.append(
             make_panel(
-                benchmark_table,
-                "08 / BENCHMARK RESULTS",
-            )
-        )
+                Group(
+                    *events
+                ),
 
-    if height >= 42:
-
-        sections.append(
-            make_panel(
-                Group(*activity),
                 "LATEST ACTIVITY",
             )
         )
 
     sections.append(
         Text(
-            "LOCAL TIME | "
-            "REFRESH 1s | "
-            "Ctrl+C TO STOP",
+            "LOCAL TIME | REFRESH 1s | CTRL+C TO STOP",
+
             style="dim",
         )
     )
 
-    return Group(*sections)
+    return Group(
+        *sections
+    )
 
 
 # ============================================================
-# DYNAMIC REQUEST SCHEDULER
+# DATASET VALIDATION
 # ============================================================
 
-def generate_tasks(
-    query: QuerySpec,
-    profile: Profile,
-    x_total: int,
-    y_total: int,
-):
-
-    for x_offset in range(
-        0,
-        x_total,
-        profile.x_chunk,
-    ):
-
-        x_size = min(
-            profile.x_chunk,
-            x_total - x_offset,
-        )
-
-        for y_offset in range(
-            0,
-            y_total,
-            profile.y_chunk,
-        ):
-
-            y_size = min(
-                profile.y_chunk,
-                y_total - y_offset,
-            )
-
-            yield (
-                x_offset,
-                y_offset,
-                x_size,
-                y_size,
-            )
-
-
-def run_scheduler(
-    query: QuerySpec,
-    profile: Profile,
-    x_total: int,
-    y_total: int,
-    auth: AuthenticationManager,
-    control: RequestControl,
-    run_dir: Path,
-    csv_writer,
-    csv_handle,
-    *,
-    mode: str,
-    capture_values: bool,
-    benchmark_results: list[dict],
-) -> tuple[dict, dict]:
-
-    task_total = (
-        math.ceil(
-            x_total / profile.x_chunk
-        )
-        * math.ceil(
-            y_total / profile.y_chunk
-        )
-    )
-
-    if task_total > MAX_TASKS_PER_RUN:
-
-        raise EngineError(
-            f"Planned tasks exceed local limit: "
-            f"{task_total:,}"
-        )
-
-    profile_dir = (
-        run_dir
-        / profile.name
-    )
-
-    profile_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    state = EngineState(
-        profile,
-        task_total,
-    )
-
-    tasks = queue.Queue(
-        maxsize=max(
-            2,
-            profile.workers * 2,
-        )
-    )
-
-    results = queue.Queue()
-
-    no_more_tasks = threading.Event()
-
-    profile_stop = threading.Event()
-
-    generator = iter(
-        generate_tasks(
-            query,
-            profile,
-            x_total,
-            y_total,
-        )
-    )
-
-    comparison_values = {}
-
-    duplicate_keys = 0
-
-    data_updates = set()
-
-    threads = []
-
-    def drain_results():
-
-        nonlocal duplicate_keys
-
-        while True:
-
-            try:
-
-                kind, record = (
-                    results.get_nowait()
-                )
-
-            except queue.Empty:
-
-                break
-
-            if kind == "REQUEST":
-
-                csv_writer.writerow({
-                    name: record.get(name)
-                    for name in CSV_FIELDS
-                })
-
-            elif kind == "RESULT":
-
-                update = record.get(
-                    "last_data_update"
-                )
-
-                if update:
-
-                    data_updates.add(update)
-
-                if capture_values:
-
-                    values = record.get(
-                        "comparison_values",
-                        {},
-                    )
-
-                    for key, value in values.items():
-
-                        if key in comparison_values:
-
-                            duplicate_keys += 1
-
-                        comparison_values[key] = value
-
-        csv_handle.flush()
-
-    for worker_id in range(
-        1,
-        profile.workers + 1,
-    ):
-
-        thread = threading.Thread(
-            target=request_worker,
-
-            name=f"W{worker_id:02d}",
-
-            args=(
-                worker_id,
-                query,
-                profile,
-                tasks,
-                results,
-                no_more_tasks,
-                profile_stop,
-                state,
-                auth,
-                control,
-                profile_dir,
-            ),
-
-            kwargs={
-                "capture_values": capture_values,
-            },
-
-            daemon=False,
-        )
-
-        threads.append(thread)
-
-        thread.start()
-
-    try:
-
-        with Live(
-            console=console,
-            refresh_per_second=1,
-            auto_refresh=False,
-            screen=True,
-            vertical_overflow="crop",
-        ) as live:
-
-            next_refresh = 0.0
-
-            while True:
-
-                if (
-                    STOP_EVENT.is_set()
-                    or profile_stop.is_set()
-                ):
-
-                    no_more_tasks.set()
-
-                if not no_more_tasks.is_set():
-
-                    while not tasks.full():
-
-                        try:
-
-                            (
-                                x_offset,
-                                y_offset,
-                                x_size,
-                                y_size,
-                            ) = next(generator)
-
-                        except StopIteration:
-
-                            no_more_tasks.set()
-
-                            break
-
-                        request_id = (
-                            f"{query.query_hash}"
-                            f"_x{x_offset:06d}"
-                            f"_y{y_offset:06d}"
-                            f"_xs{x_size:04d}"
-                            f"_ys{y_size:04d}"
-                        )
-
-                        task = RequestTask(
-                            request_id=request_id,
-
-                            x_offset=x_offset,
-
-                            y_offset=y_offset,
-
-                            x_chunk=x_size,
-
-                            y_chunk=y_size,
-
-                            queued_at=time.perf_counter(),
-                        )
-
-                        tasks.put_nowait(
-                            task
-                        )
-
-                drain_results()
-
-                now = time.monotonic()
-
-                if now >= next_refresh:
-
-                    metrics = aggregate_metrics(
-                        state.snapshot()
-                    )
-
-                    live.update(
-                        render_monitor(
-                            query,
-                            profile,
-                            metrics,
-                            control,
-                            auth,
-                            mode=mode,
-                            x_total=x_total,
-                            y_total=y_total,
-                            benchmark_results=benchmark_results,
-                        ),
-                        refresh=True,
-                    )
-
-                    next_refresh = (
-                        now
-                        + REFRESH_INTERVAL
-                    )
-
-                if not any(
-                    thread.is_alive()
-                    for thread in threads
-                ):
-
-                    break
-
-                time.sleep(0.1)
-
-            drain_results()
-
-            live.update(
-                render_monitor(
-                    query,
-                    profile,
-                    aggregate_metrics(
-                        state.snapshot()
-                    ),
-                    control,
-                    auth,
-                    mode=mode,
-                    x_total=x_total,
-                    y_total=y_total,
-                    benchmark_results=benchmark_results,
-                ),
-                refresh=True,
-            )
-
-    except KeyboardInterrupt:
-
-        STOP_EVENT.set()
-
-        profile_stop.set()
-
-        no_more_tasks.set()
-
-    finally:
-
-        if (
-            STOP_EVENT.is_set()
-            or profile_stop.is_set()
-        ):
-
-            no_more_tasks.set()
-
-        for thread in threads:
-
-            thread.join()
-
-        drain_results()
-
-    metrics = aggregate_metrics(
-        state.snapshot()
-    )
-
-    status = "COMPLETED"
-
-    if STOP_EVENT.is_set():
-
-        status = "STOPPED"
-
-    elif (
-        metrics["failed_tasks"]
-        or metrics["fatal_error"]
-        or metrics["completed_tasks"] != task_total
-        or duplicate_keys
-        or len(data_updates) > 1
-    ):
-
-        status = (
-            "PARTIAL"
-            if metrics["completed_tasks"]
-            else "FAILED"
-        )
-
-    report = {
-        **metrics,
-
-        "status": status,
-
-        "profile": profile.name,
-
-        "engine": profile.engine,
-
-        "workers_count": profile.workers,
-
-        "x_chunk": profile.x_chunk,
-        "y_chunk": profile.y_chunk,
-
-        "x_total": x_total,
-        "y_total": y_total,
-
-        "duplicate_keys": duplicate_keys,
-
-        "last_data_updates": sorted(
-            data_updates
-        ),
-
-        "comparison_coordinates": len(
-            comparison_values
-        ),
-
-        "completed_at": utc_now(),
-    }
-
-    write_json(
-        profile_dir / "summary.json",
-        report,
-    )
-
-    return report, comparison_values
-
-
-# ============================================================
-# BOTTLENECK ANALYSIS
-# ============================================================
-
-def identify_bottleneck(
-    result: dict,
-) -> dict:
-
-    timing = result.get(
-        "timing",
-        {},
-    )
-
-    execution = timing.get(
-        "execute_ms"
-    )
-
-    if not execution:
-
-        return {
-            "name": "UNKNOWN",
-            "message": (
-                "Insufficient completed request measurements"
-            ),
-        }
-
-    measured_wait = timing.get(
-        "response_wait_estimate_ms"
-    )
-
-    ttfb = timing.get(
-        "ttfb_ms"
-    )
-
-    receive = timing.get(
-        "receive_ms"
-    )
-
-    write = timing.get(
-        "file_write_ms"
-    )
-
-    parse = timing.get(
-        "parse_ms"
-    )
-
-    token = timing.get(
-        "token_refresh_ms"
-    )
-
-    candidates = {
-        name: value
-        for name, value in {
-            "RESPONSE_WAIT": (
-                measured_wait
-                if measured_wait is not None
-                else ttfb
-            ),
-
-            "RESPONSE_RECEIVE": receive,
-
-            "FILE_WRITE": write,
-
-            "XML_PARSE": parse,
-
-            "TOKEN_REFRESH": token,
-        }.items()
-        if value is not None
-    }
-
-    if not candidates:
-
-        return {
-            "name": "UNKNOWN",
-            "message": "Detailed timings unavailable",
-        }
-
-    name, duration = max(
-        candidates.items(),
-        key=lambda item: item[1],
-    )
-
-    descriptions = {
-        "RESPONSE_WAIT": (
-            "Most measured time is spent waiting for "
-            "response data. Upstream processing, network "
-            "transit and server queuing remain possible. "
-            "This does not prove server throttling."
-        ),
-
-        "RESPONSE_RECEIVE": (
-            "Response body handling is a major measured cost. "
-            "Check transfer speed, response size and writes."
-        ),
-
-        "FILE_WRITE": (
-            "Local response file writing is a major measured cost."
-        ),
-
-        "XML_PARSE": (
-            "XML parsing is a major measured local cost."
-        ),
-
-        "TOKEN_REFRESH": (
-            "Authentication refresh is a major measured cost."
-        ),
-    }
-
-    return {
-        "name": name,
-        "average_ms": round(duration, 3),
-        "message": descriptions[name],
-        "note": (
-            "Timing stages may overlap. "
-            "Average timings are not an exact additive breakdown."
-        ),
-    }
-
-
-# ============================================================
-# BENCHMARK PROFILES
-# ============================================================
-
-def build_benchmark_profiles(
-    max_workers: int,
-    x_total: int,
-    y_total: int,
-) -> list[Profile]:
-
-    profiles = [
-        Profile(
-            name="01_BASELINE_ITERATOR",
-            engine="iterator",
-            workers=1,
-            x_chunk=1,
-            y_chunk=1,
-        ),
-
-        Profile(
-            name="02_NATIVE_CALLBACK",
-            engine="callback",
-            workers=1,
-            x_chunk=1,
-            y_chunk=1,
-        ),
-    ]
-
-    if max_workers >= 2:
-
-        profiles.append(
-            Profile(
-                name="03_PARALLEL_2",
-                engine="callback",
-                workers=2,
-                x_chunk=1,
-                y_chunk=1,
-            )
-        )
-
-    if max_workers > 2:
-
-        profiles.append(
-            Profile(
-                name="04_PARALLEL_MAX",
-                engine="callback",
-                workers=max_workers,
-                x_chunk=1,
-                y_chunk=1,
-            )
-        )
-
-    profiles.extend([
-        Profile(
-            name="05_CHUNK_SMALL",
-            engine="callback",
-            workers=max_workers,
-            x_chunk=min(5, x_total),
-            y_chunk=min(5, y_total),
-        ),
-
-        Profile(
-            name="06_CHUNK_BALANCED",
-            engine="callback",
-            workers=max_workers,
-            x_chunk=min(10, x_total),
-            y_chunk=min(10, y_total),
-        ),
-    ])
-
-    unique = []
-
-    seen = set()
-
-    for profile in profiles:
-
-        key = (
-            profile.engine,
-            profile.workers,
-            profile.x_chunk,
-            profile.y_chunk,
-        )
-
-        if key in seen:
-
-            continue
-
-        seen.add(key)
-
-        unique.append(profile)
-
-    return unique
-
-
-def result_digest(
-    values: dict,
-) -> str:
+def dataset_digest(rows):
 
     digest = hashlib.sha256()
 
-    for key in sorted(values):
+    for key in sorted(rows):
 
         encoded = json.dumps(
             [
                 key,
-                values[key],
+
+                rows[key],
             ],
+
             ensure_ascii=False,
+
             separators=(",", ":"),
         ).encode("utf-8")
 
@@ -5290,302 +5703,2347 @@ def result_digest(
     return digest.hexdigest()
 
 
-def run_benchmark(
-    query: QuerySpec,
-    x_total: int,
-    y_total: int,
-    max_workers: int,
-    auth: AuthenticationManager,
-    control: RequestControl,
-    run_dir: Path,
-    csv_writer,
-    csv_handle,
-) -> dict:
-
-    sample_x = min(
-        BENCHMARK_X_MEMBERS,
-        x_total,
-    )
-
-    sample_y = min(
-        BENCHMARK_Y_MEMBERS,
-        y_total,
-    )
-
-    profiles = build_benchmark_profiles(
-        max_workers,
-        sample_x,
-        sample_y,
-    )
-
-    reports = []
-
-    baseline_values = None
-
-    baseline_report = None
-
-    expected_coordinates = (
-        sample_x
-        * sample_y
-        * len(query.measures)
-    )
-
-    for profile in profiles:
-
-        if STOP_EVENT.is_set():
-
-            break
-
-        report, values = run_scheduler(
-            query,
-            profile,
-            sample_x,
-            sample_y,
-            auth,
-            control,
-            run_dir,
-            csv_writer,
-            csv_handle,
-            mode="benchmark",
-            capture_values=True,
-            benchmark_results=reports,
-        )
-
-        complete = (
-            report["status"] == "COMPLETED"
-            and len(values) == expected_coordinates
-            and not report["duplicate_keys"]
-        )
-
-        if baseline_values is None:
-
-            if not complete:
-
-                report["equivalent"] = None
-
-                reports.append(report)
-
-                break
-
-            baseline_values = dict(values)
-
-            baseline_report = dict(report)
-
-            report["equivalent"] = True
-
-        else:
-
-            baseline_updates = set(
-                baseline_report.get(
-                    "last_data_updates",
-                    [],
-                )
-            )
-
-            current_updates = set(
-                report.get(
-                    "last_data_updates",
-                    [],
-                )
-            )
-
-            same_snapshot = (
-                not baseline_updates
-                or not current_updates
-                or baseline_updates == current_updates
-            )
-
-            report["equivalent"] = (
-                complete
-                and same_snapshot
-                and values == baseline_values
-            )
-
-        report["dataset_digest"] = (
-            result_digest(values)
-            if complete
-            else None
-        )
-
-        report["expected_coordinates"] = (
-            expected_coordinates
-        )
-
-        if baseline_report:
-
-            report["speedup"] = round(
-                baseline_report["elapsed"]
-                / max(
-                    0.001,
-                    report["elapsed"],
-                ),
-                3,
-            )
-
-        report["bottleneck"] = (
-            identify_bottleneck(report)
-        )
-
-        reports.append(report)
-
-        write_json(
-            run_dir
-            / profile.name
-            / "summary.json",
-            report,
-        )
-
-        write_json(
-            run_dir / "benchmark_progress.json",
-            {
-                "query_hash": query.query_hash,
-                "profiles": reports,
-            },
-        )
-
-        # Do not continue increasing load after
-        # authentication errors, repeated server errors
-        # or invalid/incomplete results.
-        if (
-            report["status"] != "COMPLETED"
-            or report.get("fatal_error")
-            or report["equivalent"] is False
-        ):
-
-            break
-
-        interruptible_sleep(2)
-
-    eligible = [
-        report
-        for report in reports
-        if (
-            report["status"] == "COMPLETED"
-            and report.get("equivalent") is True
-            and report["failed_tasks"] == 0
-            and report["failed_requests"] == 0
-        )
-    ]
-
-    recommendation = None
-
-    if eligible:
-
-        best = min(
-            eligible,
-            key=lambda report: (
-                report["elapsed"],
-                report.get("p95_ms")
-                or float("inf"),
-                report["workers_count"],
-            ),
-        )
-
-        recommendation = {
-            "profile": best["profile"],
-
-            "engine": best["engine"],
-
-            "workers": best["workers_count"],
-
-            "x_chunk": best["x_chunk"],
-
-            "y_chunk": best["y_chunk"],
-
-            "sample_speedup": best.get(
-                "speedup",
-                1.0,
-            ),
-
-            "sample_cells_per_second": best[
-                "cells_per_second"
-            ],
-
-            "sample_p95_ms": best.get(
-                "p95_ms"
-            ),
-
-            "sample_elapsed": best[
-                "elapsed"
-            ],
-
-            "bottleneck": best.get(
-                "bottleneck"
-            ),
-        }
+def expected_dataset_keys(
+    axes,
+    regions,
+):
 
     return {
-        "mode": "benchmark",
+        tuple_key(x_members)
+        + tuple_key(y_members)
 
-        "query_hash": query.query_hash,
+        for start, count in regions
 
-        "status": (
-            "STOPPED"
-            if STOP_EVENT.is_set()
-            else "COMPLETED"
-            if len(reports) == len(profiles)
-            and all(
-                report.get("equivalent") is True
-                for report in reports
-            )
-            else "PARTIAL"
-        ),
+        for x_members in axes.x[
+            start:
+            start + count
+        ]
 
-        "benchmark_scope": {
-            "x_members": sample_x,
-
-            "y_members": sample_y,
-
-            "measures": len(
-                query.measures
-            ),
-
-            "expected_coordinates": (
-                expected_coordinates
-            ),
-        },
-
-        "profiles": reports,
-
-        "recommended_profile": recommendation,
-
-        "limitations": [
-            "Profiles use the same bounded dataset.",
-            "Results must match before performance comparison.",
-            "Sequential profiles may benefit from server cache warming.",
-            "Small benchmark results do not guarantee full-run speedup.",
-            "No request-rate limits are bypassed.",
-            "Raw measure values are not converted to millions.",
-        ],
+        for y_members in axes.y
     }
 
 
 # ============================================================
-# SELECT VERIFIED BENCHMARK CONFIGURATION
+# ADAPTIVE CONCURRENCY
 # ============================================================
 
-def load_recommended_profile(
-    query: QuerySpec,
-    max_workers: int,
-) -> Profile:
+def evaluate_concurrency(
+    state,
+    active_limit,
+    last_adjustment,
+):
 
-    summaries = sorted(
-        OUTPUT_ROOT.glob(
-            "*/summary.json"
+    if active_limit <= 1:
+
+        return (
+            active_limit,
+            last_adjustment,
+        )
+
+    if (
+        time.monotonic()
+        - last_adjustment
+        < 15
+    ):
+
+        return (
+            active_limit,
+            last_adjustment,
+        )
+
+    snapshot = state.snapshot()
+
+    recent = [
+        item
+
+        for item in snapshot["recent"][-6:]
+
+        if item["execute_ms"] is not None
+    ]
+
+    if len(recent) < 3:
+
+        return (
+            active_limit,
+            last_adjustment,
+        )
+
+    slow = sum(
+        item["execute_ms"]
+        >= VERY_SLOW_REQUEST_MS
+
+        for item in recent
+    )
+
+    errors = sum(
+        item["status"] == "ERROR"
+
+        for item in recent
+    )
+
+    if slow >= 3 or errors >= 2:
+
+        active_limit = max(
+            1,
+
+            active_limit // 2,
+        )
+
+        state.set_active_limit(
+            active_limit
+        )
+
+        return (
+            active_limit,
+
+            time.monotonic(),
+        )
+
+    return (
+        active_limit,
+        last_adjustment,
+    )
+
+
+# ============================================================
+# BOUNDED DYNAMIC REQUEST SCHEDULER
+# ============================================================
+
+def run_scheduler(
+    query,
+    axes,
+    profile,
+    regions,
+    auth,
+    control,
+    run_dir,
+    csv_writer,
+    csv_handle,
+    *,
+    mode,
+    benchmark_results,
+):
+
+    task_total = count_tasks(
+        axes,
+
+        profile,
+
+        regions,
+    )
+
+    if task_total > MAX_TASKS_PER_RUN:
+
+        raise EngineError(
+            "Planned tasks exceeded local limit"
+        )
+
+    profile_dir = (
+        run_dir
+        / profile.name
+    )
+
+    profile_dir.mkdir(
+        parents=True,
+
+        exist_ok=True,
+    )
+
+    state = EngineState(
+        profile,
+
+        task_total,
+    )
+
+    stop_event = threading.Event()
+
+    worker_ids = deque(
+        range(
+            1,
+
+            profile.workers + 1,
+        )
+    )
+
+    sessions = []
+
+    session_lock = threading.Lock()
+
+    task_iterator = iter(
+        generate_tasks(
+            query,
+
+            axes,
+
+            profile,
+
+            regions,
+        )
+    )
+
+    rows = {}
+
+    snapshots = set()
+
+    missing_snapshot_chunks = 0
+
+    duplicate_keys = 0
+
+    exhausted = False
+
+    pending = {}
+
+    active_limit = profile.workers
+
+    last_adjustment = time.monotonic()
+
+    next_refresh = 0.0
+
+    interrupted = False
+
+    profile_deadline_reached = False
+
+    def consume_future(future):
+
+        nonlocal duplicate_keys
+        nonlocal missing_snapshot_chunks
+
+        try:
+
+            completed = future.result()
+
+        except Exception as exc:
+
+            state.set_fatal(
+                safe_error(exc)
+            )
+
+            stop_event.set()
+
+            return
+
+        for record in completed[
+            "records"
+        ]:
+
+            csv_writer.writerow({
+                name: record.get(name)
+
+                for name in REQUEST_CSV_FIELDS
+            })
+
+        result = completed.get(
+            "result"
+        )
+
+        if result is None:
+
+            if completed.get(
+                "fatal_error"
+            ):
+
+                state.set_fatal(
+                    completed["fatal_error"]
+                )
+
+                stop_event.set()
+
+            return
+
+        snapshot = result.get(
+            "last_data_update"
+        )
+
+        if snapshot:
+
+            snapshots.add(snapshot)
+
+        else:
+
+            missing_snapshot_chunks += 1
+
+        if len(snapshots) > 1:
+
+            state.set_fatal(
+                "Cube snapshot changed"
+            )
+
+            stop_event.set()
+
+        for key, values in result[
+            "rows"
+        ].items():
+
+            if key in rows:
+
+                duplicate_keys += 1
+
+                state.set_fatal(
+                    "Duplicate dataset row detected"
+                )
+
+                stop_event.set()
+
+            else:
+
+                rows[key] = values
+
+    executor = ThreadPoolExecutor(
+        max_workers=profile.workers,
+
+        thread_name_prefix="OIC",
+
+        initializer=initialize_worker,
+
+        initargs=(
+            auth,
+
+            worker_ids,
+
+            sessions,
+
+            session_lock,
         ),
+    )
+
+    try:
+
+        with Live(
+            console=console,
+
+            auto_refresh=False,
+
+            refresh_per_second=1,
+
+            screen=True,
+
+            vertical_overflow="crop",
+        ) as live:
+
+            while True:
+
+                if STOP_EVENT.is_set():
+
+                    stop_event.set()
+
+                if control.service_busy:
+
+                    stop_event.set()
+
+                if (
+                    mode == "benchmark"
+
+                    and time.monotonic()
+                    - state.started
+
+                    >= BENCHMARK_MAX_PROFILE_SECONDS
+                ):
+
+                    profile_deadline_reached = True
+
+                    stop_event.set()
+
+                if mode == "run":
+
+                    (
+                        active_limit,
+
+                        last_adjustment,
+
+                    ) = evaluate_concurrency(
+                        state,
+
+                        active_limit,
+
+                        last_adjustment,
+                    )
+
+                while (
+                    not exhausted
+
+                    and not stop_event.is_set()
+
+                    and len(pending) < active_limit
+                ):
+
+                    try:
+
+                        task = next(
+                            task_iterator
+                        )
+
+                    except StopIteration:
+
+                        exhausted = True
+
+                        break
+
+                    future = executor.submit(
+                        request_worker,
+
+                        query,
+
+                        axes,
+
+                        profile,
+
+                        task,
+
+                        time.perf_counter(),
+
+                        auth,
+
+                        control,
+
+                        state,
+
+                        stop_event,
+
+                        profile_dir,
+                    )
+
+                    pending[future] = task
+
+                if pending:
+
+                    completed, _ = wait(
+                        tuple(pending),
+
+                        timeout=0.2,
+
+                        return_when=FIRST_COMPLETED,
+                    )
+
+                    for future in completed:
+
+                        pending.pop(
+                            future,
+                            None,
+                        )
+
+                        consume_future(
+                            future
+                        )
+
+                    if completed:
+
+                        csv_handle.flush()
+
+                now = time.monotonic()
+
+                if now >= next_refresh:
+
+                    live.update(
+                        render_monitor(
+                            profile,
+
+                            axes,
+
+                            state,
+
+                            control,
+
+                            mode,
+
+                            benchmark_results,
+                        ),
+
+                        refresh=True,
+                    )
+
+                    next_refresh = (
+                        now
+                        + REFRESH_INTERVAL
+                    )
+
+                if (
+                    exhausted
+                    or stop_event.is_set()
+                ) and not pending:
+
+                    break
+
+    except KeyboardInterrupt:
+
+        interrupted = True
+
+        STOP_EVENT.set()
+
+        stop_event.set()
+
+    except Exception as exc:
+
+        state.set_fatal(
+            safe_error(exc)
+        )
+
+        stop_event.set()
+
+    finally:
+
+        if STOP_EVENT.is_set():
+
+            stop_event.set()
+
+        executor.shutdown(
+            wait=True,
+
+            cancel_futures=True,
+        )
+
+        for future in list(pending):
+
+            if (
+                future.done()
+                and not future.cancelled()
+            ):
+
+                consume_future(
+                    future
+                )
+
+        pending.clear()
+
+        csv_handle.flush()
+
+        for session in sessions:
+
+            try:
+
+                session.close()
+
+            except Exception:
+
+                pass
+
+    # Freeze benchmark time before CSV/XLSX data export.
+    extraction_metrics = aggregate_metrics(
+        state.snapshot()
+    )
+
+    expected_keys = expected_dataset_keys(
+        axes,
+
+        regions,
+    )
+
+    complete_coverage = (
+        set(rows) == expected_keys
+    )
+
+    if (
+        STOP_EVENT.is_set()
+        or interrupted
+    ):
+
+        status = "STOPPED"
+
+    elif profile_deadline_reached:
+
+        status = "PARTIAL"
+
+    elif (
+        extraction_metrics["fatal_error"]
+
+        or extraction_metrics["failed_tasks"]
+
+        or extraction_metrics["completed_tasks"]
+        != task_total
+
+        or not complete_coverage
+
+        or duplicate_keys
+
+        or len(snapshots) > 1
+    ):
+
+        status = (
+            "PARTIAL"
+
+            if rows
+
+            else "FAILED"
+        )
+
+    else:
+
+        status = "COMPLETED"
+
+    for worker in extraction_metrics[
+        "workers"
+    ]:
+
+        worker["request_started"] = None
+
+        worker["current_request_ms"] = None
+
+        worker["phase"] = "FINISHED"
+
+        worker["status"] = (
+            "FAILED"
+
+            if worker["failed"]
+
+            else "STOPPED"
+
+            if status != "COMPLETED"
+
+            else "COMPLETED"
+        )
+
+    report = {
+        **extraction_metrics,
+
+        "status": status,
+
+        "profile": profile.name,
+
+        "strategy": profile.strategy,
+
+        "engine": "curl_cffi_callback",
+
+        "workers_count": profile.workers,
+
+        "x_chunk": profile.x_chunk,
+
+        "y_chunk": profile.y_chunk,
+
+        "query_hash": query.query_hash,
+
+        "axis_digest": axes.digest,
+
+        "regions": [
+            list(region)
+
+            for region in regions
+        ],
+
+        "expected_rows": len(
+            expected_keys
+        ),
+
+        "returned_rows": len(
+            rows
+        ),
+
+        "missing_rows": len(
+            expected_keys - set(rows)
+        ),
+
+        "unexpected_rows": len(
+            set(rows) - expected_keys
+        ),
+
+        "duplicate_keys": duplicate_keys,
+
+        "complete_coverage": (
+            complete_coverage
+        ),
+
+        "expected_coordinates": (
+            len(expected_keys)
+            * len(query.measures)
+        ),
+
+        "returned_coordinates": (
+            len(rows)
+            * len(query.measures)
+        ),
+
+        "last_data_updates": sorted(
+            snapshots
+        ),
+
+        "missing_snapshot_chunks": (
+            missing_snapshot_chunks
+        ),
+
+        "snapshot_verified": (
+            bool(axes.snapshot)
+
+            and snapshots == {
+                axes.snapshot
+            }
+
+            and missing_snapshot_chunks == 0
+        ),
+
+        "profile_deadline_reached": (
+            profile_deadline_reached
+        ),
+
+        "dataset_digest": dataset_digest(
+            rows
+        ),
+
+        "output_directory": str(
+            profile_dir
+        ),
+
+        "completed_at": utc_now(),
+    }
+
+    report["bottleneck"] = (
+        identify_bottleneck(report)
+    )
+
+    # Save the extraction report before export.
+    # A failed export must not destroy benchmark timings.
+
+    write_json(
+        profile_dir / "summary.json",
+
+        report,
+    )
+
+    return report, rows
+
+
+# ============================================================
+# CSV / EXCEL VALUE CONVERSION
+# ============================================================
+
+def csv_safe_text(value):
+
+    value = str(
+        value or ""
+    )
+
+    if value.lstrip().startswith(
+        (
+            "=",
+            "+",
+            "-",
+            "@",
+        )
+    ):
+
+        return "'" + value
+
+    return value
+
+
+def csv_measure_value(value):
+
+    if value is None:
+
+        return ""
+
+    try:
+
+        number = Decimal(value)
+
+        if number.is_finite():
+
+            return value
+
+    except InvalidOperation:
+
+        pass
+
+    return csv_safe_text(
+        value
+    )
+
+
+def excel_measure_value(value):
+
+    if value is None:
+
+        return None
+
+    try:
+
+        number = Decimal(value)
+
+        if not number.is_finite():
+
+            return value
+
+        # Excel supports approximately 15 significant
+        # digits. Preserve larger values as text.
+
+        digits = len(
+            number.as_tuple().digits
+        )
+
+        if digits > 15:
+
+            return value
+
+        if number == number.to_integral_value():
+
+            if abs(number) < Decimal(
+                "1000000000000000"
+            ):
+
+                return int(number)
+
+            return value
+
+        converted = float(number)
+
+        if not math.isfinite(converted):
+
+            return value
+
+        if converted == 0 and number != 0:
+
+            return value
+
+        return converted
+
+    except (
+        InvalidOperation,
+        ValueError,
+        OverflowError,
+    ):
+
+        return value
+
+
+def make_excel_text(
+    sheet,
+    value,
+):
+
+    cell = WriteOnlyCell(
+        sheet,
+
+        value=str(
+            value or ""
+        ),
+    )
+
+    # Prevent text beginning with "=" from being
+    # interpreted as an Excel formula.
+
+    cell.data_type = "s"
+
+    return cell
+
+
+# ============================================================
+# EXPORT ROW GENERATOR
+# ============================================================
+
+def iter_export_rows(
+    axes,
+    rows,
+):
+
+    y_index = {
+        tuple_key(members): members
+
+        for members in axes.y
+    }
+
+    for x_members in axes.x:
+
+        x_key = tuple_key(
+            x_members
+        )
+
+        for y_key, y_members in y_index.items():
+
+            key = (
+                x_key
+                + y_key
+            )
+
+            if key not in rows:
+
+                continue
+
+            captions = [
+                member.caption
+                or member.unique_name
+
+                for member in (
+                    *x_members,
+
+                    *y_members,
+                )
+            ]
+
+            identifiers = [
+                member.unique_name
+
+                for member in (
+                    *x_members,
+
+                    *y_members,
+                )
+            ]
+
+            yield (
+                captions,
+
+                rows[key],
+
+                identifiers,
+            )
+
+
+# ============================================================
+# HIGH-PERFORMANCE DATA CSV EXPORT
+# ============================================================
+
+def export_data_csv(
+    path,
+    axes,
+    rows,
+):
+
+    started = time.perf_counter()
+
+    temporary = path.with_name(
+        path.name + ".partial"
+    )
+
+    row_count = 0
+
+    try:
+
+        with temporary.open(
+            "w",
+
+            encoding="utf-8-sig",
+
+            newline="",
+
+            buffering=1024 * 1024,
+        ) as handle:
+
+            writer = csv.writer(
+                handle
+            )
+
+            writer.writerow(
+                DATA_HEADERS
+            )
+
+            for (
+                captions,
+
+                values,
+
+                identifiers,
+
+            ) in iter_export_rows(
+                axes,
+
+                rows,
+            ):
+
+                writer.writerow([
+                    *[
+                        csv_safe_text(value)
+
+                        for value in captions
+                    ],
+
+                    *[
+                        csv_measure_value(value)
+
+                        for value in values
+                    ],
+
+                    *[
+                        csv_safe_text(value)
+
+                        for value in identifiers
+                    ],
+                ])
+
+                row_count += 1
+
+        temporary.replace(
+            path
+        )
+
+        return {
+            "status": "COMPLETED",
+
+            "path": str(path),
+
+            "rows": row_count,
+
+            "bytes": path.stat().st_size,
+
+            "duration_ms": elapsed_ms(
+                started
+            ),
+        }
+
+    finally:
+
+        temporary.unlink(
+            missing_ok=True
+        )
+
+
+# ============================================================
+# HIGH-PERFORMANCE EXCEL EXPORT
+# ============================================================
+
+def export_data_excel(
+    path,
+    axes,
+    rows,
+    report,
+):
+
+    started = time.perf_counter()
+
+    temporary = path.with_name(
+        path.stem + ".partial.xlsx"
+    )
+
+    workbook = Workbook(
+        write_only=True
+    )
+
+    sheet = workbook.create_sheet(
+        title="MV_FY"
+    )
+
+    sheet.freeze_panes = "D2"
+
+    sheet.column_dimensions["A"].width = 30
+    sheet.column_dimensions["B"].width = 28
+    sheet.column_dimensions["C"].width = 15
+
+    for column in "DEFGHIJ":
+
+        sheet.column_dimensions[
+            column
+        ].width = 25
+
+    for column in "KLM":
+
+        sheet.column_dimensions[
+            column
+        ].width = 42
+
+    header_fill = PatternFill(
+        fill_type="solid",
+
+        fgColor="18354A",
+    )
+
+    header_font = Font(
+        bold=True,
+
+        color="FFFFFF",
+    )
+
+    headers = []
+
+    for name in DATA_HEADERS:
+
+        cell = WriteOnlyCell(
+            sheet,
+
+            value=name,
+        )
+
+        cell.font = header_font
+
+        cell.fill = header_fill
+
+        headers.append(
+            cell
+        )
+
+    sheet.append(
+        headers
+    )
+
+    row_count = 0
+
+    try:
+
+        for (
+            captions,
+
+            values,
+
+            identifiers,
+
+        ) in iter_export_rows(
+            axes,
+
+            rows,
+        ):
+
+            output_row = [
+                make_excel_text(
+                    sheet,
+
+                    value,
+                )
+
+                for value in captions
+            ]
+
+            for value in values:
+
+                converted = excel_measure_value(
+                    value
+                )
+
+                if isinstance(
+                    converted,
+                    str,
+                ):
+
+                    output_row.append(
+                        make_excel_text(
+                            sheet,
+
+                            converted,
+                        )
+                    )
+
+                else:
+
+                    output_row.append(
+                        converted
+                    )
+
+            output_row.extend(
+                make_excel_text(
+                    sheet,
+
+                    value,
+                )
+
+                for value in identifiers
+            )
+
+            sheet.append(
+                output_row
+            )
+
+            row_count += 1
+
+        metadata = workbook.create_sheet(
+            title="METADATA"
+        )
+
+        metadata.column_dimensions[
+            "A"
+        ].width = 35
+
+        metadata.column_dimensions[
+            "B"
+        ].width = 100
+
+        metadata.append([
+            "Field",
+
+            "Value",
+        ])
+
+        metadata_rows = (
+            (
+                "Category",
+                CATEGORY,
+            ),
+
+            (
+                "Cube type",
+                CUBE_TYPE,
+            ),
+
+            (
+                "Catalog",
+                CATALOG,
+            ),
+
+            (
+                "Cube",
+                CUBE,
+            ),
+
+            (
+                "Profile",
+                report["profile"],
+            ),
+
+            (
+                "Extraction status",
+                report["status"],
+            ),
+
+            (
+                "Complete coverage",
+                report["complete_coverage"],
+            ),
+
+            (
+                "Expected rows",
+                report["expected_rows"],
+            ),
+
+            (
+                "Returned rows",
+                row_count,
+            ),
+
+            (
+                "Missing rows",
+                report["missing_rows"],
+            ),
+
+            (
+                "Dataset digest",
+                report["dataset_digest"],
+            ),
+
+            (
+                "Snapshot",
+                axes.snapshot or "UNKNOWN",
+            ),
+
+            (
+                "Measure units",
+                "Raw OIC values; no unit conversion applied.",
+            ),
+
+            (
+                "Monetary captions",
+                "Original OIC captions preserved. "
+                "Units must be independently verified.",
+            ),
+
+            (
+                "Null values",
+                "Preserved as blank cells.",
+            ),
+
+            (
+                "All Members",
+                "Preserved without automatic filtering.",
+            ),
+
+            (
+                "Numeric precision",
+                "Values exceeding Excel numeric precision "
+                "are stored as text.",
+            ),
+        )
+
+        for key, value in metadata_rows:
+
+            metadata.append([
+                make_excel_text(
+                    metadata,
+
+                    key,
+                ),
+
+                (
+                    make_excel_text(
+                        metadata,
+
+                        value,
+                    )
+
+                    if isinstance(
+                        value,
+                        str,
+                    )
+
+                    else value
+                ),
+            ])
+
+        workbook.save(
+            temporary
+        )
+
+        temporary.replace(
+            path
+        )
+
+        return {
+            "status": "COMPLETED",
+
+            "path": str(path),
+
+            "rows": row_count,
+
+            "bytes": path.stat().st_size,
+
+            "duration_ms": elapsed_ms(
+                started
+            ),
+        }
+
+    finally:
+
+        workbook.close()
+
+        temporary.unlink(
+            missing_ok=True
+        )
+
+
+# ============================================================
+# SEPARATE EXPORT PIPELINE
+# ============================================================
+
+def export_profile_data(
+    axes,
+    rows,
+    report,
+):
+
+    profile_dir = Path(
+        report["output_directory"]
+    )
+
+    profile_dir.mkdir(
+        parents=True,
+
+        exist_ok=True,
+    )
+
+    started = time.perf_counter()
+
+    prefix = (
+        "data"
+
+        if report["status"] == "COMPLETED"
+
+        else "data_partial"
+    )
+
+    exports = {}
+
+    console.print()
+
+    console.print(
+        Panel(
+            Text(
+                f"{report['profile']}"
+
+                "\n"
+
+                f"EXPORTING {len(rows):,} DATA ROWS"
+
+                "\n"
+
+                "HTTP extraction measurements frozen",
+
+                justify="center",
+
+                style="bold cyan",
+            ),
+
+            border_style="cyan",
+        )
+    )
+
+    csv_path = (
+        profile_dir
+        / f"{prefix}.csv"
+    )
+
+    xlsx_path = (
+        profile_dir
+        / f"{prefix}.xlsx"
+    )
+
+    with console.status(
+        "Writing data CSV...",
+
+        spinner="dots",
+    ):
+
+        try:
+
+            exports["csv"] = export_data_csv(
+                csv_path,
+
+                axes,
+
+                rows,
+            )
+
+        except Exception as exc:
+
+            exports["csv"] = {
+                "status": "FAILED",
+
+                "error": safe_error(exc),
+            }
+
+    with console.status(
+        "Writing Excel workbook...",
+
+        spinner="dots",
+    ):
+
+        try:
+
+            exports["excel"] = export_data_excel(
+                xlsx_path,
+
+                axes,
+
+                rows,
+
+                report,
+            )
+
+        except Exception as exc:
+
+            exports["excel"] = {
+                "status": "FAILED",
+
+                "error": safe_error(exc),
+            }
+
+    report["exports"] = exports
+
+    report["csv_export_ms"] = (
+        exports["csv"].get(
+            "duration_ms"
+        )
+    )
+
+    report["excel_export_ms"] = (
+        exports["excel"].get(
+            "duration_ms"
+        )
+    )
+
+    report["export_total_ms"] = (
+        elapsed_ms(started)
+    )
+
+    report["export_status"] = (
+        "COMPLETED"
+
+        if all(
+            item["status"] == "COMPLETED"
+
+            for item in exports.values()
+        )
+
+        else "PARTIAL"
+
+        if any(
+            item["status"] == "COMPLETED"
+
+            for item in exports.values()
+        )
+
+        else "FAILED"
+    )
+
+    report["elapsed_with_export"] = round(
+        report["elapsed"]
+
+        + report["export_total_ms"]
+        / 1000,
+
+        3,
+    )
+
+    write_json(
+        profile_dir / "summary.json",
+
+        report,
+    )
+
+    console.print(
+        make_panel(
+            kv_table([
+                (
+                    "Extraction",
+
+                    format_duration(
+                        report["elapsed"]
+                    ),
+                ),
+
+                (
+                    "CSV export",
+
+                    format_ms(
+                        report["csv_export_ms"]
+                    ),
+                ),
+
+                (
+                    "Excel export",
+
+                    format_ms(
+                        report["excel_export_ms"]
+                    ),
+                ),
+
+                (
+                    "Export status",
+
+                    report["export_status"],
+                ),
+
+                (
+                    "Rows",
+
+                    f"{len(rows):,}",
+                ),
+            ]),
+
+            "EXPORT RESULT",
+        )
+    )
+
+    return report
+
+
+# ============================================================
+# BENCHMARK PROFILE SELECTION
+# ============================================================
+
+def recommend_profile(reports):
+
+    eligible = [
+        report
+
+        for report in reports
+
+        if report.get("status") == "COMPLETED"
+
+        and report.get("equivalent") is True
+
+        and report.get("complete_coverage")
+
+        and not report.get("duplicate_keys")
+
+        and not report.get("failed_requests")
+
+        and report.get("returned_rows", 0) > 0
+
+        and report.get("non_null_cells", 0) > 0
+    ]
+
+    if not eligible:
+
+        return None
+
+    fastest = min(
+        eligible,
+
+        key=lambda report: (
+            report["elapsed"],
+
+            report.get("p95_ms")
+            or float("inf"),
+
+            report["workers_count"],
+        ),
+    )
+
+    # Prefer lower concurrency when the measured
+    # total extraction duration is within 10%
+    # of the fastest eligible profile.
+
+    comparable = [
+        report
+
+        for report in eligible
+
+        if report["elapsed"]
+        <= fastest["elapsed"] * 1.10
+    ]
+
+    best = min(
+        comparable,
+
+        key=lambda report: (
+            report["workers_count"],
+
+            report.get("p95_ms")
+            or float("inf"),
+
+            report["elapsed"],
+        ),
+    )
+
+    baseline = next(
+        (
+            report
+
+            for report in reports
+
+            if report["profile"]
+            == "01_REFERENCE_SUBSET"
+
+            and report["status"]
+            == "COMPLETED"
+        ),
+
+        None,
+    )
+
+    speedup = (
+        baseline["elapsed"]
+        / max(
+            best["elapsed"],
+            0.001,
+        )
+
+        if baseline
+
+        else None
+    )
+
+    return {
+        "profile": best["profile"],
+
+        "strategy": best["strategy"],
+
+        "engine": best["engine"],
+
+        "workers": best["workers_count"],
+
+        "x_chunk": best["x_chunk"],
+
+        "y_chunk": best["y_chunk"],
+
+        "sample_elapsed": best["elapsed"],
+
+        "sample_cells_per_second": (
+            best["cells_per_second"]
+        ),
+
+        "sample_p95_ms": best.get(
+            "p95_ms"
+        ),
+
+        "sample_speedup": (
+            round(speedup, 3)
+
+            if speedup is not None
+
+            else None
+        ),
+
+        "snapshot_verified": best.get(
+            "snapshot_verified",
+            False,
+        ),
+
+        "bottleneck": best.get(
+            "bottleneck"
+        ),
+
+        "selection_policy": (
+            "Equivalent complete datasets only; "
+            "prefer fewer workers within 10% "
+            "of fastest measured extraction time."
+        ),
+    }
+
+
+# ============================================================
+# BENCHMARK CHECKPOINT AND RECOVERY
+# ============================================================
+
+def benchmark_plan_key(
+    query,
+    axes,
+    profiles,
+    regions,
+):
+
+    return digest_json({
+        "version": APP_VERSION,
+
+        "query_hash": query.query_hash,
+
+        "axis_digest": axes.digest,
+
+        "snapshot": axes.snapshot,
+
+        "profiles": [
+            asdict(profile)
+
+            for profile in profiles
+        ],
+
+        "regions": regions,
+
+        "rate_limit": MAX_REQUESTS_PER_SECOND,
+
+        "worker_delay": WORKER_REQUEST_DELAY,
+    })
+
+
+def load_benchmark_checkpoint(
+    plan_key,
+    axes,
+    run_dir,
+):
+
+    # Reuse completed benchmark profiles only when
+    # the source snapshot and complete plan match.
+    #
+    # Never combine unknown or changed snapshots.
+
+    if not axes.snapshot:
+
+        return []
+
+    candidates = sorted(
+        OUTPUT_ROOT.glob(
+            "*/benchmark_progress.json"
+        ),
+
         key=lambda path: path.stat().st_mtime,
+
         reverse=True,
     )
 
-    for path in summaries:
+    for path in candidates:
 
-        report = read_json(path)
-
-        if report.get("mode") != "benchmark":
+        if path.parent == run_dir:
 
             continue
 
-        if report.get("status") != "COMPLETED":
+        checkpoint = read_json(
+            path
+        )
+
+        if checkpoint.get(
+            "plan_key"
+        ) != plan_key:
+
+            continue
+
+        if checkpoint.get(
+            "snapshot"
+        ) != axes.snapshot:
+
+            continue
+
+        valid_reports = []
+
+        for report in checkpoint.get(
+            "profiles",
+            [],
+        ):
+
+            if (
+                report.get("status")
+                != "COMPLETED"
+
+                or report.get("equivalent")
+                is not True
+
+                or not report.get(
+                    "snapshot_verified"
+                )
+
+                or not report.get(
+                    "complete_coverage"
+                )
+
+                or not report.get(
+                    "dataset_digest"
+                )
+            ):
+
+                break
+
+            directory = Path(
+                report["output_directory"]
+            )
+
+            if not directory.is_dir():
+
+                break
+
+            exported_csv = (
+                report.get(
+                    "exports",
+                    {},
+                )
+
+                .get(
+                    "csv",
+                    {},
+                )
+
+                .get(
+                    "path"
+                )
+            )
+
+            if (
+                not exported_csv
+
+                or not Path(
+                    exported_csv
+                ).is_file()
+            ):
+
+                break
+
+            exported_excel = (
+                report.get(
+                    "exports",
+                    {},
+                )
+
+                .get(
+                    "excel",
+                    {},
+                )
+
+                .get(
+                    "path"
+                )
+            )
+
+            if (
+                not exported_excel
+
+                or not Path(
+                    exported_excel
+                ).is_file()
+            ):
+
+                break
+
+            recovered = dict(
+                report
+            )
+
+            recovered["recovered"] = True
+
+            recovered["recovered_from"] = str(
+                path.parent
+            )
+
+            valid_reports.append(
+                recovered
+            )
+
+        if valid_reports:
+
+            return valid_reports
+
+    return []
+
+
+def save_benchmark_checkpoint(
+    run_dir,
+    query,
+    axes,
+    plan_key,
+    reports,
+    profiles,
+    regions,
+    status,
+):
+
+    summary = {
+        "app": APP_NAME,
+
+        "version": APP_VERSION,
+
+        "mode": "benchmark",
+
+        "status": status,
+
+        "query_hash": query.query_hash,
+
+        "axis_digest": axes.digest,
+
+        "snapshot": axes.snapshot,
+
+        "plan_key": plan_key,
+
+        "regions": [
+            list(region)
+
+            for region in regions
+        ],
+
+        "planned_profiles": [
+            asdict(profile)
+
+            for profile in profiles
+        ],
+
+        "profiles": reports,
+
+        "recommended_profile": (
+            recommend_profile(reports)
+        ),
+
+        "updated_at": utc_now(),
+
+        "limitations": [
+            "Performance varies with server load and cache.",
+
+            "Benchmark profiles cover selected "
+            "beginning, middle and ending regions.",
+
+            "Equivalence is verified within benchmark scope.",
+
+            "Export timing is excluded from extraction timing.",
+
+            "No automatic NON EMPTY filtering.",
+
+            "No measure-unit conversion.",
+
+            "Rate limits and server backoff are respected.",
+        ],
+    }
+
+    write_json(
+        run_dir / "benchmark_progress.json",
+
+        summary,
+    )
+
+    return summary
+
+
+# ============================================================
+# MULTI-REGION PERFORMANCE BENCHMARK
+# ============================================================
+
+def run_benchmark(
+    query,
+    axes,
+    max_workers,
+    auth,
+    control,
+    run_dir,
+    csv_writer,
+    csv_handle,
+):
+
+    regions = build_benchmark_regions(
+        axes.x_count
+    )
+
+    profiles = build_benchmark_profiles(
+        max_workers,
+
+        axes,
+    )
+
+    plan_key = benchmark_plan_key(
+        query,
+
+        axes,
+
+        profiles,
+
+        regions,
+    )
+
+    reports = load_benchmark_checkpoint(
+        plan_key,
+
+        axes,
+
+        run_dir,
+    )
+
+    valid_profile_names = {
+        profile.name
+
+        for profile in profiles
+    }
+
+    reports = [
+        report
+
+        for report in reports
+
+        if report["profile"]
+        in valid_profile_names
+    ]
+
+    completed_names = {
+        report["profile"]
+
+        for report in reports
+    }
+
+    baseline_report = next(
+        (
+            report
+
+            for report in reports
+
+            if report["profile"]
+            == "01_REFERENCE_SUBSET"
+        ),
+
+        None,
+    )
+
+    baseline_digest = (
+        baseline_report["dataset_digest"]
+
+        if baseline_report
+
+        else None
+    )
+
+    console.print(
+        make_panel(
+            kv_table([
+                (
+                    "Regions",
+
+                    str(regions),
+                ),
+
+                (
+                    "Sample X tuples",
+
+                    sum(
+                        count
+
+                        for _, count in regions
+                    ),
+                ),
+
+                (
+                    "Sample Y tuples",
+
+                    axes.y_count,
+                ),
+
+                (
+                    "Profiles",
+
+                    len(profiles),
+                ),
+
+                (
+                    "Recovered profiles",
+
+                    len(reports),
+                ),
+            ]),
+
+            "BENCHMARK PLAN",
+        )
+    )
+
+    status = "PARTIAL"
+
+    save_benchmark_checkpoint(
+        run_dir,
+
+        query,
+
+        axes,
+
+        plan_key,
+
+        reports,
+
+        profiles,
+
+        regions,
+
+        "RUNNING",
+    )
+
+    try:
+
+        for profile in profiles:
+
+            if STOP_EVENT.is_set():
+
+                status = "STOPPED"
+
+                break
+
+            if control.service_busy:
+
+                status = "PARTIAL"
+
+                break
+
+            if profile.name in completed_names:
+
+                continue
+
+            report, rows = run_scheduler(
+                query,
+
+                axes,
+
+                profile,
+
+                regions,
+
+                auth,
+
+                control,
+
+                run_dir,
+
+                csv_writer,
+
+                csv_handle,
+
+                mode="benchmark",
+
+                benchmark_results=reports,
+            )
+
+            complete = (
+                report["status"] == "COMPLETED"
+
+                and report["complete_coverage"]
+
+                and not report["duplicate_keys"]
+            )
+
+            if profile.name == "01_REFERENCE_SUBSET":
+
+                report["equivalent"] = (
+                    True
+
+                    if complete
+
+                    else None
+                )
+
+                if complete:
+
+                    baseline_report = dict(
+                        report
+                    )
+
+                    baseline_digest = report[
+                        "dataset_digest"
+                    ]
+
+            else:
+
+                report["equivalent"] = (
+                    complete
+
+                    and baseline_digest is not None
+
+                    and report["dataset_digest"]
+                    == baseline_digest
+                )
+
+            report["speedup"] = (
+                round(
+                    baseline_report["elapsed"]
+
+                    / max(
+                        report["elapsed"],
+                        0.001,
+                    ),
+
+                    3,
+                )
+
+                if baseline_report
+
+                else None
+            )
+
+            # Preserve results before any data export.
+
+            reports.append(
+                report
+            )
+
+            save_benchmark_checkpoint(
+                run_dir,
+
+                query,
+
+                axes,
+
+                plan_key,
+
+                reports,
+
+                profiles,
+
+                regions,
+
+                "RUNNING",
+            )
+
+            if rows:
+
+                export_profile_data(
+                    axes,
+
+                    rows,
+
+                    report,
+                )
+
+            else:
+
+                report["export_status"] = "SKIPPED"
+
+            write_json(
+                Path(
+                    report["output_directory"]
+                ) / "summary.json",
+
+                report,
+            )
+
+            save_benchmark_checkpoint(
+                run_dir,
+
+                query,
+
+                axes,
+
+                plan_key,
+
+                reports,
+
+                profiles,
+
+                regions,
+
+                "RUNNING",
+            )
+
+            if STOP_EVENT.is_set():
+
+                status = "STOPPED"
+
+                break
+
+            if (
+                not complete
+
+                or report.get("fatal_error")
+
+                or report.get("equivalent")
+                is not True
+
+                or control.service_busy
+            ):
+
+                status = "PARTIAL"
+
+                break
+
+            if (
+                len(reports)
+                < len(profiles)
+            ):
+
+                interruptible_sleep(
+                    BENCHMARK_PAUSE_SECONDS
+                )
+
+        if (
+            len(reports) == len(profiles)
+
+            and all(
+                report.get("equivalent") is True
+
+                for report in reports
+            )
+        ):
+
+            status = "COMPLETED"
+
+    except (
+        KeyboardInterrupt,
+        StopRequested,
+    ):
+
+        STOP_EVENT.set()
+
+        status = "STOPPED"
+
+    finally:
+
+        if STOP_EVENT.is_set():
+
+            status = "STOPPED"
+
+        summary = save_benchmark_checkpoint(
+            run_dir,
+
+            query,
+
+            axes,
+
+            plan_key,
+
+            reports,
+
+            profiles,
+
+            regions,
+
+            status,
+        )
+
+    return summary
+
+
+# ============================================================
+# LOAD VERIFIED PERFORMANCE CONFIGURATION
+# ============================================================
+
+def load_recommended_profile(
+    query,
+    axes,
+    max_workers,
+):
+
+    candidates = sorted(
+        [
+            *OUTPUT_ROOT.glob(
+                "*/summary.json"
+            ),
+
+            *OUTPUT_ROOT.glob(
+                "*/benchmark_progress.json"
+            ),
+        ],
+
+        key=lambda path: path.stat().st_mtime,
+
+        reverse=True,
+    )
+
+    for path in candidates:
+
+        report = read_json(
+            path
+        )
+
+        if report.get("version") != APP_VERSION:
+
+            continue
+
+        if report.get("mode") != "benchmark":
 
             continue
 
@@ -5593,9 +8051,37 @@ def load_recommended_profile(
 
             continue
 
-        recommendation = report.get(
-            "recommended_profile"
-        ) or {}
+        if report.get("axis_digest") != axes.digest:
+
+            continue
+
+        # Never reuse old tuning results when the
+        # source snapshot cannot be verified.
+
+        if not axes.snapshot:
+
+            continue
+
+        if report.get("snapshot") != axes.snapshot:
+
+            continue
+
+        matching_reports = [
+            item
+
+            for item in report.get(
+                "profiles",
+                [],
+            )
+
+            if item.get(
+                "snapshot_verified"
+            )
+        ]
+
+        recommendation = recommend_profile(
+            matching_reports
+        )
 
         if not recommendation:
 
@@ -5615,14 +8101,14 @@ def load_recommended_profile(
                 recommendation["y_chunk"]
             )
 
-            engine = recommendation[
-                "engine"
+            strategy = recommendation[
+                "strategy"
             ]
 
         except (
             KeyError,
-            TypeError,
             ValueError,
+            TypeError,
         ):
 
             continue
@@ -5631,109 +8117,377 @@ def load_recommended_profile(
 
             continue
 
-        if not 1 <= x_chunk <= 50:
+        if not 1 <= x_chunk <= 20:
 
             continue
 
-        if not 1 <= y_chunk <= 20:
+        if not 1 <= y_chunk <= axes.y_count:
 
             continue
 
-        if engine not in (
-            "iterator",
-            "callback",
+        if strategy not in (
+            "subset",
+            "explicit",
         ):
 
             continue
 
-        return Profile(
-            name="FULL_EXTRACTION",
-            engine=engine,
-            workers=workers,
-            x_chunk=x_chunk,
-            y_chunk=y_chunk,
+        return (
+            Profile(
+                name="FULL_EXTRACTION",
+
+                strategy=strategy,
+
+                workers=workers,
+
+                x_chunk=x_chunk,
+
+                y_chunk=y_chunk,
+            ),
+
+            {
+                "source": str(path),
+
+                "recommendation": recommendation,
+
+                "verified": True,
+            },
         )
 
-    return Profile(
-        name="FULL_EXTRACTION",
-        engine="callback",
-        workers=max_workers,
-        x_chunk=DEFAULT_X_CHUNK,
-        y_chunk=DEFAULT_Y_CHUNK,
+    # Conservative fallback:
+    # use the original query semantics at low concurrency
+    # until an optimized profile has been validated.
+
+    return (
+        Profile(
+            name="FULL_EXTRACTION",
+
+            strategy="subset",
+
+            workers=1,
+
+            x_chunk=DEFAULT_X_CHUNK,
+
+            y_chunk=min(
+                DEFAULT_Y_CHUNK,
+
+                axes.y_count,
+            ),
+        ),
+
+        {
+            "source": "CONSERVATIVE_DEFAULT",
+
+            "verified": False,
+
+            "note": (
+                "No matching validated benchmark found. "
+                "Using one worker and original Subset MDX."
+            ),
+        },
     )
 
 
 # ============================================================
-# FULL EXTRACTION
+# FULL DATA EXTRACTION
 # ============================================================
 
 def run_full_extraction(
-    query: QuerySpec,
-    x_total: int,
-    y_total: int,
-    max_workers: int,
-    auth: AuthenticationManager,
-    control: RequestControl,
-    run_dir: Path,
+    query,
+    axes,
+    max_workers,
+    auth,
+    control,
+    run_dir,
     csv_writer,
     csv_handle,
-) -> dict:
+):
 
-    profile = load_recommended_profile(
+    profile, selection = load_recommended_profile(
         query,
+
+        axes,
+
         max_workers,
     )
 
-    report, _ = run_scheduler(
+    console.print(
+        make_panel(
+            kv_table([
+                (
+                    "Strategy",
+
+                    profile.strategy,
+                ),
+
+                (
+                    "Workers",
+
+                    profile.workers,
+                ),
+
+                (
+                    "X chunk",
+
+                    profile.x_chunk,
+                ),
+
+                (
+                    "Y chunk",
+
+                    profile.y_chunk,
+                ),
+
+                (
+                    "Benchmark verified",
+
+                    selection["verified"],
+                ),
+
+                (
+                    "Source",
+
+                    selection["source"],
+                ),
+            ]),
+
+            "SELECTED EXTRACTION PROFILE",
+        )
+    )
+
+    report, rows = run_scheduler(
         query,
+
+        axes,
+
         profile,
-        x_total,
-        y_total,
+
+        [
+            (
+                0,
+
+                axes.x_count,
+            ),
+        ],
+
         auth,
+
         control,
+
         run_dir,
+
         csv_writer,
+
         csv_handle,
+
         mode="run",
-        capture_values=False,
+
         benchmark_results=[],
     )
 
-    report["bottleneck"] = identify_bottleneck(
-        report
+    report["profile_selection"] = (
+        selection
+    )
+
+    if rows:
+
+        export_profile_data(
+            axes,
+
+            rows,
+
+            report,
+        )
+
+    else:
+
+        report["export_status"] = "SKIPPED"
+
+    write_json(
+        Path(
+            report["output_directory"]
+        ) / "summary.json",
+
+        report,
     )
 
     return {
         "mode": "run",
 
+        "status": report["status"],
+
         "query_hash": query.query_hash,
 
-        "status": report["status"],
+        "axis_digest": axes.digest,
+
+        "snapshot": axes.snapshot,
 
         "profile": report,
 
+        "expected_rows": (
+            axes.x_count
+
+            * axes.y_count
+        ),
+
+        "returned_rows": len(
+            rows
+        ),
+
         "expected_coordinates": (
-            x_total
-            * y_total
+            axes.x_count
+
+            * axes.y_count
+
             * len(query.measures)
         ),
 
-        "raw_response_directory": str(
-            run_dir
-            / profile.name
-            / "responses"
+        "exports": report.get(
+            "exports",
+            {},
+        ),
+
+        "export_status": report.get(
+            "export_status"
         ),
     }
 
 
 # ============================================================
-# INITIAL INFORMATION
+# BENCHMARK COMPARISON CSV
+# ============================================================
+
+def export_benchmark_comparison(
+    run_dir,
+    summary,
+):
+
+    profiles = summary.get(
+        "profiles",
+        [],
+    )
+
+    if not profiles:
+
+        return
+
+    path = (
+        run_dir
+        / "benchmark_comparison.csv"
+    )
+
+    fields = (
+        "profile",
+
+        "strategy",
+
+        "workers_count",
+
+        "x_chunk",
+
+        "y_chunk",
+
+        "status",
+
+        "equivalent",
+
+        "requests",
+
+        "failed_requests",
+
+        "elapsed",
+
+        "average_ms",
+
+        "median_ms",
+
+        "p95_ms",
+
+        "max_ms",
+
+        "requests_per_second",
+
+        "cells_per_second",
+
+        "slow_requests",
+
+        "returned_rows",
+
+        "non_null_cells",
+
+        "response_bytes",
+
+        "download_bytes",
+
+        "speedup",
+
+        "ttfb_ms",
+
+        "response_wait_estimate_ms",
+
+        "receive_ms",
+
+        "file_write_ms",
+
+        "parse_ms",
+
+        "csv_export_ms",
+
+        "excel_export_ms",
+
+        "export_total_ms",
+
+        "export_status",
+
+        "snapshot_verified",
+
+        "recovered",
+
+        "dataset_digest",
+    )
+
+    with path.open(
+        "w",
+
+        encoding="utf-8-sig",
+
+        newline="",
+    ) as handle:
+
+        writer = csv.DictWriter(
+            handle,
+
+            fieldnames=fields,
+
+            extrasaction="ignore",
+        )
+
+        writer.writeheader()
+
+        for profile in profiles:
+
+            flattened = {
+                **profile,
+
+                **profile.get(
+                    "timing",
+                    {},
+                ),
+            }
+
+            writer.writerow(
+                flattened
+            )
+
+
+# ============================================================
+# STARTUP DISPLAY
 # ============================================================
 
 def render_startup(
-    query: QuerySpec,
+    query,
     args,
-    run_dir: Path,
+    run_dir,
 ):
 
     console.clear()
@@ -5742,130 +8496,174 @@ def render_startup(
         Panel(
             Text(
                 APP_NAME
+
                 + f"\nVERSION {APP_VERSION}"
-                + "\nXMLA / MDX / CURL_CFFI",
+
+                + "\n"
+
+                + "XMLA / MDX / CURL_CFFI / CSV / EXCEL",
+
                 justify="center",
-                style="bold cyan",
+
+                style="bold bright_cyan",
             ),
+
             border_style="cyan",
         )
     )
 
-    configuration = kv_table([
-        ("Mode", args.mode.upper()),
-
-        ("Category", "MV — รถยนต์"),
-
-        ("Cube", "FY — ปีบัญชี"),
-
-        ("Catalog", CATALOG),
-
-        ("Cube name", CUBE),
-
-        ("Max workers", args.workers),
-
-        ("HTTP engine", "CURL_CFFI"),
-
-        ("Query hash", query.query_hash),
-
-        ("Output", str(run_dir)),
-    ])
-
     console.print(
         make_panel(
-            configuration,
+            kv_table([
+                (
+                    "Mode",
+
+                    args.mode.upper(),
+                ),
+
+                (
+                    "Category",
+
+                    "MV — รถยนต์",
+                ),
+
+                (
+                    "Cube",
+
+                    "FY — ปีบัญชี",
+                ),
+
+                (
+                    "Catalog",
+
+                    CATALOG,
+                ),
+
+                (
+                    "Max workers",
+
+                    args.workers,
+                ),
+
+                (
+                    "HTTP",
+
+                    "NATIVE CALLBACK",
+                ),
+
+                (
+                    "Request rate cap",
+
+                    f"{MAX_REQUESTS_PER_SECOND:.1f}/s",
+                ),
+
+                (
+                    "Query hash",
+
+                    query.query_hash,
+                ),
+
+                (
+                    "Output",
+
+                    str(run_dir),
+                ),
+            ]),
+
             "ENGINE CONFIGURATION",
         )
     )
 
     fields = Table(
         box=box.SIMPLE,
+
         expand=True,
     )
 
     fields.add_column(
         "Axis",
+
         style="cyan",
-        no_wrap=True,
     )
 
     fields.add_column(
-        "OIC Caption"
+        "Caption"
     )
 
     fields.add_column(
         "Verified MDX"
     )
 
-    for index, (caption, mdx) in enumerate(
-        zip(
-            query.x_captions,
+    for prefix, captions, identifiers in (
+        (
+            "X",
+
+            X_CAPTIONS,
+
             query.x,
         ),
-        start=1,
-    ):
 
-        fields.add_row(
-            f"X{index}",
-            caption,
-            Text(mdx),
-        )
+        (
+            "Y",
 
-    for index, (caption, mdx) in enumerate(
-        zip(
-            query.y_captions,
+            Y_CAPTIONS,
+
             query.y,
         ),
-        start=1,
-    ):
 
-        fields.add_row(
-            f"Y{index}",
-            caption,
-            Text(mdx),
-        )
+        (
+            "M",
 
-    for index, (caption, mdx) in enumerate(
-        zip(
-            query.measure_captions,
+            MEASURE_CAPTIONS,
+
             query.measures,
         ),
-        start=1,
     ):
 
-        fields.add_row(
-            f"M{index}",
+        for index, (
             caption,
-            Text(mdx),
-        )
+
+            identifier,
+
+        ) in enumerate(
+            zip(
+                captions,
+
+                identifiers,
+            ),
+
+            start=1,
+        ):
+
+            fields.add_row(
+                f"{prefix}{index}",
+
+                Text(caption),
+
+                Text(identifier),
+            )
 
     console.print(
         make_panel(
             fields,
+
             "VERIFIED FIXED QUERY",
         )
     )
 
-    console.print(
-        Text(
-            "Validating authenticated XMLA access "
-            "and discovering exact axis cardinalities...",
-            style="cyan",
-        )
-    )
-
 
 # ============================================================
-# FINAL REPORT
+# FINAL PERFORMANCE REPORT
 # ============================================================
 
 def render_final_report(
-    summary: dict,
-    run_dir: Path,
+    summary,
+    run_dir,
 ):
 
     status = summary.get(
         "status",
+
         "UNKNOWN",
     )
 
@@ -5874,200 +8672,229 @@ def render_final_report(
     console.print(
         Panel(
             Text(
-                "OIC LOAD ENGINE\n"
+                APP_NAME
+
+                + "\n"
+
                 + status,
+
                 justify="center",
+
                 style=(
                     "bold green"
+
                     if status == "COMPLETED"
+
                     else "bold yellow"
                 ),
             ),
+
             border_style=(
                 "green"
+
                 if status == "COMPLETED"
+
                 else "yellow"
             ),
         )
     )
 
-    if summary.get("mode") == "benchmark":
+    if summary.get(
+        "mode"
+    ) == "benchmark":
 
         table = Table(
-            title="BENCHMARK RESULTS",
             box=box.SIMPLE,
+
             expand=True,
+
+            title="BENCHMARK RESULTS",
         )
 
-        for column in (
+        for name in (
             "Profile",
-            "Engine",
-            "Workers",
+
+            "W",
+
             "Chunk",
+
             "Requests",
-            "Elapsed",
+
+            "Extract",
+
             "P95",
+
             "Cells/s",
-            "Speedup",
+
+            "CSV",
+
+            "Excel",
+
             "Match",
         ):
 
             table.add_column(
-                column
+                name
             )
 
-        for result in summary.get(
+        for profile in summary.get(
             "profiles",
             [],
         ):
 
-            equivalent = result.get(
+            equivalent = profile.get(
                 "equivalent"
             )
 
             table.add_row(
-                result["profile"],
-
-                result["engine"],
+                profile["profile"],
 
                 str(
-                    result["workers_count"]
+                    profile["workers_count"]
                 ),
 
-                (
-                    f"{result['x_chunk']}/"
-                    f"{result['y_chunk']}"
-                ),
+                f"{profile['x_chunk']}/"
+                f"{profile['y_chunk']}",
 
-                str(result["requests"]),
+                str(
+                    profile["requests"]
+                ),
 
                 format_duration(
-                    result["elapsed"]
+                    profile["elapsed"]
                 ),
 
                 format_ms(
-                    result.get("p95_ms")
+                    profile.get("p95_ms")
                 ),
 
-                (
-                    f"{result['cells_per_second']:.2f}"
+                f"{profile['cells_per_second']:.2f}",
+
+                format_ms(
+                    profile.get(
+                        "csv_export_ms"
+                    )
                 ),
 
-                (
-                    f"{result.get('speedup', 0):.2f}x"
+                format_ms(
+                    profile.get(
+                        "excel_export_ms"
+                    )
                 ),
 
                 Text(
                     "YES"
+
                     if equivalent is True
+
                     else "NO"
+
                     if equivalent is False
+
                     else "—",
+
                     style=(
                         "green"
+
                         if equivalent is True
-                        else "red"
-                        if equivalent is False
-                        else "dim"
+
+                        else "yellow"
                     ),
                 ),
             )
 
-        console.print(table)
+        console.print(
+            table
+        )
 
-        recommended = summary.get(
+        recommendation = summary.get(
             "recommended_profile"
         )
 
-        if recommended:
-
-            recommendation_table = kv_table([
-                (
-                    "Profile",
-                    recommended["profile"],
-                ),
-
-                (
-                    "Engine",
-                    recommended["engine"],
-                ),
-
-                (
-                    "Workers",
-                    recommended["workers"],
-                ),
-
-                (
-                    "X Chunk",
-                    recommended["x_chunk"],
-                ),
-
-                (
-                    "Y Chunk",
-                    recommended["y_chunk"],
-                ),
-
-                (
-                    "Sample speedup",
-                    Text(
-                        f"{recommended['sample_speedup']:.2f}x",
-                        style="bold green",
-                    ),
-                ),
-
-                (
-                    "Sample cells/sec",
-                    recommended[
-                        "sample_cells_per_second"
-                    ],
-                ),
-
-                (
-                    "Sample P95",
-                    format_ms(
-                        recommended.get(
-                            "sample_p95_ms"
-                        )
-                    ),
-                ),
-            ])
+        if recommendation:
 
             console.print(
                 make_panel(
-                    recommendation_table,
-                    "RECOMMENDED CONFIGURATION",
+                    kv_table([
+                        (
+                            "Profile",
+
+                            recommendation[
+                                "profile"
+                            ],
+                        ),
+
+                        (
+                            "MDX strategy",
+
+                            recommendation[
+                                "strategy"
+                            ],
+                        ),
+
+                        (
+                            "Workers",
+
+                            recommendation[
+                                "workers"
+                            ],
+                        ),
+
+                        (
+                            "Chunk X/Y",
+
+                            f"{recommendation['x_chunk']}/"
+                            f"{recommendation['y_chunk']}",
+                        ),
+
+                        (
+                            "Sample elapsed",
+
+                            format_duration(
+                                recommendation[
+                                    "sample_elapsed"
+                                ]
+                            ),
+                        ),
+
+                        (
+                            "Cells/sec",
+
+                            recommendation[
+                                "sample_cells_per_second"
+                            ],
+                        ),
+
+                        (
+                            "Sample speedup",
+
+                            (
+                                f"{recommendation['sample_speedup']:.2f}x"
+
+                                if recommendation.get(
+                                    "sample_speedup"
+                                ) is not None
+
+                                else "—"
+                            ),
+                        ),
+
+                        (
+                            "Snapshot verified",
+
+                            recommendation[
+                                "snapshot_verified"
+                            ],
+                        ),
+                    ]),
+
+                    "RECOMMENDED PROFILE",
                 )
             )
 
-            bottleneck = recommended.get(
-                "bottleneck"
-            ) or {}
-
-            if bottleneck:
-
-                console.print(
-                    make_panel(
-                        Group(
-                            Text(
-                                bottleneck.get(
-                                    "name",
-                                    "UNKNOWN",
-                                ),
-                                style="bold yellow",
-                            ),
-
-                            Text(
-                                bottleneck.get(
-                                    "message",
-                                    "",
-                                )
-                            ),
-                        ),
-                        "PERFORMANCE DIAGNOSIS",
-                    )
-                )
-
-    elif summary.get("mode") == "run":
+    elif summary.get(
+        "mode"
+    ) == "run":
 
         report = summary.get(
             "profile",
@@ -6080,64 +8907,99 @@ def render_final_report(
                 make_panel(
                     kv_table([
                         (
-                            "Profile",
-                            report["profile"],
+                            "Strategy",
+
+                            report["strategy"],
                         ),
 
                         (
-                            "Completed chunks",
-                            report["completed_tasks"],
+                            "Rows",
+
+                            f"{report['returned_rows']:,}/"
+                            f"{report['expected_rows']:,}",
                         ),
 
                         (
-                            "Failed chunks",
-                            report["failed_tasks"],
+                            "Missing rows",
+
+                            report["missing_rows"],
+                        ),
+
+                        (
+                            "Duplicate rows",
+
+                            report["duplicate_keys"],
                         ),
 
                         (
                             "Requests",
+
                             report["requests"],
                         ),
 
                         (
-                            "Non-null cells",
-                            f"{report['non_null_cells']:,}",
-                        ),
+                            "Extraction",
 
-                        (
-                            "Saved XML",
-                            format_bytes(
-                                report["response_bytes"]
+                            format_duration(
+                                report["elapsed"]
                             ),
                         ),
 
                         (
-                            "Cells/sec",
-                            report["cells_per_second"],
-                        ),
-
-                        (
                             "Average latency",
+
                             format_ms(
-                                report.get("average_ms")
+                                report["average_ms"]
                             ),
                         ),
 
                         (
                             "P95 latency",
+
                             format_ms(
-                                report.get("p95_ms")
+                                report["p95_ms"]
                             ),
                         ),
 
                         (
-                            "Elapsed",
-                            format_duration(
-                                report["elapsed"]
+                            "CSV export",
+
+                            format_ms(
+                                report.get(
+                                    "csv_export_ms"
+                                )
                             ),
                         ),
+
+                        (
+                            "Excel export",
+
+                            format_ms(
+                                report.get(
+                                    "excel_export_ms"
+                                )
+                            ),
+                        ),
+
+                        (
+                            "Export status",
+
+                            report.get(
+                                "export_status",
+                                "SKIPPED",
+                            ),
+                        ),
+
+                        (
+                            "Bottleneck",
+
+                            report["bottleneck"][
+                                "name"
+                            ],
+                        ),
                     ]),
-                    "EXTRACTION RESULT",
+
+                    "FULL EXTRACTION RESULT",
                 )
             )
 
@@ -6145,7 +9007,14 @@ def render_final_report(
         make_panel(
             kv_table([
                 (
-                    "Summary",
+                    "Run directory",
+
+                    str(run_dir),
+                ),
+
+                (
+                    "Main summary",
+
                     str(
                         run_dir
                         / "summary.json"
@@ -6154,6 +9023,7 @@ def render_final_report(
 
                 (
                     "Request metrics",
+
                     str(
                         run_dir
                         / "requests.csv"
@@ -6161,19 +9031,39 @@ def render_final_report(
                 ),
 
                 (
-                    "Raw XML",
-                    str(run_dir),
+                    "Axis discovery",
+
+                    str(
+                        run_dir
+                        / "axis_discovery.json"
+                    ),
+                ),
+
+                (
+                    "Data output",
+
+                    "Profile/data.csv + data.xlsx",
+                ),
+
+                (
+                    "Partial output",
+
+                    "Profile/data_partial.csv + data_partial.xlsx",
                 ),
             ]),
+
             "OUTPUT FILES",
         )
     )
 
-    if summary.get("error"):
+    if summary.get(
+        "error"
+    ):
 
         console.print(
             Text(
                 summary["error"],
+
                 style="bold red",
             )
         )
@@ -6183,7 +9073,7 @@ def render_final_report(
 # MAIN
 # ============================================================
 
-def main() -> int:
+def main():
 
     args = parse_args()
 
@@ -6195,7 +9085,9 @@ def main() -> int:
         datetime.now().strftime(
             "%Y%m%d_%H%M%S"
         )
+
         + "_"
+
         + uuid.uuid4().hex[:6]
     )
 
@@ -6206,6 +9098,7 @@ def main() -> int:
 
     run_dir.mkdir(
         parents=True,
+
         exist_ok=True,
     )
 
@@ -6228,6 +9121,7 @@ def main() -> int:
     }
 
     auth = None
+    control = None
 
     try:
 
@@ -6239,6 +9133,7 @@ def main() -> int:
 
         auth = AuthenticationManager(
             env,
+
             control,
         )
 
@@ -6258,102 +9153,180 @@ def main() -> int:
             ),
 
             "x_captions": list(
-                query.x_captions
+                X_CAPTIONS
             ),
 
             "y_captions": list(
-                query.y_captions
+                Y_CAPTIONS
             ),
 
             "measure_captions": list(
-                query.measure_captions
+                MEASURE_CAPTIONS
             ),
 
-            "mapping_source": query.mapping_source,
+            "mapping_source": (
+                query.mapping_source
+            ),
         }
 
         render_startup(
             query,
+
             args,
+
             run_dir,
         )
 
-        with console.status(
-            "Connecting to OIC XMLA...",
-            spinner="dots",
-        ):
+        discovery_started = (
+            time.perf_counter()
+        )
 
-            x_total, y_total, discovery = (
-                discover_axis_counts(
-                    query,
-                    auth,
-                    control,
-                    run_dir,
-                )
+        axes = discover_axes(
+            query,
+
+            auth,
+
+            control,
+
+            run_dir,
+        )
+
+        summary["discovery_ms"] = (
+            elapsed_ms(
+                discovery_started
             )
-
-        summary["axis_discovery"] = discovery
+        )
 
         summary["axis_counts"] = {
-            "x_members": x_total,
+            "x_members": axes.x_count,
 
-            "y_members": y_total,
+            "y_members": axes.y_count,
 
             "measures": len(
                 query.measures
             ),
 
-            "potential_coordinates": (
-                x_total
-                * y_total
+            "expected_rows": (
+                axes.x_count
+                * axes.y_count
+            ),
+
+            "expected_coordinates": (
+                axes.x_count
+
+                * axes.y_count
+
                 * len(query.measures)
             ),
         }
 
+        summary["axis_digest"] = axes.digest
+
+        summary["snapshot"] = axes.snapshot
+
         console.print(
-            Text(
-                "AUTHENTICATION VALID | "
-                f"X={x_total:,} | "
-                f"Y={y_total:,} | "
-                f"M={len(query.measures)}",
-                style="bold green",
+            make_panel(
+                kv_table([
+                    (
+                        "Authentication",
+
+                        Text(
+                            "VALID",
+
+                            style="green",
+                        ),
+                    ),
+
+                    (
+                        "X tuples",
+
+                        f"{axes.x_count:,}",
+                    ),
+
+                    (
+                        "Y tuples",
+
+                        f"{axes.y_count:,}",
+                    ),
+
+                    (
+                        "Measures",
+
+                        len(query.measures),
+                    ),
+
+                    (
+                        "Potential data rows",
+
+                        f"{axes.x_count * axes.y_count:,}",
+                    ),
+
+                    (
+                        "Potential cells",
+
+                        f"{axes.x_count * axes.y_count * len(query.measures):,}",
+                    ),
+
+                    (
+                        "Discovery time",
+
+                        format_ms(
+                            summary["discovery_ms"]
+                        ),
+                    ),
+
+                    (
+                        "Snapshot",
+
+                        axes.snapshot or "UNKNOWN",
+                    ),
+                ]),
+
+                "AXIS DISCOVERY COMPLETED",
             )
         )
 
-        if x_total == 0 or y_total == 0:
-
-            raise EngineError(
-                "Fixed query returned an empty axis"
-            )
-
         with (
-            run_dir
-            / "requests.csv"
+            run_dir / "requests.csv"
         ).open(
             "w",
+
             encoding="utf-8-sig",
+
             newline="",
+
+            buffering=1024 * 1024,
         ) as csv_handle:
 
             csv_writer = csv.DictWriter(
                 csv_handle,
-                fieldnames=CSV_FIELDS,
+
+                fieldnames=REQUEST_CSV_FIELDS,
+
                 extrasaction="ignore",
             )
 
             csv_writer.writeheader()
 
+            csv_handle.flush()
+
             if args.mode == "benchmark":
 
                 result = run_benchmark(
                     query,
-                    x_total,
-                    y_total,
+
+                    axes,
+
                     args.workers,
+
                     auth,
+
                     control,
+
                     run_dir,
+
                     csv_writer,
+
                     csv_handle,
                 )
 
@@ -6361,54 +9334,107 @@ def main() -> int:
 
                 result = run_full_extraction(
                     query,
-                    x_total,
-                    y_total,
+
+                    axes,
+
                     args.workers,
+
                     auth,
+
                     control,
+
                     run_dir,
+
                     csv_writer,
+
                     csv_handle,
                 )
 
-            summary.update(result)
+            summary.update(
+                result
+            )
 
-    except KeyboardInterrupt:
+        if args.mode == "benchmark":
+
+            export_benchmark_comparison(
+                run_dir,
+
+                summary,
+            )
+
+    except (
+        KeyboardInterrupt,
+        StopRequested,
+    ):
 
         STOP_EVENT.set()
 
         summary["status"] = "STOPPED"
 
-    except StopRequested:
-
-        STOP_EVENT.set()
-
-        summary["status"] = "STOPPED"
-
-    except AuthenticationError as exc:
+    except (
+        AuthenticationError,
+        ServiceBusyError,
+        EngineError,
+    ) as exc:
 
         summary["status"] = "FAILED"
 
-        summary["error"] = safe_error(exc)
-
-    except EngineError as exc:
-
-        summary["status"] = "FAILED"
-
-        summary["error"] = str(exc)[:500]
+        summary["error"] = safe_error(
+            exc
+        )
 
     except Exception as exc:
 
         summary["status"] = "FAILED"
 
-        summary["error"] = safe_error(exc)
+        summary["error"] = safe_error(
+            exc
+        )
 
     finally:
+
+        # Preserve completed benchmark profiles even
+        # when the user stops between profiles or
+        # interrupts the export stage.
+
+        if args.mode == "benchmark":
+
+            checkpoint = read_json(
+                run_dir
+                / "benchmark_progress.json"
+            )
+
+            if checkpoint:
+
+                for key in (
+                    "profiles",
+
+                    "recommended_profile",
+
+                    "plan_key",
+
+                    "regions",
+
+                    "planned_profiles",
+
+                    "limitations",
+                ):
+
+                    if key in checkpoint:
+
+                        summary[key] = (
+                            checkpoint[key]
+                        )
+
+                if STOP_EVENT.is_set():
+
+                    summary["status"] = "STOPPED"
 
         summary["finished_at"] = utc_now()
 
         summary["total_elapsed_seconds"] = round(
             time.monotonic() - started,
+
             3,
         )
 
@@ -6421,27 +9447,82 @@ def main() -> int:
 
                 "token_refresh_total_ms": round(
                     auth.refresh_total_ms,
+
                     3,
                 ),
             }
 
+        if control is not None:
+
+            summary["request_control"] = {
+                "rate_cap": (
+                    MAX_REQUESTS_PER_SECOND
+                ),
+
+                "worker_delay": (
+                    WORKER_REQUEST_DELAY
+                ),
+
+                "service_busy": (
+                    control.service_busy
+                ),
+
+                "cooldown_remaining_seconds": round(
+                    control.remaining(),
+
+                    3,
+                ),
+
+                "cooldown_reason": (
+                    control.cooldown_reason
+                ),
+            }
+
         write_json(
-            run_dir / "summary.json",
+            run_dir
+            / "summary.json",
+
             summary,
         )
 
     render_final_report(
         summary,
+
         run_dir,
     )
 
-    return (
-        0
-        if summary["status"] == "COMPLETED"
-        else 1
-    )
+    if summary["status"] != "COMPLETED":
+
+        return 1
+
+    if (
+        args.mode == "run"
+
+        and summary.get("export_status")
+        != "COMPLETED"
+    ):
+
+        return 2
+
+    if args.mode == "benchmark":
+
+        if any(
+            profile.get("export_status")
+            != "COMPLETED"
+
+            for profile in summary.get(
+                "profiles",
+                [],
+            )
+        ):
+
+            return 2
+
+    return 0
 
 
 if __name__ == "__main__":
 
-    raise SystemExit(main())
+    raise SystemExit(
+        main()
+    )

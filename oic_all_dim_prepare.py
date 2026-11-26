@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import itertools
+from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import re
@@ -37,7 +38,10 @@ def integer(value, default=None):
 
 
 def checked_root(data):
-    root = ET.fromstring(data)
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise ValueError("Malformed XMLA XML") from exc
     if any(local(e.tag) in ("Fault", "Error") for e in root.iter()):
         raise ValueError("XMLA fault/error")
     return root
@@ -286,7 +290,7 @@ def potential(scope):
 def request_record(prep,job,cube,profile,scope,timeout,status="PENDING",parent=None):
     mdx=build_mdx(profile,scope)
     payload=build_soap(profile,mdx)
-    rid=digest([prep,cube,job,scope,parent])
+    rid=digest([prep,cube,job,scope,parent,"PROBE" if status=="PROBE" else "EXTRACT"])
     return {"id":rid,"prep":prep,"job":job,"cube":cube,"scope":scope,"mdx":mdx,
             "payload":payload,"timeout":timeout,"potential_cells":potential(scope),
             "status":status,"parent":parent}
@@ -313,39 +317,122 @@ def benchmark_profile(db,prep,job,cube,profile,scope,base,probe,budget):
     samples=[]
     if not scope["hierarchy"]:
         return base,budget
-    # Disjoint member samples allow successful probe data to remain committed.
-    # Compare within a workload group; estimates are deliberately low confidence.
-    offset=0
-    for factor in (0.5,1,2):
+    # Compare bounded X/Y/M shapes. Non-overlapping samples are reusable data.
+    shapes=[
+        (base["x"],base["y"],base["m"]),
+        (base["x"]*2,base["y"],base["m"]),
+        (base["x"],max(1,base["y"]//2),min(len(scope["measures"]),base["m"]*2)),
+        (base["x"]*2,base["y"],max(1,base["m"]//2)),
+    ]
+    occupied=[]
+    for x,y,m in shapes:
         if budget<=0:
             break
-        x=max(1,int(base["x"]*factor))
-        x=min(x,MAX_CELLS//max(1,base["y"]*base["m"]))
-        members=scope["members"][offset:offset+x]
-        if not members:
+        x=max(1,min(x,MAX_CELLS//max(1,y*m)))
+        candidates=[scope]
+        for previous in occupied:
+            candidates=[r for c in candidates for r in subtract_scope(c,previous)]
+        if not candidates:
             break
-        part=dict(scope,members=members,years=scope["years"][:base["y"]],measures=scope["measures"][:base["m"]])
+        region=max(candidates,key=potential)
+        part=dict(region,members=region["members"][:x],years=region["years"][:y],measures=region["measures"][:m])
         req=request_record(prep,job,cube,profile,part,base["timeout"],"PROBE")
         db.insert_requests([req])
         before=time.monotonic()
         result=probe(req,profile)
         budget-=1
         elapsed=max(0.001,float(result.get("duration",time.monotonic()-before)))
-        samples.append({"x":len(members),"y":len(part["years"]),"m":len(part["measures"]),
+        samples.append({"x":len(part["members"]),"y":len(part["years"]),"m":len(part["measures"]),
                         "seconds":elapsed,"ok":bool(result.get("ok")),
                         "covered_per_second":potential(part)/elapsed if result.get("ok") else 0,
                         "useful_cells":result.get("useful_cells",0)})
-        offset+=len(members)
+        occupied.append(part)
         if result.get("pressure"):
             break
-    good=[s for s in samples if s["ok"]]
+    good=[v for v in samples if v["ok"]]
     if not good:
         return dict(base,samples=samples),budget
-    best=max(good,key=lambda s:s["covered_per_second"])
-    # Few samples cannot establish a statistically meaningful P95.
+    best=max(good,key=lambda v:v["covered_per_second"])
     return dict(base,x=best["x"],y=best["y"],m=best["m"],
-                timeout=min(300,max(60,math.ceil(max(s["seconds"] for s in good)*1.5),DEFAULT_TIMEOUT)),
+                timeout=min(300,max(60,math.ceil(max(v["seconds"] for v in good)*1.5),DEFAULT_TIMEOUT)),
                 source="DIRECT_SAMPLE",confidence="LOW",samples=samples),budget
+
+
+def optimize_concurrency(db,prep,jobs,probe):
+    saved=db.load_profile(prep,"GLOBAL","concurrency")
+    if saved:
+        return saved
+    # Compare 1, 2, and at most 4 simultaneous requests using disjoint,
+    # equal-sized batches of one representative job. Do not benchmark live
+    # traffic again after the bounded seven-probe budget.
+    used=db.conn.execute("""SELECT count(*) FROM oic_requests
+        WHERE prep=? AND json_extract(scope_json,'$.probe_kind')='concurrency'""",(prep,)).fetchone()[0]
+    if used:
+        result={"limit":1,"source":"CONSERVATIVE_INTERRUPTED_BENCHMARK","samples":[]}
+        db.save_profile(prep,"GLOBAL","concurrency",result)
+        return result
+    selected=None
+    for job,cube,profile,scope in jobs:
+        if not scope["hierarchy"] or len(scope["members"])<140:
+            continue
+        remaining=[scope]
+        for row in db.conn.execute("SELECT scope_json FROM oic_requests WHERE prep=? AND job=? AND status IN ('COMMITTED','EMPTY')",(prep,job)):
+            remaining=[r for c in remaining for r in subtract_scope(c,json.loads(row[0]))]
+        for region in remaining:
+            if len(region["members"])>=140:
+                selected=(job,cube,profile,region)
+                break
+        if selected:
+            break
+    if not selected:
+        result={"limit":1,"source":"CONSERVATIVE_NO_COMPARABLE_SAMPLE","samples":[]}
+        db.save_profile(prep,"GLOBAL","concurrency",result)
+        return result
+    job,cube,profile,region=selected
+    offset=0
+    samples=[]
+    for concurrency in (1,2,4):
+        reqs=[]
+        for _ in range(concurrency):
+            part=dict(region,members=region["members"][offset:offset+20],
+                      years=region["years"][:4],measures=region["measures"][:20],probe_kind="concurrency")
+            offset+=20
+            reqs.append(request_record(prep,job,cube,profile,part,DEFAULT_TIMEOUT,"PROBE"))
+        db.insert_requests(reqs)
+        start=time.monotonic()
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            results=list(pool.map(lambda r:probe(r,profile,parallel=True),reqs))
+        elapsed=max(0.001,time.monotonic()-start)
+        success=all(r.get("ok") for r in results)
+        samples.append({"concurrency":concurrency,"seconds":elapsed,"ok":success,
+                        "covered_per_second":sum(r["potential_cells"] for r in reqs)/elapsed if success else 0})
+        if not success or any(r.get("pressure") for r in results):
+            break
+        if len(samples)>1 and samples[-1]["covered_per_second"]<=samples[-2]["covered_per_second"]*1.05:
+            break
+    good=[v for v in samples if v["ok"]]
+    best=max(good,key=lambda v:v["covered_per_second"]) if good else {"concurrency":1}
+    result={"limit":best["concurrency"],"source":"BOUNDED_COMPARATIVE_SAMPLE","samples":samples}
+    db.save_profile(prep,"GLOBAL","concurrency",result)
+    return result
+
+
+def reprepare_failed_requests(db,prep,log):
+    rows=[dict(r) for r in db.conn.execute("SELECT * FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE'",(prep,))]
+    for row in rows:
+        scope=json.loads(row["scope_json"])
+        axis=max(("members","years","measures"),key=lambda k:len(scope[k]))
+        if len(scope[axis])<2:
+            log(f"{row['id'][:12]} remains unresolved: minimum request scope")
+            continue
+        values=scope[axis]
+        mid=len(values)//2
+        profile=db.profile(prep,row["cube"])
+        children=[request_record(prep,row["job"],row["cube"],profile,dict(scope,**{axis:part}),
+                                  row["timeout"],"PENDING",row["id"]) for part in (values[:mid],values[mid:])]
+        db.reprepare_request(row,children)
+        log(f"REPREPARED {row['id'][:12]} | two disjoint requests")
+    db.retry_failed(prep)
 
 
 def build_recovery_requests(req,profile):
@@ -401,8 +488,16 @@ def prepare_all(db,transport,probe,output,log):
     current=db.preparation(fingerprint)
     prep=current["id"]
     if current["status"]=="READY":
-        log("Existing READY preparation reused; no rediscovery")
-        return True
+        version_changed=db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND error LIKE 'SOURCE_VERSION_CHANGED%' LIMIT 1",(prep,)).fetchone()
+        if version_changed:
+            db.conn.execute("UPDATE oic_preparations SET status='STALE' WHERE id=?",(prep,))
+            current=db.preparation(fingerprint)
+            prep=current["id"]
+            log("Source update marker changed; preparing a new snapshot")
+        else:
+            reprepare_failed_requests(db,prep,log)
+            log("Existing READY inventory reused; failed scopes reprepared when possible")
+            return True
     db.recover_preparation(prep)
     errors=[]
     jobs=[]
@@ -472,20 +567,30 @@ def prepare_all(db,transport,probe,output,log):
         (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
         log(f"PREPARE INCOMPLETE | {len(errors)} errors; rerun --prepare")
         return False
-    budget=PROBE_BUDGET
-    for job,cube,profile,scope in jobs:
-        key=workload_group(len(scope["members"]))+f":{len(scope['years'])}:{len(scope['measures'])}"
+    # Spend at most four shape probes per cube, keeping the global budget
+    # distributed across all categories instead of exhausting it on the first.
+    profiles={}
+    for job,cube,profile,scope in sorted(jobs,key=lambda j:len(j[3]["members"]),reverse=True):
+        key=("YEAR_ONLY" if not scope["hierarchy"] else workload_group(len(scope["members"])))+":"+str(len(scope["years"]))+":"+digest(scope["measures"])[:12]
         adaptive=db.load_profile(prep,cube,key)
         if adaptive is None:
             base=initial_profile(len(scope["members"]),len(scope["years"]),len(scope["measures"]))
-            adaptive,budget=benchmark_profile(db,prep,job,cube,profile,scope,base,probe,budget)
+            used=db.conn.execute("""SELECT count(*) FROM oic_requests WHERE prep=? AND cube=?
+                 AND status IN ('PROBE','PROBE_FAILED','COMMITTED','EMPTY') AND json_extract(scope_json,'$.probe_kind') IS NULL""",(prep,cube)).fetchone()[0]
+            budget=max(0,min(4-used,PROBE_BUDGET))
+            adaptive,_=benchmark_profile(db,prep,job,cube,profile,scope,base,probe,budget)
             db.save_profile(prep,cube,key,adaptive)
-        generate_request_plan(db,prep,job,cube,profile,scope,adaptive)
+        profiles[job]=adaptive
+    concurrency=optimize_concurrency(db,prep,jobs,probe)
+    for job,cube,profile,scope in jobs:
+        generate_request_plan(db,prep,job,cube,profile,scope,profiles[job])
+    db.conn.execute("UPDATE oic_requests SET status='PROBE_FAILED' WHERE prep=? AND status='PROBE'",(prep,))
     summary["requests"]=db.progress(prep)
+    summary["coverage"]=db.coverage(prep)
     summary["probe_budget"]=PROBE_BUDGET
-    summary["recommended_concurrency"]=1
-    summary["concurrency_source"]="CONSERVATIVE_NO_LIVE_CONCURRENCY_BENCHMARK"
-    db.finalize_preparation(prep,"READY",summary,concurrency=1)
+    summary["recommended_concurrency"]=concurrency["limit"]
+    summary["concurrency_profile"]=concurrency
+    db.finalize_preparation(prep,"READY",summary,concurrency=concurrency["limit"])
     (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     log(f"PREPARE READY | {len(jobs)} jobs | {summary['requests']}")
     return True

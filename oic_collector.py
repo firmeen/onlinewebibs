@@ -5581,11 +5581,14 @@ def launch_terminal_ui(args, return_app: bool = False):
 
                 status = field.get("status")
 
-                reported = field.get("reported_status")
-                label = status if status in ("VERIFIED", "MAPPED", "UNSUPPORTED") else "UNVERIFIED"
-                suffix = f"  [{label}]"
-                if reported == "VERIFIED" and status != "VERIFIED":
-                    suffix += " [REPORTED VERIFIED]"
+                if status == "UNSUPPORTED":
+                    suffix = "  [UNSUPPORTED]"
+
+                elif status not in ("MAPPED", "VERIFIED"):
+                    suffix = "  [UNVERIFIED]"
+
+                else:
+                    suffix = ""
 
                 parent.add_leaf(
                     caption + suffix,

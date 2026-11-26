@@ -398,6 +398,9 @@ def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata
         db.finalize_inventory(prep,cube,hierarchy,0)
         return []
     strategy=select_discovery_strategy(count,levels)
+    capability=db.load_profile(prep,cube,"DISCOVERY_METADATA:MEMBER_CAPABILITY") or {}
+    if capability.get("prefer_mdx"):
+        strategy="MDX_PAGINATION"
     if not state.get("next_offset") and strategy in ("RESTRICTED","LEVEL"):
         try:
             if strategy=="RESTRICTED":
@@ -430,6 +433,14 @@ def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata
             return members
         except (RuntimeError,ValueError) as exc:
             raise_if_fatal(exc)
+            kind=getattr(exc,"kind","")
+            if kind in ("DISCOVER_NOT_SUPPORTED","DISCOVERY_SCOPE_UNCONFIRMED","QUERY_SCOPE_ERROR") or "restriction not honored" in str(exc):
+                failures=capability.get("failures",0)+1
+                prefer=kind=="DISCOVER_NOT_SUPPORTED" or "restriction not honored" in str(exc) or failures>=2
+                db.save_profile(prep,cube,"DISCOVERY_METADATA:MEMBER_CAPABILITY",
+                                {"failures":failures,"prefer_mdx":prefer,"reason":kind or "RESTRICTION_NOT_HONORED"})
+                if prefer:
+                    emit_event(emit,"activity",message=f"{cube} | restricted Discover unreliable; prefer paged MDX")
             emit_event(emit,"activity",message=f"{hierarchy} | {strategy} failed; fallback to paged MDX")
     return discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit)
 

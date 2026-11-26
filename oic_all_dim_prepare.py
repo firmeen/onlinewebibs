@@ -62,7 +62,7 @@ def load_all_catalogs():
         # Preserve the original report (including unresolved identifiers/formulas).
         report = query.load_verification_report(code, kind)
         if report:
-            original = {str(f.get("id")): f for f in report.get("fields", []) if f.get("id")}
+            original = {str(query._field_identity(code,kind,f)): f for f in report.get("fields", [])}
             fields = [dict(f, original_report=original.get(str(f.get("id")))) for f in fields]
         result[key] = (profile, catalog, fields)
     return result
@@ -185,6 +185,54 @@ def deduplicate_members(rows, hierarchy):
     return sorted(result.values(),key=lambda m:m["unique_name"])
 
 
+def raise_if_fatal(exc):
+    if getattr(exc,"kind","") in ("AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR",
+                                  "RATE_LIMITED","SERVER_UNAVAILABLE","DISK_FULL","STORAGE_ERROR"):
+        raise exc
+
+
+def discover_member_counts(transport,profile,hierarchies):
+    """Use batched calculated count measures; fall back to individual counts.
+
+    The aliases and returned ordinals are checked, so missing/truncated
+    responses cannot be interpreted as zero.
+    """
+    result={}
+    cube=profile["cube"].replace("]","]]")
+    for batch in partition(hierarchies,20):
+        aliases={f"[Measures].[OICInventoryCount{i}]":h for i,h in enumerate(batch)}
+        definitions=" ".join(f"MEMBER {alias} AS Count({h}.AllMembers)" for alias,h in aliases.items())
+        mdx=f"WITH {definitions} SELECT {mdx_set(list(aliases))} ON COLUMNS FROM [{cube}]"
+        try:
+            root=checked_root(transport(profile,build_soap(profile,mdx),DEFAULT_TIMEOUT))
+            axis=root.find(f".//{{{MD_NS}}}Axis[@name='Axis0']")
+            if axis is None:
+                raise ValueError("Missing count axis")
+            names=[]
+            for item in axis.findall(f"./{{{MD_NS}}}Tuples/{{{MD_NS}}}Tuple"):
+                members=item.findall(f"{{{MD_NS}}}Member")
+                if len(members)!=1:
+                    raise ValueError("Invalid count tuple")
+                names.append(members[0].findtext(f"{{{MD_NS}}}UName"))
+            if len(names)!=len(aliases) or set(names)!=set(aliases):
+                raise ValueError("Incomplete count axis")
+            found={}
+            for cell in root.findall(f".//{{{MD_NS}}}CellData/{{{MD_NS}}}Cell"):
+                ordinal=integer(cell.get("CellOrdinal"))
+                count=integer(cell.findtext(f"{{{MD_NS}}}Value"))
+                if ordinal is None or ordinal<0 or ordinal>=len(names) or count is None or count<0 or ordinal in found:
+                    raise ValueError("Invalid count cell")
+                found[ordinal]=count
+            if len(found)!=len(names):
+                raise ValueError("Incomplete count cells")
+            result.update({aliases[name]:found[i] for i,name in enumerate(names)})
+        except (RuntimeError,ValueError) as exc:
+            raise_if_fatal(exc)
+            # Individual queries are attempted only for missing count results.
+            continue
+    return result
+
+
 def exact_member_count(transport, profile, hierarchy):
     if not query.IDENTIFIER.fullmatch(hierarchy):
         raise ValueError("Invalid hierarchy")
@@ -236,17 +284,19 @@ def discover_members_mdx(transport,profile,hierarchy,count):
     return sorted(result.values(),key=lambda m:m["unique_name"])
 
 
-def discover_dimension_members(transport,profile,hierarchy,bulk,metadata,levels):
+def discover_dimension_members(transport,profile,hierarchy,bulk,metadata,levels,count=None):
     members=deduplicate_members(bulk,hierarchy)
     reported=integer(metadata.get("HIERARCHY_CARDINALITY"))
     # Verify completeness against an actual MDX count rather than trusting
     # schema cardinality estimates or a short/empty response.
-    count=exact_member_count(transport,profile,hierarchy)
+    if count is None:
+        count=exact_member_count(transport,profile,hierarchy)
     if len(members)!=count:
         try:
             rows=discover_rows(transport,profile,"MDSCHEMA_MEMBERS",{"HIERARCHY_UNIQUE_NAME":hierarchy})
             members=deduplicate_members(rows,hierarchy)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError) as exc:
+            raise_if_fatal(exc)
             members=[]
     if len(members)!=count and levels:
         try:
@@ -256,7 +306,8 @@ def discover_dimension_members(transport,profile,hierarchy,bulk,metadata,levels)
                     rows.extend(discover_rows(transport,profile,"MDSCHEMA_MEMBERS",
                         {"HIERARCHY_UNIQUE_NAME":hierarchy,"LEVEL_UNIQUE_NAME":level["LEVEL_UNIQUE_NAME"]}))
             members=deduplicate_members(rows,hierarchy)
-        except (ValueError,RuntimeError):
+        except (ValueError,RuntimeError) as exc:
+            raise_if_fatal(exc)
             members=[]
     if len(members)!=count:
         members=discover_members_mdx(transport,profile,hierarchy,count)
@@ -497,7 +548,11 @@ def prepare_all(db,transport,probe,output,log):
         else:
             reprepare_failed_requests(db,prep,log)
             log("Existing READY inventory reused; failed scopes reprepared when possible")
-            return True
+            summary=json.loads(current["summary_json"])
+            summary.update(requests=db.progress(prep),coverage=db.coverage(prep))
+            db.finalize_preparation(prep,"READY",summary,current["concurrency"])
+            (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+            return not db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE' LIMIT 1",(prep,)).fetchone()
     db.recover_preparation(prep)
     errors=[]
     jobs=[]
@@ -519,15 +574,25 @@ def prepare_all(db,transport,probe,output,log):
             db.save_catalog(prep,cube,profile,fields,measures)
             errors.append(f"{cube}: {exc}")
             continue
-        db.save_catalog(prep,cube,profile,fields,measures)
+        if not db.conn.execute("SELECT 1 FROM oic_cubes WHERE prep=? AND cube=?",(prep,cube)).fetchone():
+            db.save_catalog(prep,cube,profile,fields,measures)
         pending=[h for h in dimensions if db.inventory(prep,cube,h) is None]
-        hierarchies,levels,bulk=[],[],[]
+        hierarchies,levels,bulk,live_measures=[],[],[],[]
+        counts={}
         if pending:
-            for kind,target in (("MDSCHEMA_HIERARCHIES",hierarchies),("MDSCHEMA_LEVELS",levels),("MDSCHEMA_MEMBERS",bulk)):
+            for kind,target in (("MDSCHEMA_HIERARCHIES",hierarchies),("MDSCHEMA_LEVELS",levels),("MDSCHEMA_MEMBERS",bulk),("MDSCHEMA_MEASURES",live_measures)):
                 try:
                     target.extend(discover_rows(transport,profile,kind))
                 except (ValueError,RuntimeError) as exc:
+                    raise_if_fatal(exc)
                     log(f"{cube} {kind} fallback: {type(exc).__name__}")
+            counts=discover_member_counts(transport,profile,pending)
+            native={r.get("MEASURE_UNIQUE_NAME"):r for r in live_measures}
+            measures={k:dict(v,live_metadata=native.get(k)) for k,v in measures.items()}
+            db.save_catalog(prep,cube,profile,fields,measures)
+        else:
+            stored=db.conn.execute("SELECT measure,metadata_json FROM oic_measures WHERE prep=? AND cube=?",(prep,cube)).fetchall()
+            measures={r[0]:json.loads(r[1]) for r in stored}
         inventory={}
         for h in dimensions:
             members=db.inventory(prep,cube,h)
@@ -535,10 +600,11 @@ def prepare_all(db,transport,probe,output,log):
                 try:
                     meta=next((r for r in hierarchies if r.get("HIERARCHY_UNIQUE_NAME")==h),{})
                     own_levels=[r for r in levels if r.get("HIERARCHY_UNIQUE_NAME")==h]
-                    members,metadata=discover_dimension_members(transport,profile,h,bulk,meta,own_levels)
+                    members,metadata=discover_dimension_members(transport,profile,h,bulk,meta,own_levels,counts.get(h))
                     db.save_inventory(prep,cube,h,"COMPLETE" if members else "EMPTY",metadata,own_levels,members)
                     log(f"{cube} {h} | MEMBERS {len(members)}")
                 except (ValueError,RuntimeError) as exc:
+                    raise_if_fatal(exc)
                     db.save_inventory(prep,cube,h,"FAILED",{"error":str(exc)[:300]},[],[])
                     errors.append(f"{cube} {h}: {str(exc)[:200]}")
                     continue
@@ -555,11 +621,16 @@ def prepare_all(db,transport,probe,output,log):
             members=[m["unique_name"] for m in inventory.get(h,[])] if h else [""]
             if not members:
                 continue
-            scope={"hierarchy":h,"year_hierarchy":profile["year"],"members":members,
-                   "years":years,"measures":sorted(measures)}
-            job=digest([prep,cube,h,scope])
-            db.save_job(prep,job,cube,h,scope)
-            jobs.append((job,cube,profile,scope))
+            groups={}
+            for name,meta in measures.items():
+                group=(meta.get("live_metadata") or {}).get("MEASUREGROUP_NAME") or "UNKNOWN"
+                groups.setdefault(group,[]).append(name)
+            for group,names in sorted(groups.items()):
+                scope={"hierarchy":h,"year_hierarchy":profile["year"],"members":members,
+                       "years":years,"measures":sorted(names),"measure_group":group}
+                job=digest([prep,cube,h,scope])
+                db.save_job(prep,job,cube,h,scope)
+                jobs.append((job,cube,profile,scope))
     summary={"preparation":prep,"catalog_fields":total_fields,"discovered_members":total_members,
              "unresolved_fields":unresolved,"jobs":len(jobs),"errors":errors}
     if errors:

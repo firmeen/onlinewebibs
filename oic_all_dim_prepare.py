@@ -7,6 +7,7 @@ import json
 import math
 import re
 import time
+from decimal import Decimal, InvalidOperation
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -32,8 +33,9 @@ def local(tag):
 
 def integer(value, default=None):
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        number=Decimal(str(value))
+        return int(number) if number.is_finite() and number==number.to_integral_value() else default
+    except (InvalidOperation,TypeError,ValueError,OverflowError):
         return default
 
 
@@ -62,7 +64,12 @@ def load_all_catalogs():
         # Preserve the original report (including unresolved identifiers/formulas).
         report = query.load_verification_report(code, kind)
         if report:
-            original = {str(query._field_identity(code,kind,f)): f for f in report.get("fields", [])}
+            original = {}
+            for f in report.get("fields", []):
+                try:
+                    original[str(query._field_identity(code,kind,f))]=f
+                except (KeyError,TypeError,ValueError):
+                    continue
             fields = [dict(f, original_report=original.get(str(f.get("id")))) for f in fields]
         result[key] = (profile, catalog, fields)
     return result
@@ -341,7 +348,8 @@ def potential(scope):
 def request_record(prep,job,cube,profile,scope,timeout,status="PENDING",parent=None):
     mdx=build_mdx(profile,scope)
     payload=build_soap(profile,mdx)
-    rid=digest([prep,cube,job,scope,parent,"PROBE" if status=="PROBE" else "EXTRACT"])
+    identity={k:scope[k] for k in ("hierarchy","year_hierarchy","members","years","measures")}
+    rid=digest([prep,cube,job,identity,parent,"PROBE" if status=="PROBE" else "EXTRACT",scope.get("probe_kind")])
     return {"id":rid,"prep":prep,"job":job,"cube":cube,"scope":scope,"mdx":mdx,
             "payload":payload,"timeout":timeout,"potential_cells":potential(scope),
             "status":status,"parent":parent}
@@ -511,7 +519,7 @@ def generate_request_plan(db,prep,job,cube,profile,scope,adaptive):
     for x,y,m in itertools.product(partition(scope["members"],adaptive["x"]),
                                     partition(scope["years"],adaptive["y"]),
                                     partition(scope["measures"],adaptive["m"])):
-        part=dict(scope,members=x,years=y,measures=m)
+        part=dict(scope,members=x,years=y,measures=m,profile_id=adaptive.get("profile_id"))
         remaining=[part]
         for covered in probes:
             remaining=[r for piece in remaining for r in subtract_scope(piece,covered)]
@@ -538,27 +546,28 @@ def prepare_all(db,transport,probe,output,log):
     fingerprint=digest([PLANNER_VERSION,catalogs])
     current=db.preparation(fingerprint)
     prep=current["id"]
-    if current["status"]=="READY":
-        version_changed=db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND error LIKE 'SOURCE_VERSION_CHANGED%' LIMIT 1",(prep,)).fetchone()
-        if version_changed:
-            db.conn.execute("UPDATE oic_preparations SET status='STALE' WHERE id=?",(prep,))
-            current=db.preparation(fingerprint)
-            prep=current["id"]
-            log("Source update marker changed; preparing a new snapshot")
-        else:
-            reprepare_failed_requests(db,prep,log)
-            log("Existing READY inventory reused; failed scopes reprepared when possible")
-            summary=json.loads(current["summary_json"])
-            summary.update(requests=db.progress(prep),coverage=db.coverage(prep))
-            db.finalize_preparation(prep,"READY",summary,current["concurrency"])
-            (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
-            return not db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE' LIMIT 1",(prep,)).fetchone()
+    version_changed=db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND error LIKE 'SOURCE_VERSION_CHANGED%' LIMIT 1",(prep,)).fetchone()
+    if version_changed:
+        db.conn.execute("UPDATE oic_preparations SET status='STALE' WHERE id=?",(prep,))
+        current=db.preparation(fingerprint)
+        prep=current["id"]
+        log("Source update marker changed; preparing a new snapshot")
+    elif current["status"]=="READY":
+        reprepare_failed_requests(db,prep,log)
+        log("Existing READY inventory reused; failed scopes reprepared when possible")
+        summary=json.loads(current["summary_json"])
+        summary.update(requests=db.progress(prep),coverage=db.coverage(prep))
+        db.finalize_preparation(prep,"READY",summary,current["concurrency"])
+        (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+        return not db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE' LIMIT 1",(prep,)).fetchone()
     db.recover_preparation(prep)
     errors=[]
     jobs=[]
     total_members=0
     total_fields=0
     unresolved=0
+    cube_summary={}
+    unavailable=[]
     for cube,(profile,catalog,fields) in catalogs.items():
         log(f"PREPARE {cube} | {len(fields)} catalog fields")
         dimensions,measures=classify_fields(fields)
@@ -566,7 +575,10 @@ def prepare_all(db,transport,probe,output,log):
         unresolved+=sum(1 for f in fields if f.get("mdx") not in dimensions and f.get("mdx") not in measures)
         if profile["availability"]!="AVAILABLE" or catalog.get("source")=="PROFILE":
             db.save_catalog(prep,cube,profile,fields,measures)
-            errors.append(f"{cube}: missing executable catalog")
+            if profile["availability"]=="NOT_AVAILABLE":
+                unavailable.append(cube)
+            else:
+                errors.append(f"{cube}: missing executable catalog")
             continue
         try:
             profile["year"]=resolve_year_hierarchy(profile,dimensions)
@@ -594,13 +606,23 @@ def prepare_all(db,transport,probe,output,log):
             stored=db.conn.execute("SELECT measure,metadata_json FROM oic_measures WHERE prep=? AND cube=?",(prep,cube)).fetchall()
             measures={r[0]:json.loads(r[1]) for r in stored}
         inventory={}
+        hierarchy_meta={str(r.get("HIERARCHY_UNIQUE_NAME","")).casefold():r for r in hierarchies}
+        levels_by_h={}
+        bulk_by_h={}
+        for row in levels:
+            levels_by_h.setdefault(str(row.get("HIERARCHY_UNIQUE_NAME","")).casefold(),[]).append(row)
+        for row in bulk:
+            bulk_by_h.setdefault(str(row.get("HIERARCHY_UNIQUE_NAME","")).casefold(),[]).append(row)
+        del bulk
         for h in dimensions:
             members=db.inventory(prep,cube,h)
             if members is None:
                 try:
-                    meta=next((r for r in hierarchies if r.get("HIERARCHY_UNIQUE_NAME")==h),{})
-                    own_levels=[r for r in levels if r.get("HIERARCHY_UNIQUE_NAME")==h]
-                    members,metadata=discover_dimension_members(transport,profile,h,bulk,meta,own_levels,counts.get(h))
+                    meta=hierarchy_meta.get(h.casefold(),{})
+                    own_levels=levels_by_h.get(h.casefold(),[])
+                    members,metadata=discover_dimension_members(transport,profile,h,bulk_by_h.pop(h.casefold(),[]),meta,own_levels,counts.get(h))
+                    if not own_levels:
+                        own_levels=list({m["level"]:{"LEVEL_UNIQUE_NAME":m["level"],"LEVEL_NUMBER":m["level_number"],"source":"MEMBER_METADATA"} for m in members if m["level"]}.values())
                     db.save_inventory(prep,cube,h,"COMPLETE" if members else "EMPTY",metadata,own_levels,members)
                     log(f"{cube} {h} | MEMBERS {len(members)}")
                 except (ValueError,RuntimeError) as exc:
@@ -614,6 +636,8 @@ def prepare_all(db,transport,probe,output,log):
         years=[m["unique_name"] for m in inventory.get(profile["year"],[])
                if not m["is_all_member"] and not m["is_calculated_member"]
                and (m["member_type"] is not None or (m["level_number"] or 0)>0)]
+        cube_summary[cube]={"fields":len(fields),"dimensions":len(dimensions),"inventories_complete":len(inventory),
+                            "members":sum(len(m) for m in inventory.values()),"years":len(years),"native_measures":len(measures)}
         if not years or not measures:
             errors.append(f"{cube}: no validated years or native measures")
             continue
@@ -632,7 +656,8 @@ def prepare_all(db,transport,probe,output,log):
                 db.save_job(prep,job,cube,h,scope)
                 jobs.append((job,cube,profile,scope))
     summary={"preparation":prep,"catalog_fields":total_fields,"discovered_members":total_members,
-             "unresolved_fields":unresolved,"jobs":len(jobs),"errors":errors}
+             "unresolved_fields":unresolved,"jobs":len(jobs),"errors":errors,
+             "cube_details":cube_summary,"unavailable_cubes":unavailable,"available_cubes":sum(p[0]["availability"]=="AVAILABLE" for p in catalogs.values())}
     if errors:
         db.finalize_preparation(prep,"PREPARING",summary)
         (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
@@ -651,7 +676,7 @@ def prepare_all(db,transport,probe,output,log):
             budget=max(0,min(4-used,PROBE_BUDGET))
             adaptive,_=benchmark_profile(db,prep,job,cube,profile,scope,base,probe,budget)
             db.save_profile(prep,cube,key,adaptive)
-        profiles[job]=adaptive
+        profiles[job]=dict(adaptive,profile_id=key)
     concurrency=optimize_concurrency(db,prep,jobs,probe)
     for job,cube,profile,scope in jobs:
         generate_request_plan(db,prep,job,cube,profile,scope,profiles[job])
@@ -659,6 +684,22 @@ def prepare_all(db,transport,probe,output,log):
     summary["requests"]=db.progress(prep)
     summary["coverage"]=db.coverage(prep)
     summary["probe_budget"]=PROBE_BUDGET
+    summary["profile_counts"]={}
+    for row in db.conn.execute("SELECT metadata_json FROM oic_profiles WHERE prep=? AND cube!='GLOBAL'",(prep,)):
+        source=json.loads(row[0]).get("source","UNKNOWN")
+        summary["profile_counts"][source]=summary["profile_counts"].get(source,0)+1
+    summary["estimated_extraction_seconds"]=None
+    # Only extrapolate when all pending jobs have measured throughput.
+    elapsed=0.0
+    for job,_,_,scope in jobs:
+        good=[sample["covered_per_second"] for sample in profiles[job].get("samples",[]) if sample.get("ok") and sample.get("covered_per_second",0)>0]
+        remaining=db.conn.execute("SELECT coalesce(sum(potential_cells),0) FROM oic_requests WHERE prep=? AND job=? AND status='PENDING'",(prep,job)).fetchone()[0]
+        if remaining and not good:
+            break
+        if remaining:
+            elapsed+=remaining/max(good)
+    else:
+        summary["estimated_extraction_seconds"]=round(elapsed/max(1,concurrency["limit"]))
     summary["recommended_concurrency"]=concurrency["limit"]
     summary["concurrency_profile"]=concurrency
     db.finalize_preparation(prep,"READY",summary,concurrency=concurrency["limit"])

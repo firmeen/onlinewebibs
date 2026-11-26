@@ -209,6 +209,8 @@ class PrepareMonitor:
             row.update(data)
         if stage not in ("RECEIVING",):
             suffix=f" | HTTP {data['http_status']}" if "http_status" in data else ""
+            if "remaining_seconds" in data:
+                suffix+=f" | JWT remaining {data['remaining_seconds']}s"
             log(f"{key[:12]} | {stage}{suffix}")
 
     def request_finished(self,key,ok,metrics=None,error=None):
@@ -691,11 +693,12 @@ class OICClient:
             now=time.time()
             # Another worker may already have renewed and published credentials.
             if self.token!=before and self.token!=rejected_token and jwt_exp(self.token)>now+TOKEN_REFRESH_MARGIN:
-                self.observe("REUSING SHARED TOKEN")
+                self.observe("REUSING SHARED TOKEN",remaining_seconds=int(jwt_exp(self.token)-now))
                 return
             if rejected_token is None and not periodic and jwt_exp(self.token)>now+TOKEN_REFRESH_MARGIN:
                 return
-            if periodic and rejected_token is None and time.monotonic()-self.last_auth_check<SESSION_RECHECK_SECONDS:
+            if (periodic and rejected_token is None and jwt_exp(self.token)>now+TOKEN_REFRESH_MARGIN
+                    and time.monotonic()-self.last_auth_check<SESSION_RECHECK_SECONDS):
                 return
             self.observe("AUTH REFRESH",stage_timeout=45)
             if not self.cookie:
@@ -757,7 +760,7 @@ class OICClient:
             self.refresh_token(periodic=periodic_due)
         except CollectionError as exc:
             # A transient renewal outage does not invalidate an existing JWT.
-            if exc.kind in ("AUTH_ENDPOINT_ERROR","SERVER_UNAVAILABLE","RATE_LIMITED") and jwt_exp(self.token)>time.time()+TOKEN_REFRESH_MARGIN:
+            if exc.kind=="AUTH_ENDPOINT_ERROR" and jwt_exp(self.token)>time.time()+TOKEN_REFRESH_MARGIN:
                 self.last_auth_check=time.monotonic()
                 self.observe("REUSING VALID TOKEN",remaining_seconds=int(jwt_exp(self.token)-time.time()))
                 return
@@ -1068,7 +1071,8 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
         db.fail(r,message,"RETRY",5)
         db.stop(rid)
     elif kind in ("RATE_LIMITED","SERVER_UNAVAILABLE","HTTP_500_UNKNOWN","AUTH_ENDPOINT_ERROR"):
-        delay=max(5,exc.delay,2**r["attempts"])
+        minimum=min(120,5*(2**r["attempts"])) if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE") else 5
+        delay=max(minimum,exc.delay,2**r["attempts"])
         db.pressure(rid,delay)
         db.fail(r,message,"RETRY" if r["attempts"]<MAX_ATTEMPTS else "FAILED",delay)
     elif kind in ("RESPONSE_TOO_LARGE","SOAP_FAULT","QUERY_FAULT","QUERY_SCOPE_ERROR","RESPONSE_TIMEOUT","INVALID_QUERY"):
@@ -1077,7 +1081,7 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
             db.fail(r,message,"RETRY",10)
         elif not db.activate_recovery_requests(r,message):
             db.fail(r,message,"NEEDS_REPREPARE")
-    elif kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","AUTH_TOKEN_EXPIRED","INVALID_XML","DATABASE_BUSY"):
+    elif kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","INVALID_XML","DATABASE_BUSY"):
         if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
             client.reconnect()
         db.fail(r,message,"RETRY" if r["attempts"]<MAX_ATTEMPTS else "FAILED",2**r["attempts"])
@@ -1321,6 +1325,8 @@ def run_prepare(db):
         health_checks={}
         unknown_streak=0
         log("AUTH | Cookie Jar active | reuse valid JWT | periodic renewal at safe request boundaries")
+        log(f"AUTH | Initial JWT remaining {max(0,int(jwt_exp(client.token)-time.time()))}s")
+        preflight_complete=False
 
         def monitored_call(profile,payload,timeout,phase,detail,attempt):
             cube=f"{profile['code']}/{profile['cube_type']}"
@@ -1370,12 +1376,24 @@ def run_prepare(db):
             return True
 
         def transport(profile,payload,timeout):
-            nonlocal unknown_streak
+            nonlocal unknown_streak,preflight_complete
             phase,detail=monitor.context()
             for attempt in range(1,MAX_ATTEMPTS+1):
                 try:
                     data=monitored_call(profile,payload,timeout,phase,detail,attempt)
                     unknown_streak=0
+                    if not preflight_complete:
+                        # Reuse the first real discovery response as the connection
+                        # check instead of issuing an additional preflight request.
+                        from oic_all_dim_prepare import parse_discover_rows
+                        if "MDSCHEMA_" in detail:
+                            try:
+                                rows=parse_discover_rows(data)
+                                if rows:
+                                    preflight_complete=True
+                                    log("CONNECTION CHECK | XMLA HTTP 200 | valid metadata rowset")
+                            except ValueError:
+                                pass
                     return data
                 except CollectionError as exc:
                     kind=exc.kind
@@ -1398,7 +1416,8 @@ def run_prepare(db):
                         raise
                     if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
                         client.reconnect()
-                    cooldown(profile,max(2**attempt,exc.delay,5),str(exc))
+                    minimum=5*(2**attempt) if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE") else 5
+                    cooldown(profile,max(2**attempt,exc.delay,minimum),str(exc))
             raise RuntimeError("Discovery retry budget exhausted")
 
         def probe(req,profile,parallel=False):

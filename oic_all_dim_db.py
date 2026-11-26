@@ -205,6 +205,104 @@ class OICDatabase:
                 [(prep,cube,hierarchy,m["unique_name"],m.get("caption"),m.get("parent"),
                   m.get("level"),canonical(m)) for m in members])
 
+    def load_discovery_checkpoint(self, prep, cube, hierarchy):
+        row=self.conn.execute("SELECT status,metadata_json FROM oic_dimensions WHERE prep=? AND cube=? AND hierarchy=?",
+                              (prep,cube,hierarchy)).fetchone()
+        if not row:
+            return {"status":"PENDING","next_offset":0}
+        return dict(json.loads(row["metadata_json"]),status=row["status"])
+
+    def save_cardinality(self, prep, cube, hierarchy, metadata, levels, count=None):
+        with self.transaction():
+            state=self.load_discovery_checkpoint(prep,cube,hierarchy)
+            if state["status"] in ("COMPLETE","EMPTY"):
+                return
+            status=state.pop("status")
+            state.update(metadata=metadata,reported_cardinality=metadata.get("HIERARCHY_CARDINALITY"))
+            if count is not None:
+                previous=state.get("expected_count")
+                if previous is not None and previous!=count and state.get("next_offset",0):
+                    # Previous pages no longer belong to a consistent enumeration.
+                    self.conn.execute("DELETE FROM oic_members WHERE prep=? AND cube=? AND hierarchy=?",
+                                      (prep,cube,hierarchy))
+                    state.update(next_offset=0,last_member=None,page_size=100)
+                state["expected_count"]=count
+            status="PARTIAL" if state.get("next_offset",0) else "COUNTED" if state.get("expected_count") is not None else "PENDING"
+            self.conn.execute("""INSERT INTO oic_dimensions VALUES(?,?,?,?,?)
+                ON CONFLICT(prep,cube,hierarchy) DO UPDATE SET status=excluded.status,metadata_json=excluded.metadata_json""",
+                (prep,cube,hierarchy,status,canonical(state)))
+            self.conn.executemany("INSERT OR REPLACE INTO oic_levels VALUES(?,?,?,?,?)",
+                [(prep,cube,hierarchy,l["LEVEL_UNIQUE_NAME"],canonical(l)) for l in levels if l.get("LEVEL_UNIQUE_NAME")])
+
+    def append_member_page(self, prep, cube, hierarchy, offset, members, page_size):
+        if not members:
+            raise ValueError("Empty page cannot advance discovery")
+        names=[m["unique_name"] for m in members]
+        if len(set(names))!=len(names):
+            raise ValueError("Duplicate members inside discovery page")
+        with self.transaction():
+            state=self.load_discovery_checkpoint(prep,cube,hierarchy)
+            if state["status"] in ("COMPLETE","EMPTY") or state.get("next_offset",0)!=offset:
+                raise ValueError("Discovery checkpoint offset mismatch")
+            existing=self.conn.execute("SELECT count(*) FROM oic_members WHERE prep=? AND cube=? AND hierarchy=?",
+                                       (prep,cube,hierarchy)).fetchone()[0]
+            if existing!=offset:
+                raise ValueError("Stored member count does not match checkpoint")
+            expected=state.get("expected_count")
+            if expected is None or offset+len(names)>expected:
+                raise ValueError("Page exceeds validated member count")
+            try:
+                self.conn.executemany("INSERT INTO oic_members VALUES(?,?,?,?,?,?,?,?)",
+                    [(prep,cube,hierarchy,m["unique_name"],m.get("caption"),m.get("parent"),m.get("level"),canonical(m))
+                     for m in members])
+            except sqlite3.IntegrityError as exc:
+                raise ValueError("Discovery page overlaps stored members") from exc
+            self.conn.executemany("INSERT OR IGNORE INTO oic_levels VALUES(?,?,?,?,?)",
+                [(prep,cube,hierarchy,m["level"],canonical({"LEVEL_UNIQUE_NAME":m["level"],
+                   "LEVEL_NUMBER":m.get("level_number"),"source":"MEMBER_METADATA"})) for m in members if m.get("level")])
+            state.pop("status",None)
+            state.update(next_offset=offset+len(names),last_member=names[-1],page_size=page_size,method="MDX_PAGINATION")
+            state.pop("error",None)
+            self.conn.execute("UPDATE oic_dimensions SET status='PARTIAL',metadata_json=? WHERE prep=? AND cube=? AND hierarchy=?",
+                              (canonical(state),prep,cube,hierarchy))
+
+    def reset_partial_inventory(self, prep, cube, hierarchy):
+        with self.transaction():
+            state=self.load_discovery_checkpoint(prep,cube,hierarchy)
+            if state["status"] in ("COMPLETE","EMPTY"):
+                raise ValueError("Cannot reset completed inventory")
+            state.pop("status",None)
+            state.update(next_offset=0,last_member=None,page_size=100)
+            self.conn.execute("DELETE FROM oic_members WHERE prep=? AND cube=? AND hierarchy=?",(prep,cube,hierarchy))
+            self.conn.execute("UPDATE oic_dimensions SET status='COUNTED',metadata_json=? WHERE prep=? AND cube=? AND hierarchy=?",
+                              (canonical(state),prep,cube,hierarchy))
+
+    def finalize_inventory(self, prep, cube, hierarchy, count):
+        with self.transaction():
+            state=self.load_discovery_checkpoint(prep,cube,hierarchy)
+            actual=self.conn.execute("SELECT count(*) FROM oic_members WHERE prep=? AND cube=? AND hierarchy=?",
+                                     (prep,cube,hierarchy)).fetchone()[0]
+            if state.get("expected_count")!=count or actual!=count or state.get("next_offset",0)!=count:
+                raise ValueError("Member inventory coverage mismatch")
+            state.pop("status",None)
+            state.pop("error",None)
+            state.update(discovered_cardinality=count,source="XMLA_COUNT_VALIDATED")
+            self.conn.execute("UPDATE oic_dimensions SET status=?,metadata_json=? WHERE prep=? AND cube=? AND hierarchy=?",
+                              ("COMPLETE" if count else "EMPTY",canonical(state),prep,cube,hierarchy))
+
+    def mark_discovery_failure(self, prep, cube, hierarchy, error):
+        with self.transaction():
+            state=self.load_discovery_checkpoint(prep,cube,hierarchy)
+            if state["status"] in ("COMPLETE","EMPTY"):
+                return
+            state.pop("status",None)
+            state["error"]=str(error)[:300]
+            state["failures"]=state.get("failures",0)+1
+            status="PARTIAL" if state.get("next_offset",0) else "FAILED"
+            self.conn.execute("""INSERT INTO oic_dimensions VALUES(?,?,?,?,?)
+                ON CONFLICT(prep,cube,hierarchy) DO UPDATE SET status=excluded.status,metadata_json=excluded.metadata_json""",
+                (prep,cube,hierarchy,status,canonical(state)))
+
     def save_profile(self, prep, cube, profile, data):
         self.conn.execute("INSERT OR REPLACE INTO oic_profiles VALUES(?,?,?,?)",
                           (prep,cube,profile,canonical(data)))

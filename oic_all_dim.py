@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -25,6 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -47,6 +49,9 @@ DEFAULT_WORKERS = 4
 MAX_RESPONSE_BYTES = 100 * 1024 * 1024
 MAX_ATTEMPTS = 3
 STARTUP_TIMEOUT = 60
+TOKEN_REFRESH_MARGIN = 60
+SESSION_RECHECK_SECONDS = 120
+AUTH_LOCK_TIMEOUT = 90
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36")
 LOGGER = logging.getLogger("oic-all-dim")
@@ -204,6 +209,8 @@ class PrepareMonitor:
             row.update(data)
         if stage not in ("RECEIVING",):
             suffix=f" | HTTP {data['http_status']}" if "http_status" in data else ""
+            if "remaining_seconds" in data:
+                suffix+=f" | JWT remaining {data['remaining_seconds']}s"
             log(f"{key[:12]} | {stage}{suffix}")
 
     def request_finished(self,key,ok,metrics=None,error=None):
@@ -298,7 +305,7 @@ class PrepareMonitor:
                 requests.append(Text(row["detail"],overflow="ellipsis",no_wrap=True))
             if stage=="COOLDOWN":
                 requests.append(Text(f"Retry in {max(0,row.get('deadline',now)-now):.1f}s",style="yellow"))
-            elif stage in ("REQUEST IN FLIGHT","AUTH REFRESH"):
+            elif stage in ("REQUEST IN FLIGHT","AUTH REFRESH","AUTH LOCK WAIT"):
                 limit=row.get("stage_timeout",row["timeout"])
                 requests.append(Text(f"{age:.1f}s elapsed / {limit}s configured timeout (client wait, not server progress)"))
                 if not compact or len(active)==1:
@@ -397,6 +404,95 @@ def read_env():
     return values
 
 
+def credential_values():
+    env=read_env()
+    return (env.get("OIC_COOKIE","").removeprefix("Cookie:").strip(),
+            env.get("OIC_BEARER_TOKEN","").removeprefix("Bearer ").strip())
+
+
+@contextmanager
+def authentication_lock(stop=lambda:False):
+    """Serialize GenToken across local workers/probes without sharing HTTP sessions."""
+    OUTPUT.mkdir(parents=True,exist_ok=True)
+    deadline=time.monotonic()+AUTH_LOCK_TIMEOUT
+    with (OUTPUT/"auth.lock").open("a+b") as file:
+        if file.seek(0,os.SEEK_END)==0:
+            file.write(b"0")
+            file.flush()
+        locked=False
+        try:
+            while not locked:
+                if stop():
+                    raise CollectionError("USER_STOP")
+                file.seek(0)
+                try:
+                    if os.name=="nt":
+                        import msvcrt
+                        msvcrt.locking(file.fileno(),msvcrt.LK_NBLCK,1)
+                    else:
+                        import fcntl
+                        fcntl.flock(file.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    locked=True
+                except OSError:
+                    if time.monotonic()>=deadline:
+                        raise CollectionError("AUTH_ENDPOINT_ERROR","Local authentication lock wait exceeded",5)
+                    time.sleep(.2)
+            yield
+        finally:
+            if locked:
+                file.seek(0)
+                if os.name=="nt":
+                    msvcrt.locking(file.fileno(),msvcrt.LK_UNLCK,1)
+                else:
+                    fcntl.flock(file.fileno(),fcntl.LOCK_UN)
+
+
+def publish_credentials(expected,cookie,token):
+    """Update only the two credential keys, preserving all unrelated .env lines.
+
+    Called under authentication_lock. Refuse to overwrite a concurrently
+    changed credential pair (e.g. the user or the original Main Collector).
+    """
+    path=PROJECT_ROOT/".env"
+    if not path.is_file() or credential_values()!=expected:
+        return False
+    if any("\r" in v or "\n" in v for v in (cookie,token)):
+        raise CollectionError("AUTH_ENDPOINT_ERROR","Unexpected credential format",5)
+    original=path.read_bytes()
+    contents=original.decode("utf-8-sig")
+    updates={"OIC_COOKIE":cookie,"OIC_BEARER_TOKEN":token}
+    found=set()
+    lines=[]
+    newline="\r\n" if "\r\n" in contents else "\n"
+    for line in contents.splitlines():
+        match=re.match(r"^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=).*$",line)
+        if not match or match.group(2) not in updates:
+            lines.append(line)
+            continue
+        key=match.group(2)
+        if key not in found:
+            lines.append(match.group(1)+key+match.group(3)+updates[key])
+            found.add(key)
+    lines.extend(key+"="+value for key,value in updates.items() if key not in found)
+    encoded=(newline.join(lines)+newline).encode("utf-8")
+    if original.startswith(b"\xef\xbb\xbf"):
+        encoded=b"\xef\xbb\xbf"+encoded
+    temporary=path.with_name(".env.oic."+uuid.uuid4().hex+".tmp")
+    try:
+        # Credentials are never written into the database or logs.
+        fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+        with os.fdopen(fd,"wb") as out:
+            out.write(encoded)
+            out.flush()
+            os.fsync(out.fileno())
+        if path.read_bytes()!=original or credential_values()!=expected:
+            return False
+        os.replace(temporary,path)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def jwt_exp(token):
     try:
         payload=token.removeprefix("Bearer ").split(".")[1]
@@ -475,8 +571,10 @@ def bounded_error_body(response):
 def classify_http(status,headers,endpoint="XMLA",body=b""):
     delay=max(5,retry_after(headers.get("Retry-After")))
     diagnostic=extract_error_details(body)
-    if status==401:
-        kind="AUTH_COOKIE_EXPIRED" if endpoint=="GEN_TOKEN" else "AUTH_TOKEN_EXPIRED"
+    if status in (301,302,303,307,308) and endpoint=="GEN_TOKEN":
+        kind="AUTH_COOKIE_EXPIRED"
+    elif status==401:
+        kind="ACCESS_DENIED" if endpoint=="GEN_TOKEN" else "AUTH_TOKEN_EXPIRED"
     elif status==403:
         kind="ACCESS_DENIED"
     elif status==429:
@@ -503,7 +601,7 @@ def classify_network(exc):
 
 
 class OICClient:
-    def __init__(self):
+    def __init__(self,periodic=False,stop=None):
         self.session=None
         self.observer=None
         self.cookie=""
@@ -511,7 +609,9 @@ class OICClient:
         self.web_class=None
         self.env_signature=None
         self.env_token=""
-        self.token_scope=None
+        self.last_auth_check=time.monotonic()
+        self.periodic=periodic
+        self.stop=stop or (lambda:False)
         self.reload_credentials(force=True)
 
     def observe(self,stage,**data):
@@ -524,9 +624,7 @@ class OICClient:
         signature=(st.st_mtime_ns,st.st_size) if st else None
         if not force and signature==self.env_signature:
             return False
-        env=read_env()
-        cookie=env.get("OIC_COOKIE","").removeprefix("Cookie:").strip()
-        token=env.get("OIC_BEARER_TOKEN","").removeprefix("Bearer ").strip()
+        cookie,token=credential_values()
         changed=cookie!=self.cookie
         token_changed=token!=self.env_token
         self.env_signature=signature
@@ -534,71 +632,137 @@ class OICClient:
         self.env_token=token
         if changed or token_changed or force:
             self.token=token
-            self.token_scope=None
+            self.last_auth_check=time.monotonic()
         if changed or self.session is None:
-            self.reconnect()
-        return changed or token_changed or force
+            self.reconnect(preserve_cookies=False)
+        if (changed or token_changed) and not force:
+            log("AUTH | external credential update loaded")
+        return changed or token_changed
 
-    def reconnect(self):
+    def load_cookie(self,raw):
+        hostname=urlparse(BASE_URL).hostname
+        for part in raw.split(";"):
+            name,separator,value=part.strip().partition("=")
+            if separator and name.strip():
+                self.session.cookies.set(name.strip(),value.strip(),domain=hostname,path="/",secure=True)
+
+    def cookie_header(self):
+        hostname=urlparse(BASE_URL).hostname
+        values={}
+        for cookie in self.session.cookies.jar:
+            if cookie.domain.lstrip(".")==hostname and not cookie.is_expired():
+                values[cookie.name]=cookie.value
+        return "; ".join(f"{key}={value}" for key,value in values.items())
+
+    def reconnect(self,preserve_cookies=True):
+        previous=None
         if self.session is not None:
+            if preserve_cookies:
+                # Preserve full cookie attributes rather than re-parsing a header.
+                previous=list(self.session.cookies.jar)
             self.session.close()
         info_names=("NAMELOOKUP_TIME","CONNECT_TIME","APPCONNECT_TIME","PRETRANSFER_TIME","STARTTRANSFER_TIME","TOTAL_TIME")
         infos=[getattr(CurlInfo,n) for n in info_names if hasattr(CurlInfo,n)]
         self.session=curl_requests.Session(verify=True,curl_infos=infos,
             curl_options={CurlOpt.TCP_KEEPALIVE:1})
         self.session.headers.update({"User-Agent":USER_AGENT,"Accept-Language":"th-TH,th;q=0.9"})
+        if previous is not None:
+            for cookie in previous:
+                self.session.cookies.jar.set_cookie(cookie)
+        else:
+            self.load_cookie(self.cookie)
 
     def set_cube(self,profile):
         cls=profile.get("cls") or profile.get("web_class")
         if not cls:
             raise CollectionError("INVALID_QUERY","Missing Web Class")
+        # Reference collector reuses a valid JWT across categories and FY/UY/AY.
+        # The selected class changes Referer/GenToken context, not token validity.
         self.web_class=cls
-        # Keep a usable scoped token; unscoped .env tokens cannot prove class compatibility.
-        # Refresh once on the first class, or when the known class changes.
 
     def referer(self):
         return BASE_URL+PAGE_PATH+"?Class="+self.web_class
 
-    def refresh_token(self):
-        self.observe("AUTH REFRESH",stage_timeout=45)
-        if not self.cookie:
-            raise CollectionError("AUTH_COOKIE_EXPIRED","Set OIC_COOKIE in .env")
-        try:
-            response=self.session.post(TOKEN_URL,
-                json={"_tk":"Init","_pageUrl":PAGE_PATH+"?Class="+self.web_class},
-                headers={"Accept":"application/json, text/javascript, */*; q=0.01",
-                         "Content-Type":"application/json; charset=UTF-8","X-Requested-With":"XMLHttpRequest",
-                         "Origin":BASE_URL,"Referer":self.referer(),"Cookie":self.cookie},
-                timeout=(15,45),allow_redirects=False)
-        except RequestException as exc:
-            error=classify_network(exc)
-            if error.kind=="TLS_ERROR":
-                raise CollectionError("TLS_ERROR","GEN_TOKEN TLS verification failure",endpoint="GEN_TOKEN") from None
-            raise CollectionError("AUTH_ENDPOINT_ERROR",f"GEN_TOKEN | {error.kind}",5,endpoint="GEN_TOKEN") from None
-        if response.status_code!=200:
-            raise classify_http(response.status_code,response.headers,"GEN_TOKEN",response.content[:65536])
-        try:
-            token=response.json().get("d","")
-        except (ValueError,AttributeError):
-            raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken did not return usable JSON",5,endpoint="GEN_TOKEN") from None
-        if token=="SESSION_EXPIRED":
-            raise CollectionError("AUTH_COOKIE_EXPIRED","Update OIC_COOKIE in .env",endpoint="GEN_TOKEN")
-        if not isinstance(token,str):
-            raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken returned unexpected token type",5,endpoint="GEN_TOKEN")
-        if jwt_exp(token)<=time.time()+30:
-            raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken returned unusable JWT",5,endpoint="GEN_TOKEN")
-        self.token=token.removeprefix("Bearer ").strip()
-        self.token_scope=self.web_class
+    def refresh_token(self,rejected_token=None,periodic=False):
+        before=self.token
+        self.observe("AUTH LOCK WAIT",stage_timeout=AUTH_LOCK_TIMEOUT)
+        with authentication_lock(self.stop):
+            self.reload_credentials()
+            if self.stop():
+                raise CollectionError("USER_STOP")
+            now=time.time()
+            # Another worker may already have renewed and published credentials.
+            if self.token!=before and self.token!=rejected_token and jwt_exp(self.token)>now+TOKEN_REFRESH_MARGIN:
+                self.observe("REUSING SHARED TOKEN",remaining_seconds=int(jwt_exp(self.token)-now))
+                return
+            if rejected_token is None and not periodic and jwt_exp(self.token)>now+TOKEN_REFRESH_MARGIN:
+                return
+            if (periodic and rejected_token is None and jwt_exp(self.token)>now+TOKEN_REFRESH_MARGIN
+                    and time.monotonic()-self.last_auth_check<SESSION_RECHECK_SECONDS):
+                return
+            self.observe("AUTH REFRESH",stage_timeout=45)
+            if not self.cookie:
+                raise CollectionError("AUTH_COOKIE_EXPIRED","Set OIC_COOKIE in .env")
+            expected=(self.cookie,self.env_token)
+            try:
+                response=self.session.post(TOKEN_URL,
+                    json={"_tk":"Init","_pageUrl":PAGE_PATH+"?Class="+self.web_class},
+                    headers={"Accept":"application/json, text/javascript, */*; q=0.01",
+                             "Content-Type":"application/json; charset=UTF-8","X-Requested-With":"XMLHttpRequest",
+                             "Origin":BASE_URL,"Referer":self.referer()},
+                    timeout=(15,45),allow_redirects=False)
+            except RequestException as exc:
+                error=classify_network(exc)
+                if error.kind=="TLS_ERROR":
+                    raise CollectionError("TLS_ERROR","GEN_TOKEN TLS verification failure",endpoint="GEN_TOKEN") from None
+                raise CollectionError("AUTH_ENDPOINT_ERROR",f"GEN_TOKEN | {error.kind}",5,endpoint="GEN_TOKEN") from None
+            if response.status_code!=200:
+                raise classify_http(response.status_code,response.headers,"GEN_TOKEN",response.content[:65536])
+            try:
+                token=response.json().get("d","")
+            except (ValueError,AttributeError):
+                raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken did not return usable JSON",5,endpoint="GEN_TOKEN") from None
+            if token=="SESSION_EXPIRED":
+                raise CollectionError("AUTH_COOKIE_EXPIRED","Update OIC_COOKIE in .env",endpoint="GEN_TOKEN")
+            if not isinstance(token,str):
+                raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken returned unexpected token type",5,endpoint="GEN_TOKEN")
+            token=token.removeprefix("Bearer ").strip()
+            if len(token.split("."))!=3 or jwt_exp(token)<=time.time()+30:
+                raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken returned unusable JWT",5,endpoint="GEN_TOKEN")
+            self.token=token
+            self.last_auth_check=time.monotonic()
+            current_cookie=self.cookie_header()
+            if not current_cookie:
+                raise CollectionError("AUTH_COOKIE_EXPIRED","GenToken session contains no usable cookies",endpoint="GEN_TOKEN")
+            try:
+                published=publish_credentials(expected,current_cookie,token)
+            except OSError:
+                published=False
+                log("AUTH | JWT renewed locally; .env update unavailable")
+            if published:
+                self.cookie=current_cookie
+                self.env_token=token
+                st=(PROJECT_ROOT/".env").stat()
+                self.env_signature=(st.st_mtime_ns,st.st_size)
+            elif credential_values()!=expected:
+                self.reload_credentials(force=True)
+                if jwt_exp(self.token)<=time.time()+10:
+                    raise CollectionError("AUTH_ENDPOINT_ERROR","Credential changed during refresh; retry with latest .env",5)
+            log(f"AUTH | GenToken successful | JWT remaining {max(0,int(jwt_exp(self.token)-time.time()))}s | "+("shared .env updated" if published else "local credential retained"))
 
     def ensure_token(self):
-        if self.token_scope==self.web_class and jwt_exp(self.token)>time.time()+60:
+        remaining=jwt_exp(self.token)-time.time()
+        periodic_due=self.periodic and time.monotonic()-self.last_auth_check>=SESSION_RECHECK_SECONDS
+        if remaining>TOKEN_REFRESH_MARGIN and not periodic_due:
+            self.observe("REUSING VALID TOKEN",remaining_seconds=int(remaining))
             return
         try:
-            self.refresh_token()
+            self.refresh_token(periodic=periodic_due)
         except CollectionError as exc:
-            if (exc.kind=="AUTH_ENDPOINT_ERROR" and self.token_scope==self.web_class
-                    and jwt_exp(self.token)>time.time()+10):
-                self.observe("REUSING VALID TOKEN")
+            # A transient renewal outage does not invalidate an existing JWT.
+            if exc.kind=="AUTH_ENDPOINT_ERROR" and jwt_exp(self.token)>time.time()+TOKEN_REFRESH_MARGIN:
+                self.last_auth_check=time.monotonic()
+                self.observe("REUSING VALID TOKEN",remaining_seconds=int(jwt_exp(self.token)-time.time()))
                 return
             raise
 
@@ -616,14 +780,15 @@ class OICClient:
                 with self.session.stream("POST",XMLA_URL,data=payload,
                     headers={"Accept":"text/plain, */*; q=0.01","Content-Type":"text/xml",
                              "X-Requested-With":"XMLHttpRequest","Origin":BASE_URL,"Referer":self.referer(),
-                             "Authorization":"Bearer "+self.token,"Cookie":self.cookie},
+                             "Authorization":"Bearer "+self.token},
                     timeout=(15,timeout),allow_redirects=False) as response:
                     headers_at=time.monotonic()
                     self.observe("HEADERS RECEIVED",http_status=response.status_code)
                     if response.status_code!=200:
                         error=classify_http(response.status_code,response.headers,"XMLA",bounded_error_body(response))
-                        if error.kind=="AUTH_TOKEN_EXPIRED" and attempt==0:
+                        if error.kind in ("AUTH_TOKEN_EXPIRED","ACCESS_DENIED") and attempt==0:
                             retry_auth=True
+                            rejected_token=self.token
                         else:
                             raise error
                     else:
@@ -679,7 +844,7 @@ class OICClient:
                                 temporary.unlink(missing_ok=True)
                 if retry_auth:
                     t=time.monotonic()
-                    self.refresh_token()
+                    self.refresh_token(rejected_token=rejected_token)
                     auth_seconds+=time.monotonic()-t
             except RequestException as exc:
                 raise classify_network(exc) from None
@@ -901,8 +1066,13 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
         db.fail(r,message,"RETRY")
     elif kind=="AUTH_COOKIE_EXPIRED":
         db.fail(r,message,"RETRY",5)
+    elif kind in ("ACCESS_DENIED","AUTH_TOKEN_EXPIRED"):
+        # Persistent rejection after bounded refresh requires user action.
+        db.fail(r,message,"RETRY",5)
+        db.stop(rid)
     elif kind in ("RATE_LIMITED","SERVER_UNAVAILABLE","HTTP_500_UNKNOWN","AUTH_ENDPOINT_ERROR"):
-        delay=max(5,exc.delay,2**r["attempts"])
+        minimum=min(120,5*(2**r["attempts"])) if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE") else 5
+        delay=max(minimum,exc.delay,2**r["attempts"])
         db.pressure(rid,delay)
         db.fail(r,message,"RETRY" if r["attempts"]<MAX_ATTEMPTS else "FAILED",delay)
     elif kind in ("RESPONSE_TOO_LARGE","SOAP_FAULT","QUERY_FAULT","QUERY_SCOPE_ERROR","RESPONSE_TIMEOUT","INVALID_QUERY"):
@@ -911,7 +1081,7 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
             db.fail(r,message,"RETRY",10)
         elif not db.activate_recovery_requests(r,message):
             db.fail(r,message,"NEEDS_REPREPARE")
-    elif kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","AUTH_TOKEN_EXPIRED","INVALID_XML","DATABASE_BUSY"):
+    elif kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","INVALID_XML","DATABASE_BUSY"):
         if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
             client.reconnect()
         db.fail(r,message,"RETRY" if r["attempts"]<MAX_ATTEMPTS else "FAILED",2**r["attempts"])
@@ -970,7 +1140,7 @@ def run_worker(rid,worker):
         run=db.run(rid)
         if not run or run["state"]!="RUNNING":
             raise RuntimeError("Unknown active run")
-        client=OICClient()
+        client=OICClient(stop=lambda:stopped(db,rid))
         if not client.cookie:
             raise RuntimeError("OIC_COOKIE not configured")
         db.register_worker(rid,worker,owner,os.getpid(),psutil.Process().create_time())
@@ -1148,12 +1318,15 @@ def run_prepare(db):
     status="FAILED"
     try:
         monitor.start()
-        client=OICClient()
+        client=OICClient(periodic=True)
         if not client.cookie:
             raise RuntimeError("Set OIC_COOKIE in local .env")
 
         health_checks={}
         unknown_streak=0
+        log("AUTH | Cookie Jar active | reuse valid JWT | periodic renewal at safe request boundaries")
+        log(f"AUTH | Initial JWT remaining {max(0,int(jwt_exp(client.token)-time.time()))}s")
+        preflight_complete=False
 
         def monitored_call(profile,payload,timeout,phase,detail,attempt):
             cube=f"{profile['code']}/{profile['cube_type']}"
@@ -1203,12 +1376,24 @@ def run_prepare(db):
             return True
 
         def transport(profile,payload,timeout):
-            nonlocal unknown_streak
+            nonlocal unknown_streak,preflight_complete
             phase,detail=monitor.context()
             for attempt in range(1,MAX_ATTEMPTS+1):
                 try:
                     data=monitored_call(profile,payload,timeout,phase,detail,attempt)
                     unknown_streak=0
+                    if not preflight_complete:
+                        # Reuse the first real discovery response as the connection
+                        # check instead of issuing an additional preflight request.
+                        from oic_all_dim_prepare import parse_discover_rows
+                        if "MDSCHEMA_" in detail:
+                            try:
+                                rows=parse_discover_rows(data)
+                                if rows:
+                                    preflight_complete=True
+                                    log("CONNECTION CHECK | XMLA HTTP 200 | valid metadata rowset")
+                            except ValueError:
+                                pass
                     return data
                 except CollectionError as exc:
                     kind=exc.kind
@@ -1231,7 +1416,8 @@ def run_prepare(db):
                         raise
                     if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
                         client.reconnect()
-                    cooldown(profile,max(2**attempt,exc.delay,5),str(exc))
+                    minimum=5*(2**attempt) if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE") else 5
+                    cooldown(profile,max(2**attempt,exc.delay,minimum),str(exc))
             raise RuntimeError("Discovery retry budget exhausted")
 
         def probe(req,profile,parallel=False):

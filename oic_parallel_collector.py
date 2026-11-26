@@ -4073,6 +4073,11 @@ def selected_worker(args) -> int:
                                             pid=os.getpid(), attempt_id=attempt_id,
                                             updated_at=utc_now()))
             heartbeat_stop.wait(2)
+    if attempt_id:
+        initial = read_json(state_path, {}) or {}
+        if (cancel_file.exists() or initial.get("attempt_id") != attempt_id
+                or initial.get("status") != "STARTING" or initial.get("pid")):
+            return 1
     save_state()
     thread = threading.Thread(target=heartbeat, daemon=True)
     thread.start()
@@ -4135,6 +4140,8 @@ def selected_worker(args) -> int:
                     log(f"REQUEST X={x_offset} Y={y_offset}", worker_id)
                     http = None
                     for attempt in range(2):
+                        if stop_requested():
+                            break
                         try:
                             http = None
                             request_started = time.monotonic()
@@ -4177,9 +4184,9 @@ def selected_worker(args) -> int:
                             if stop_requested():
                                 break
                             time.sleep(min(30, 2 ** (attempt + 1) + worker_id))
-                    if stop_requested():
-                        break
                     if data is None:
+                        if stop_requested():
+                            break
                         raise RuntimeError("Empty XMLA dataset after attempts")
                     record = dict(status="OK", x_offset=x_offset, y_offset=y_offset,
                                   request_file=req_path.name, response_file=resp_path.name,
@@ -4464,6 +4471,10 @@ def wait_for_query_workers(config: dict, run_dir: Path, attempt_id: str, *,
                             proc.terminate()
                         continue
                     code = proc.exit_code()
+                    # The final state can be written between the first read and process exit.
+                    latest = read_json(directory / "state.json", {}) or {}
+                    if latest.get("attempt_id") == attempt_id:
+                        state = latest
                     if state.get("status") not in WORKER_TERMINAL:
                         finish(wid, state, f"Worker exited without final state (exit={code})",
                                stopped=stopping)
@@ -4476,6 +4487,11 @@ def wait_for_query_workers(config: dict, run_dir: Path, attempt_id: str, *,
                 elif state.get("status") in WORKER_TERMINAL:
                     pending.discard(wid)
                 elif stopping or time.monotonic() >= launch_deadline:
+                    (directory / f"cancel-{attempt_id}.flag").touch()
+                    latest = read_json(directory / "state.json", {}) or {}
+                    if (latest.get("attempt_id") == attempt_id and latest.get("pid")
+                            and latest.get("process_created")):
+                        continue  # registration raced cancellation; supervise its exit
                     finish(wid, state, "Worker cancelled before startup" if stopping else
                            "Worker tab did not register within 60s", stopped=stopping)
             if on_tick:
@@ -4557,6 +4573,7 @@ def _batch_snapshot(batch_dir: Path, *, status: str, current: str | None,
         "status": status, "current_query": current,
         "queries": entries, "error": error,
         "updated_at": utc_now(),
+        "finished_at": utc_now() if status in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED") else None,
     })
 
 def _update_history(root: Path, record: dict) -> None:
@@ -4589,7 +4606,7 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
     colors = dict(COMPLETED="green", RUNNING="bright_cyan", RETRYING="yellow",
                   PAUSED="yellow", STALE="yellow", FAILED="red", PARTIAL="yellow",
                   SESSION_EXPIRED="red", STOPPED="yellow", STOPPING="yellow",
-                  STARTING="cyan", PENDING="dim")
+                  STARTING="cyan", EXPORTING="cyan", PENDING="dim")
     def styled(value):
         return Text(str(value), style=colors.get(str(value), "white"))
     def panel(value, title, style="cyan"):
@@ -4613,6 +4630,9 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
     bytes_mb = int(totals.get("bytes") or 0) / 1024 ** 2
     engine = ", ".join(sorted({str(w["http_engine"]) for w in workers if w.get("http_engine")})) or "—"
     active = sum(totals.get("workers_" + k, 0) for k in ("running", "retrying", "paused"))
+    running = totals.get("workers_running", 0)
+    retrying = totals.get("workers_retrying", 0)
+    paused = totals.get("workers_paused", 0)
     count = int(config.get("workers") or 0)
     header = panel(Text("OIC PARALLEL COLLECTOR | LIVE EXTRACTION MONITOR", justify="center",
                         style="bold bright_cyan"), "XMLA / MDX / EXCEL")
@@ -4624,7 +4644,8 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
     def captions(axis):
         values = config.get(axis, [])
         # Config contains stable MDX; don't guess human-readable captions.
-        return short(", ".join(str(v) for v in values), max(22, console.size.width - 24))
+        width = console.size.width // 2 if console.size.width >= 110 else console.size.width
+        return short(", ".join(str(v) for v in values), max(22, width - 20))
     configuration = Text(f"X / ROWS: {captions('x')}\nY / COLUMNS: {captions('y')}\n"
         f"Values: {len(config.get('measures', []))} | X/Y chunk: "
         f"{config.get('x_chunk', '—')}/{config.get('y_chunk', '—')}")
@@ -4635,14 +4656,14 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
     metrics = Text(
         f"Chunks OK {totals.get('chunks_ok', 0):,} | Failed {totals.get('chunks_failed', 0):,}"
         f" | Cells {totals.get('cells', 0):,} | {bytes_mb:.2f} MiB\n"
-        f"Active {active}/{count} | Execute calls {calls:,} | Avg "
+        f"Active {active}/{count} (run {running}, retry {retrying}, pause {paused}) | Execute calls {calls:,} | Avg "
         + (f"{avg:.0f} ms" if avg is not None else "—")
         + f" | Rate {rate} | Cooldown {str(cool) + 's' if cool else 'NONE'}\n"
         f"Excel: {entry.get('export_status', 'PENDING')} | Rows {entry.get('rows', '—')} "
         "| Dynamic chunks: total unknown")
     worker_table = Table(box=rich_box.SIMPLE, expand=True, padding=(0, 1), title="05 / PARALLEL WORKERS")
     for name in ("ID", "Status", "Current X/Y", "OK", "Fail", "HTTP", "ms", "HB", "Last event"):
-        worker_table.add_column(name, no_wrap=name not in ("Last event",), overflow="ellipsis")
+        worker_table.add_column(name, no_wrap=True, overflow="ellipsis")
     for w in workers:
         current_key = str(w.get("current_request") or "")
         match = re.search(r"_x(\d+)_y(\d+)$", current_key)
@@ -4657,7 +4678,8 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
     for name in ("Query", "Class/Cube", "Status", "Workers", "Chunks", "Rows"):
         queue.add_column(name, overflow="ellipsis", no_wrap=True)
     # Keep current query visible on shorter terminals.
-    row_limit = max(1, min(len(entries), console.size.height - 25 - len(workers)))
+    wide = console.size.width >= 110
+    row_limit = max(1, min(len(entries), console.size.height - (19 if wide else 28) - len(workers)))
     index = next((i for i, e in enumerate(entries) if e.get("query_id") == current), len(entries) - 1)
     first = max(0, min(index - row_limit // 2, len(entries) - row_limit))
     for e in entries[first:first + row_limit]:
@@ -4669,15 +4691,23 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
                       str(e.get("rows", "—")))
     if len(entries) > row_limit:
         queue.caption = f"Showing {first + 1}–{first + row_limit} of {len(entries)} queries"
-    recent = sorted(workers, key=lambda w: str(w.get("updated_at", "")), reverse=True)[:3]
+    recent = sorted(workers, key=lambda w: str(w.get("updated_at", "")), reverse=True)[:(3 if console.size.height >= 36 else 1)]
     events = Text("\n".join(f"{str(w.get('updated_at', ''))[11:19]} W{int(w.get('worker_id') or 0):02d} "
                              f"{short(w.get('last_message'), 110)}" for w in recent) or "Waiting for workers")
     if manifest.get("error") or entry.get("error"):
         events.append("\n" + short(manifest.get("error") or entry.get("error"), 160), style="red")
-    return Group(header, panel(overview, "01 / RUN OVERVIEW"),
-                 panel(configuration, "02 / QUERY CONFIGURATION"),
-                 panel(progress, "03 / BATCH PROGRESS"), panel(metrics, "04 / EXTRACTION METRICS"),
-                 worker_table, queue, panel(events, "07 / LATEST ACTIVITY"),
+    info = (panel(overview, "01 / RUN OVERVIEW"), panel(configuration, "02 / QUERY CONFIGURATION"))
+    stats = (panel(progress, "03 / BATCH PROGRESS"), panel(metrics, "04 / EXTRACTION METRICS"))
+    if wide:
+        top = Table.grid(expand=True)
+        top.add_column(ratio=1)
+        top.add_column(ratio=1)
+        top.add_row(*info)
+        top.add_row(*stats)
+        sections = [top]
+    else:
+        sections = [*info, *stats]
+    return Group(header, *sections, worker_table, queue, panel(events, "07 / LATEST ACTIVITY"),
                  Text("Refresh 1s | STOP / FORCE STOP: Main | Ctrl+C: close monitor", style="dim"))
 
 
@@ -4790,13 +4820,16 @@ def run_batch(batch_dir: Path) -> int:
             else:
                 entry["status"] = "PARTIAL" if totals["chunks_ok"] else "FAILED"
             try:
-                entry["export_status"] = "EXPORTING"
+                extraction_status = entry["status"]
+                entry.update(status="EXPORTING", export_status="EXPORTING")
                 _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
                 output, row_count = selected_export(config, qdir)
-                entry.update(excel_path=output, rows=row_count, export_status="COMPLETED")
+                entry.update(status=extraction_status, excel_path=output, rows=row_count,
+                             export_status="COMPLETED")
             except Exception as exc:
                 entry.update(status="PARTIAL" if totals["chunks_ok"] else "FAILED",
                              export_status="FAILED", error=f"EXCEL: {exc}")
+            entry["finished_at"] = utc_now()
             _update_history(output_root, dict(
                 run_id=batch_dir.name, query_id=qid, code=config["code"],
                 cube_type=config.get("cube_type", "FY"), cube=config["cube"],

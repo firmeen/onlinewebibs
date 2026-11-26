@@ -294,10 +294,14 @@ def exact_member_count(transport,profile,hierarchy,emit=None):
 
 def read_member_page(transport,profile,hierarchy,offset,size,emit=None):
     cube=profile["cube"].replace("]","]]")
-    mdx=(f"SELECT Subset({hierarchy}.AllMembers,{offset},{size}) "
-         f"DIMENSION PROPERTIES MEMBER_TYPE,PARENT_UNIQUE_NAME,CHILDREN_CARDINALITY ON COLUMNS FROM [{cube}]")
+    # Constant measure avoids evaluating the default business measure.
+    mdx=(f"WITH MEMBER [Measures].[OICInventoryAxis] AS 0 "
+         f"SELECT {{[Measures].[OICInventoryAxis]}} ON COLUMNS, "
+         f"Subset({hierarchy}.AllMembers,{offset},{size}) "
+         f"DIMENSION PROPERTIES MEMBER_TYPE,PARENT_UNIQUE_NAME,CHILDREN_CARDINALITY "
+         f"ON ROWS FROM [{cube}] CELL PROPERTIES VALUE")
     root=checked_root(transport(profile,build_soap(profile,mdx),90))
-    axis=root.find(f".//{{{MD_NS}}}Axis[@name='Axis0']")
+    axis=root.find(f".//{{{MD_NS}}}Axis[@name='Axis1']")
     if axis is None:
         raise ValueError("Missing member enumeration axis")
     page=axis.findall(f"./{{{MD_NS}}}Tuples/{{{MD_NS}}}Tuple")
@@ -317,7 +321,10 @@ def read_member_page(transport,profile,hierarchy,offset,size,emit=None):
              "LEVEL_UNIQUE_NAME":props.get("LName"),"LEVEL_NUMBER":props.get("LNum"),
              "PARENT_UNIQUE_NAME":props.get("PARENT_UNIQUE_NAME"),"MEMBER_TYPE":props.get("MEMBER_TYPE"),
              "CHILDREN_CARDINALITY":props.get("CHILDREN_CARDINALITY"),"HIERARCHY_UNIQUE_NAME":hierarchy}
-        result.append(normalize_member(row))
+        member=normalize_member(row)
+        if member["member_type"] is None and hierarchy==profile.get("year"):
+            raise ValueError("Missing MEMBER_TYPE for year inventory")
+        result.append(member)
     if len({m["unique_name"] for m in result})!=len(result):
         raise ValueError("Duplicate member enumeration page")
     return result
@@ -382,66 +389,18 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
 
 
 def select_discovery_strategy(count,levels):
-    if count<=500:
-        return "RESTRICTED"
-    if count>2000 and levels and all(
-        0<=integer(l.get("LEVEL_CARDINALITY"),-1)<=500 for l in levels):
-        return "LEVEL"
+    # Local catalog supplies identifiers; live Execute verifies members.
     return "MDX_PAGINATION"
 
 
 def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata,levels,count,emit=None):
-    state=db.load_discovery_checkpoint(prep,cube,hierarchy)
     if count is None:
         raise ValueError("Exact cardinality not available")
     if count==0:
         db.finalize_inventory(prep,cube,hierarchy,0)
         return []
     strategy=select_discovery_strategy(count,levels)
-    capability=db.load_profile(prep,cube,"DISCOVERY_METADATA:MEMBER_CAPABILITY") or {}
-    if capability.get("prefer_mdx"):
-        strategy="MDX_PAGINATION"
-    if not state.get("next_offset") and strategy in ("RESTRICTED","LEVEL"):
-        try:
-            if strategy=="RESTRICTED":
-                rows=discover_rows(transport,profile,"MDSCHEMA_MEMBERS",{"HIERARCHY_UNIQUE_NAME":hierarchy},emit=emit)
-            else:
-                rows=[]
-                for level in levels:
-                    name=level.get("LEVEL_UNIQUE_NAME")
-                    if not name:
-                        raise ValueError("Missing level unique name")
-                    part=discover_rows(transport,profile,"MDSCHEMA_MEMBERS",
-                                       {"HIERARCHY_UNIQUE_NAME":hierarchy,"LEVEL_UNIQUE_NAME":name},emit=emit)
-                    if any(r.get("LEVEL_UNIQUE_NAME")!=name for r in part):
-                        raise ValueError("Level restriction not honored")
-                    rows.extend(part)
-            members=deduplicate_members(rows,hierarchy)
-            if len(members)!=count:
-                raise ValueError("Restricted member count mismatch")
-            names={m["unique_name"] for m in members}
-            for m in members:
-                m["parent_present"]=m["parent"] in names if m["parent"] else None
-            if not levels:
-                levels=list({m["level"]:{"LEVEL_UNIQUE_NAME":m["level"],"LEVEL_NUMBER":m["level_number"],
-                    "source":"MEMBER_METADATA"} for m in members if m["level"]}.values())
-            db.save_inventory(prep,cube,hierarchy,"COMPLETE",
-                {"metadata":metadata,"reported_cardinality":integer(metadata.get("HIERARCHY_CARDINALITY")),
-                 "discovered_cardinality":count,"expected_count":count,"next_offset":count,
-                 "source":"XMLA_COUNT_VALIDATED","method":strategy},levels,members)
-            emit_event(emit,"discovery",message=f"CHECKPOINT | {hierarchy} | {count:,}/{count:,} committed")
-            return members
-        except (RuntimeError,ValueError) as exc:
-            raise_if_fatal(exc)
-            kind=getattr(exc,"kind","")
-            if kind in ("DISCOVER_NOT_SUPPORTED","DISCOVERY_SCOPE_UNCONFIRMED","QUERY_SCOPE_ERROR") or "restriction not honored" in str(exc):
-                failures=capability.get("failures",0)+1
-                prefer=kind=="DISCOVER_NOT_SUPPORTED" or "restriction not honored" in str(exc) or failures>=2
-                db.save_profile(prep,cube,"DISCOVERY_METADATA:MEMBER_CAPABILITY",
-                                {"failures":failures,"prefer_mdx":prefer,"reason":kind or "RESTRICTION_NOT_HONORED"})
-                if prefer:
-                    emit_event(emit,"activity",message=f"{cube} | restricted Discover unreliable; prefer paged MDX")
-            emit_event(emit,"activity",message=f"{hierarchy} | {strategy} failed; fallback to paged MDX")
+    emit_event(emit,"activity",message=f"{cube} | {strategy} | {hierarchy} | {count:,} members")
     return discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit)
 
 
@@ -738,21 +697,25 @@ def prepare_all(db,transport,probe,output,log,emit=None):
         emit_event(emit,"activity",message=f"{cube} | {len(inventory)} cached hierarchies | {len(pending)} pending")
         hierarchies,levels,live_measures=[],[],[]
         if pending:
+            # Reuse successful optional metadata without requiring new
+            # Discover calls on the critical path.
+            emit_event(emit,"phase",phase="METADATA_DISCOVERY",cube=cube,
+                       detail="Verified catalog + cached metadata | MDX EXECUTE FIRST")
             targets=(("MDSCHEMA_HIERARCHIES",hierarchies),("MDSCHEMA_LEVELS",levels),("MDSCHEMA_MEASURES",live_measures))
             for kind,target in targets:
                 cached=db.load_profile(prep,cube,"DISCOVERY_METADATA:"+kind)
                 if cached is not None:
-                    target.extend(cached["rows"])
-                    emit_event(emit,"activity",message=f"{cube} | reusing {kind}")
-                    continue
-                try:
-                    target.extend(discover_rows(transport,profile,kind,emit=emit))
-                    db.save_profile(prep,cube,"DISCOVERY_METADATA:"+kind,{"rows":target})
-                except (ValueError,RuntimeError) as exc:
-                    raise_if_fatal(exc)
-                    log(f"{cube} {kind} fallback: {type(exc).__name__}")
+                    target.extend(cached.get("rows",[]))
+                    emit_event(emit,"activity",message=f"{cube} | reusing cached {kind}")
             native={r.get("MEASURE_UNIQUE_NAME"):r for r in live_measures}
-            measures={k:dict(v,live_metadata=native.get(k)) for k,v in measures.items()}
+            stored={r[0]:json.loads(r[1]) for r in db.conn.execute(
+                "SELECT measure,metadata_json FROM oic_measures WHERE prep=? AND cube=?",(prep,cube))}
+            for name,meta in list(measures.items()):
+                details=meta.get("details") or {}
+                previous=(stored.get(name) or {}).get("live_metadata")
+                local_group=details.get("MEASUREGROUP_NAME") or meta.get("measure_group")
+                live=native.get(name) or previous or ({"MEASUREGROUP_NAME":local_group} if local_group else None)
+                measures[name]=dict(meta,live_metadata=live)
             db.save_catalog(prep,cube,profile,fields,measures)
         else:
             stored=db.conn.execute("SELECT measure,metadata_json FROM oic_measures WHERE prep=? AND cube=?",(prep,cube)).fetchall()
@@ -808,6 +771,8 @@ def prepare_all(db,transport,probe,output,log,emit=None):
                 job=digest([prep,cube,h,scope])
                 db.save_job(prep,job,cube,h,scope)
                 jobs.append((job,cube,profile,scope))
+        if len(inventory)!=len(dimensions):
+            errors.append(f"{cube}: {len(dimensions)-len(inventory)} unresolved hierarchy inventories")
         emit_event(emit,"cube",cube=cube,status="INVENTORY READY" if len(inventory)==len(dimensions) else "INCOMPLETE")
     summary={"preparation":prep,"catalog_fields":total_fields,"discovered_members":total_members,
              "unresolved_fields":unresolved,"jobs":len(jobs),"errors":errors,

@@ -1292,94 +1292,87 @@ class OICClient:
         request_body: bytes,
         destination: Path,
     ) -> dict:
-
-        if (
-            jwt_exp(self.token)
-            <= int(time.time()) + 60
-        ):
-
-            self.refresh_token()
-
-        for attempt in range(2):
-            if attempt:
-                # The previous streaming response has already been closed.
-                self.refresh_token()
-
-            headers = {
-                "Accept": "text/plain, */*; q=0.01",
-                "Content-Type": "text/xml",
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE_URL,
-                "Referer": self.referer(),
-                "Authorization": (
-                    "Bearer " + self.token
-                ),
-            }
-
-            with self.session.stream(
-                "POST",
-                XMLA_URL,
-                data=request_body,
-                headers=headers,
-                timeout=(15, self.timeout),
-                allow_redirects=False,
-            ) as response:
-
-                if (
-                    response.status_code in (401, 403)
-                    and attempt == 0
-                ):
-
-                    continue
-
-                temporary = destination.with_name(
-                    destination.name + ".partial"
-                )
-
-                size = 0
-
+        started = time.perf_counter()
+        metrics = dict(execute_ms=None, token_refresh_ms=0.0,
+                       header_wait_ms=None, first_body_ms=None, receive_ms=None,
+                       file_write_ms=None, finalize_ms=None, http_attempts=0,
+                       http_status=None, last_observed_http=None)
+        # Retain partial timing on exceptions without changing exception types.
+        self.last_execute_metrics = metrics
+        try:
+            if jwt_exp(self.token) <= int(time.time()) + 60:
+                refresh_started = time.perf_counter()
                 try:
-
-                    with temporary.open("wb") as file:
-
-                        for chunk in response.iter_content():
-
-                            if not chunk:
-                                continue
-
-                            size += len(chunk)
-
-                            if size > self.max_bytes:
-
-                                raise RuntimeError(
-                                    "XMLA response exceeds "
-                                    "configured size limit"
-                                )
-
-                            file.write(chunk)
-
-                    temporary.replace(
-                        destination
-                    )
-
+                    self.refresh_token()
                 finally:
+                    metrics["token_refresh_ms"] += (time.perf_counter() - refresh_started) * 1000
 
-                    temporary.unlink(
-                        missing_ok=True
-                    )
+            for attempt in range(2):
+                if attempt:
+                    refresh_started = time.perf_counter()
+                    try:
+                        self.refresh_token()
+                    finally:
+                        metrics["token_refresh_ms"] += (time.perf_counter() - refresh_started) * 1000
 
-                return {
-                    "http_status": response.status_code,
-                    "content_type": response.headers.get(
-                        "Content-Type",
-                        "",
-                    ),
-                    "response_bytes": size,
+                headers = {
+                    "Accept": "text/plain, */*; q=0.01",
+                    "Content-Type": "text/xml",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": BASE_URL,
+                    "Referer": self.referer(),
+                    "Authorization": "Bearer " + self.token,
                 }
-
-        raise RuntimeError(
-            "Authentication rejected after JWT refresh"
-        )
+                metrics.update(header_wait_ms=None, first_body_ms=None, receive_ms=None,
+                               file_write_ms=None, finalize_ms=None, http_status=None)
+                metrics["http_attempts"] += 1
+                transfer_started = time.perf_counter()
+                with self.session.stream(
+                    "POST", XMLA_URL, data=request_body, headers=headers,
+                    timeout=(15, self.timeout), allow_redirects=False,
+                ) as response:
+                    metrics["header_wait_ms"] = (time.perf_counter() - transfer_started) * 1000
+                    metrics["http_status"] = response.status_code
+                    metrics["last_observed_http"] = response.status_code
+                    if response.status_code in (401, 403) and attempt == 0:
+                        continue
+                    temporary = destination.with_name(destination.name + ".partial")
+                    size = 0
+                    metrics["file_write_ms"] = 0.0
+                    receive_started = time.perf_counter()
+                    try:
+                        try:
+                            with temporary.open("wb") as file:
+                                for chunk in response.iter_content():
+                                    if not chunk:
+                                        continue
+                                    if metrics["first_body_ms"] is None:
+                                        metrics["first_body_ms"] = (time.perf_counter() - transfer_started) * 1000
+                                    size += len(chunk)
+                                    if size > self.max_bytes:
+                                        raise RuntimeError("XMLA response exceeds configured size limit")
+                                    write_started = time.perf_counter()
+                                    try:
+                                        file.write(chunk)
+                                    finally:
+                                        metrics["file_write_ms"] += (time.perf_counter() - write_started) * 1000
+                        finally:
+                            metrics["receive_ms"] = (time.perf_counter() - receive_started) * 1000
+                        finalize_started = time.perf_counter()
+                        try:
+                            temporary.replace(destination)
+                        finally:
+                            metrics["finalize_ms"] = (time.perf_counter() - finalize_started) * 1000
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    metrics.update(content_type=response.headers.get("Content-Type", ""),
+                                   response_bytes=size)
+                    break
+            else:
+                raise RuntimeError("Authentication rejected after JWT refresh")
+        finally:
+            metrics["execute_ms"] = (time.perf_counter() - started) * 1000
+        return dict(metrics)
 
     def close(self) -> None:
         self.session.close()
@@ -4036,8 +4029,7 @@ def selected_worker(args) -> int:
             if remaining <= 0:
                 return
             state["status"] = "PAUSED"
-            state["last_message"] = "Shared server cooldown"
-            save_state()
+            set_phase("COOLDOWN", "Shared server cooldown")
             time.sleep(min(1, remaining))
         return
     def backoff_server(http_status: int, attempt: int):
@@ -4063,10 +4055,23 @@ def selected_worker(args) -> int:
                  last_http=None, last_message="Initializing", updated_at=utc_now(),
                  started_at=utc_now(), http_engine="curl_cffi",
                  requests_total=0, requests_finished=0,
-                 request_time_total_ms=0.0, last_request_ms=None)
+                 request_time_total_ms=0.0, last_request_ms=None,
+                 current_phase="INITIALIZING", current_x_offset=None, current_y_offset=None,
+                 last_event_at=utc_now(), slow_requests=0, recent_requests=[],
+                 last_execute_http=None, last_parse_ms=None, last_parse_source=None)
+    timing_fields = ("header_wait_ms", "first_body_ms", "receive_ms", "file_write_ms",
+                     "finalize_ms", "token_refresh_ms", "http_attempts")
+    state.update({"last_" + name: None for name in timing_fields})
     def save_state():
         state["updated_at"] = utc_now()
         write_json(state_path, state)
+    def set_phase(phase, message=None):
+        state["current_phase"] = phase
+        if phase != "REQUESTING":
+            state["request_started_at"] = None
+        if message is not None:
+            state.update(last_message=message, last_event_at=utc_now())
+        save_state()
     def heartbeat():
         while not heartbeat_stop.is_set():
             write_json(heartbeat_path, dict(run_id=config["run_id"], worker_id=worker_id,
@@ -4089,7 +4094,7 @@ def selected_worker(args) -> int:
         console.print(Panel(
             Text(f"OIC PARALLEL COLLECTOR\nWORKER {worker_id:02d} / {worker_count:02d}\n"
                  f"{config.get('query_id', 'Q001')} | {code}/{config.get('cube_type', 'FY')} | CURL_CFFI\n"
-                 f"X start={allocation['x_offset_start']} stride={allocation['x_offset_stride']}",
+                 f"X start={allocation['x_offset_start']} stride={allocation['x_offset_stride']} | CHUNK={x_size}/{y_size}",
                  justify="center"), border_style="cyan"))
         log("Task plan loaded", worker_id, "OK")
         if stop_requested():
@@ -4103,18 +4108,17 @@ def selected_worker(args) -> int:
                            timeout=int(config.get("timeout", 60)),
                            max_response_mb=100, worker_id=worker_id, code=code)
         state["status"] = "RUNNING"
-        state["last_message"] = "HTTP session ready"
-        save_state()
+        set_phase("IDLE", "HTTP session ready")
         log("HTTP session initialized | curl_cffi", worker_id, "OK")
         # Deterministic X paging: a given X page belongs to exactly one worker.
         x_offset = int(allocation["x_offset_start"])
         while not stop_requested():
             y_offset = 0
             if (run_dir / "pause.flag").exists():
-                state["status"] = "PAUSED"; save_state()
+                state["status"] = "PAUSED"; set_phase("PAUSED", "Paused")
                 while (run_dir / "pause.flag").exists() and not stop_requested():
                     time.sleep(1)
-                state["status"] = "RUNNING"; save_state()
+                state["status"] = "RUNNING"; set_phase("IDLE", "Resumed")
             if stop_requested():
                 break
             x_returned = None
@@ -4124,45 +4128,92 @@ def selected_worker(args) -> int:
                 resp_path = chunks_dir / f"{key}.response.xml"
                 record = manifest["chunks"].get(key, {})
                 data = None
+                cached = False
+                state.update(current_x_offset=x_offset, current_y_offset=y_offset,
+                             current_request=key)
+                chunk_http = None
                 if record.get("status") == "OK" and resp_path.is_file():
+                    set_phase("PARSING", f"Cached XML X={x_offset} Y={y_offset}")
+                    parse_started = time.perf_counter()
                     try:
                         data = query_parse(resp_path.read_bytes())
+                        cached = True
                     except (ValueError, ET.ParseError, OSError):
                         data = None
+                    finally:
+                        state.update(last_parse_ms=(time.perf_counter() - parse_started) * 1000,
+                                     last_parse_source="CACHE")
                 if data is None:
                     wait_for_server()
                     if stop_requested():
                         break
                     req_path.write_bytes(query_soap(config, x_offset, y_offset))
-                    state.update(status="RUNNING", current_request=key,
-                                 request_started_at=utc_now(), last_message=f"Request {key}")
-                    save_state()
-                    log(f"REQUEST X={x_offset} Y={y_offset}", worker_id)
+                    state.update(status="RUNNING", current_request=key)
                     http = None
                     for attempt in range(2):
                         if stop_requested():
                             break
                         try:
                             http = None
-                            request_started = time.monotonic()
+                            chunk_http = None
+                            body = req_path.read_bytes()
+                            client.last_execute_metrics = {}
                             state.update(status="RUNNING", request_started_at=utc_now(),
-                                         last_http=None, requests_total=state["requests_total"] + 1)
-                            save_state()
+                                         last_execute_http=None, last_parse_ms=None,
+                                         last_parse_source=None, requests_total=state["requests_total"] + 1)
+                            set_phase("REQUESTING", f"REQUEST X={x_offset} Y={y_offset}")
+                            log(f"REQUEST X={x_offset} Y={y_offset}", worker_id)
+                            request_started = time.perf_counter()
+                            sample = None
                             try:
-                                http = client.execute(req_path.read_bytes(), resp_path)
+                                http = client.execute(body, resp_path)
                             finally:
-                                duration = (time.monotonic() - request_started) * 1000
+                                timing = http if http is not None else client.last_execute_metrics
+                                duration = timing.get("execute_ms")
+                                if duration is None:
+                                    duration = (time.perf_counter() - request_started) * 1000
                                 state["last_request_ms"] = round(duration, 2)
                                 state["request_time_total_ms"] += duration
                                 state["requests_finished"] += 1
-                                if http is not None:
-                                    state["last_http"] = http["http_status"]
-                                save_state()
+                                chunk_http = timing.get("http_status")
+                                state["last_execute_http"] = chunk_http
+                                observed_http = timing.get("last_observed_http", chunk_http)
+                                if observed_http is not None:
+                                    state["last_http"] = observed_http
+                                for name in timing_fields:
+                                    state["last_" + name] = timing.get(name)
+                                state["slow_requests"] += int(duration >= 5000)
+                                sample = dict(completed_at=utc_now(), duration_ms=duration,
+                                              http_status=chunk_http, parse_ms=None,
+                                              outcome="OK" if http and chunk_http == 200 else "ERROR")
+                                sample.update({name: timing.get(name) for name in timing_fields})
+                                state["recent_requests"].append(sample)
+                                del state["recent_requests"][:-100]
+                                set_phase("IDLE", f"HTTP {chunk_http if chunk_http is not None else 'ERROR'} | {duration:.0f} ms")
+                                if http is None and duration >= 5000:
+                                    log(f"SLOW | Execute error after {duration:.0f} ms", worker_id, "WARN")
+                            if duration >= 5000:
+                                wait_ms = timing.get("header_wait_ms")
+                                receive_ms = timing.get("receive_ms")
+                                log("SLOW | Header " + (f"{wait_ms:.0f} ms" if wait_ms is not None else "—")
+                                    + " | Receive " + (f"{receive_ms:.0f} ms" if receive_ms is not None else "—"),
+                                    worker_id, "WARN")
                             log(f"HTTP {http['http_status']} | {duration:.0f} ms | "
                                 f"{http['response_bytes']:,} bytes", worker_id,
-                                "OK" if http["http_status"] == 200 else "WARN")
+                                "WARN" if duration >= 5000 or http["http_status"] != 200 else "OK")
                             if http["http_status"] == 200:
-                                data = query_parse(resp_path.read_bytes())
+                                set_phase("PARSING", f"Parse XML X={x_offset} Y={y_offset}")
+                                parse_started = time.perf_counter()
+                                try:
+                                    data = query_parse(resp_path.read_bytes())
+                                except BaseException:
+                                    sample["outcome"] = "ERROR"
+                                    raise
+                                finally:
+                                    state["last_parse_ms"] = (time.perf_counter() - parse_started) * 1000
+                                    state["last_parse_source"] = "HTTP"
+                                    sample["parse_ms"] = state["last_parse_ms"]
+                                    save_state()
                                 break
                             if http["http_status"] in (401, 403):
                                 raise RuntimeError(f"AUTH HTTP {http['http_status']}")
@@ -4173,13 +4224,13 @@ def selected_worker(args) -> int:
                             wait_for_server()
                             if stop_requested():
                                 break
-                            state["status"] = "RUNNING"; save_state()
+                            state["status"] = "RUNNING"; set_phase("IDLE")
                         except (CurlRequestError, ValueError, ET.ParseError, RuntimeError) as exc:
                             if attempt == 1 or (http and http.get("http_status") not in
                                                        (408, 425, 429, 500, 502, 503, 504)):
                                 raise
-                            state.update(status="RETRYING", last_message=f"Retry: {exc}"[:200])
-                            save_state()
+                            state["status"] = "RETRYING"
+                            set_phase("RETRYING", f"Retry: {exc}"[:200])
                             log(f"Transient error: {exc}", worker_id, "WARN")
                             if stop_requested():
                                 break
@@ -4195,10 +4246,6 @@ def selected_worker(args) -> int:
                                   cells=len(data["cells"]), http_status=200,
                                   response_bytes=resp_path.stat().st_size,
                                   completed_at=utc_now())
-                    manifest["chunks"][key] = record
-                    manifest["updated_at"] = utc_now()
-                    write_json(manifest_path, manifest)
-                    log(f"OK X={record['x_count']} Y={record['y_tuples']} cells={record['cells']}", worker_id, "OK")
                 # Schema v2 puts Measures on Axis1 with X/ROWS; v1 preserved.
                 row_keys = {tuple(m["unique_name"] for m in row
                                   if m["hierarchy"] != "[Measures]")
@@ -4210,17 +4257,36 @@ def selected_worker(args) -> int:
                     x_count = len(data["axes"]["Axis0"])
                     y_count = len(row_keys)
                 x_returned = x_count
-                state.update(current_request=None, request_started_at=None,
-                             last_message=f"OK X={x_offset} Y={y_offset} cells={len(data['cells'])}")
-                save_state()
+                valid_cells = sum(value is not None for value in data["cells"].values())
+                kind = ("EMPTY_PAGE" if x_count == 0 or y_count == 0 else
+                        "DATA" if valid_cells else "NO_CELLS")
+                metadata = dict(x_members=x_count, y_members=y_count,
+                                axis0_tuples=len(data["axes"]["Axis0"]),
+                                axis1_tuples=len(data["axes"]["Axis1"]),
+                                measure_count=len(config.get("measures", [])),
+                                chunk_kind=kind, nonempty_cells=valid_cells)
+                if not cached or any(record.get(k) != v for k, v in metadata.items()):
+                    set_phase("SAVING", f"Save chunk X={x_offset} Y={y_offset}")
+                    record.update(metadata)
+                    manifest["chunks"][key] = record
+                    manifest["updated_at"] = utc_now()
+                    write_json(manifest_path, manifest)
+                message = (f"{'CACHE ' if cached else ''}{kind} | X={x_count} Y={y_count} "
+                           f"M={metadata['measure_count']} CELLS={valid_cells}")
+                if not cached:
+                    log(message, worker_id, "OK")
+                state["current_request"] = None
+                set_phase("IDLE", f"{kind} X={x_offset} Y={y_offset} | cells={valid_cells}")
                 if x_count == 0 or y_count < y_size:
                     break
                 y_offset += y_size
+                set_phase("DELAY")
                 time.sleep(float(config.get("delay", 1)))
             if x_returned is None or x_returned < x_size:
                 completed = True
                 break
             x_offset += int(allocation["x_offset_stride"])
+            set_phase("DELAY")
             time.sleep(float(config.get("delay", 1)))
         state["status"] = "STOPPED" if stop_requested() else "COMPLETED" if completed else "PARTIAL"
     except KeyboardInterrupt:
@@ -4234,13 +4300,13 @@ def selected_worker(args) -> int:
                                           x_offset=x_offset, y_offset=y_offset,
                                           response_file=resp_path.name,
                                           request_file=req_path.name,
-                                          http_status=state.get("last_http"),
+                                          http_status=locals().get("chunk_http"),
                                           error=text_message[:300],
                                           completed_at=utc_now())
         has_success = any(c.get("status") == "OK" for c in manifest["chunks"].values())
         state["status"] = ("SESSION_EXPIRED" if any(marker in text_message.upper() for marker in ("SESSION_EXPIRED", "COOKIE SESSION EXPIRED", "AUTH HTTP 401", "AUTH HTTP 403"))
                            else "PARTIAL" if has_success else "FAILED")
-        state["last_message"] = text_message[:200]
+        state.update(last_message=text_message[:200], last_event_at=utc_now())
         log(f"FAILED: {text_message}", worker_id, "ERROR")
     finally:
         if client:
@@ -4253,7 +4319,9 @@ def selected_worker(args) -> int:
         manifest["updated_at"] = utc_now()
         write_json(manifest_path, manifest)
         state["exit_code"] = 1 if errors else 0
+        state["current_phase"] = "FINISHED"
         state["last_message"] = f"{state['status']}: {state.get('last_message', '')}"[:200]
+        state["last_event_at"] = utc_now()
         save_state()
         log(state["last_message"], worker_id,
             "OK" if state["status"] == "COMPLETED" else "WARN")
@@ -4265,8 +4333,17 @@ WORKER_TERMINAL = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED
 
 def selected_summary(config: dict, run_dir: Path):
     workers = []
-    totals = dict(chunks_ok=0, chunks_failed=0, cells=0, bytes=0,
-                  requests_total=0, requests_finished=0, request_time_total_ms=0.0)
+    chunk_fields = ("chunks_ok", "chunks_failed", "data_chunks", "empty_pages",
+                    "no_cell_chunks", "unclassified_chunks", "cells", "bytes")
+    totals = dict.fromkeys(chunk_fields, 0)
+    totals.update(requests_total=0, requests_finished=0, request_time_total_ms=0.0,
+                  slow_requests=0)
+    now = datetime.now(timezone.utc)
+    recent = []
+    starts = []
+    history_limited = False
+    expected_hash = query_hash(config)
+    kinds = {"DATA": "data_chunks", "EMPTY_PAGE": "empty_pages", "NO_CELLS": "no_cell_chunks"}
     for wid in range(1, int(config["workers"]) + 1):
         directory = run_dir / f"worker_{wid:02d}"
         state = read_json(directory / "state.json", {}) or {}
@@ -4284,27 +4361,70 @@ def selected_summary(config: dict, run_dir: Path):
             if (last and state["heartbeat_age"] > 10) or (
                     not last and elapsed_seconds(state.get("started_at")) > 10):
                 state["status"] = "STALE"
-        state.update(chunks_ok=0, chunks_failed=0, cells=0, bytes=0)
+        state.update(dict.fromkeys(chunk_fields, 0))
         manifest = read_json(directory / "manifest.json", {}) or {}
         if (manifest.get("run_id") == config["run_id"]
-                and manifest.get("query_hash") == query_hash(config)):
+                and manifest.get("query_hash") == expected_hash):
             for chunk in manifest.get("chunks", {}).values():
                 if chunk.get("status") == "OK":
                     state["chunks_ok"] += 1
+                    state[kinds.get(chunk.get("chunk_kind"), "unclassified_chunks")] += 1
                     state["cells"] += int(chunk.get("cells") or 0)
                     state["bytes"] += int(chunk.get("response_bytes") or 0)
                 elif chunk.get("status") == "FAILED":
                     state["chunks_failed"] += 1
-        for name in ("chunks_ok", "chunks_failed", "cells", "bytes",
-                     "requests_total", "requests_finished", "request_time_total_ms"):
+        for name in (*chunk_fields, "requests_total", "requests_finished",
+                     "request_time_total_ms", "slow_requests"):
             totals[name] += state.get(name) or 0
+        state["current_request_ms"] = None
+        if (state.get("status") not in WORKER_TERMINAL
+                and state.get("current_phase") == "REQUESTING"):
+            start = parse_time(state.get("request_started_at"))
+            if start:
+                state["current_request_ms"] = max(0.0, (now - start).total_seconds() * 1000)
+        started = parse_time(state.get("started_at"))
+        if started:
+            starts.append(started)
+        samples = state.get("recent_requests") or []
+        worker_recent = []
+        for sample in samples:
+            ended = parse_time(sample.get("completed_at"))
+            if ended and 0 <= (now - ended).total_seconds() <= 60:
+                worker_recent.append(sample)
+        if len(samples) >= 100 and len(worker_recent) == len(samples):
+            history_limited = True
+        recent.extend(worker_recent)
         workers.append(state)
+    maximum = max((w["chunks_ok"] for w in workers), default=0)
+    totals["max_worker_chunks_ok"] = maximum
+    for w in workers:
+        w["relative_progress"] = w["chunks_ok"] / maximum if maximum else 0.0
     for status in ("RUNNING", "RETRYING", "PAUSED", "STARTING", "STALE", "COMPLETED", "STOPPED"):
         totals["workers_" + status.lower()] = sum(w.get("status") == status for w in workers)
     totals["workers_failed"] = sum(w.get("status") in {"PARTIAL", "FAILED", "SESSION_EXPIRED"} for w in workers)
     totals["workers_terminal"] = sum(w.get("status") in WORKER_TERMINAL for w in workers)
     totals["average_request_ms"] = (totals["request_time_total_ms"] / totals["requests_finished"]
                                     if totals["requests_finished"] else None)
+    durations = sorted(float(v["duration_ms"]) for v in recent if v.get("duration_ms") is not None)
+    totals["recent_sample_count"] = len(durations)
+    totals["recent_average_ms"] = sum(durations) / len(durations) if durations else None
+    totals["recent_p95_ms"] = durations[math.ceil(.95 * len(durations)) - 1] if durations else None
+    totals["recent_slow_requests"] = sum(v >= 5000 for v in durations)
+    totals["slow_inflight_workers"] = sum((w.get("current_request_ms") or 0) >= 5000 for w in workers)
+    totals["recent_history_limited"] = history_limited
+    # Freeze the attempt clock once every worker has reached a terminal state.
+    ended = now
+    if workers and totals["workers_terminal"] == len(workers):
+        ends = [parse_time(w.get("updated_at")) for w in workers]
+        ended = max((v for v in ends if v), default=now)
+    elapsed = max(0.0, (ended - min(starts)).total_seconds()) if starts else 0.0
+    observed = min(60.0, max(0.0, (now - min(starts)).total_seconds())) if starts else 0.0
+    totals["overall_request_rate"] = totals["requests_total"] / elapsed if elapsed else None
+    totals["recent_request_rate"] = len(durations) / observed if observed and (durations or totals["requests_finished"]) else None
+    for name in ("header_wait_ms", "first_body_ms", "receive_ms", "file_write_ms",
+                 "finalize_ms", "token_refresh_ms", "parse_ms"):
+        values = [float(v[name]) for v in recent if v.get(name) is not None]
+        totals["recent_" + name] = sum(values) / len(values) if values else None
     return workers, totals
 
 def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
@@ -4597,6 +4717,8 @@ def _update_history(root: Path, record: dict) -> None:
 
 def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: dict,
                          cooldown: dict):
+    from rich.bar import Bar
+
     entries = manifest.get("queries", [])
     current = manifest.get("current_query")
     entry = next((e for e in entries if e.get("query_id") == current), {})
@@ -4604,112 +4726,256 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
         entry = next((e for e in reversed(entries) if e.get("started_at")), {})
     status = manifest.get("status", "STARTING")
     colors = dict(COMPLETED="green", RUNNING="bright_cyan", RETRYING="yellow",
-                  PAUSED="yellow", STALE="yellow", FAILED="red", PARTIAL="yellow",
-                  SESSION_EXPIRED="red", STOPPED="yellow", STOPPING="yellow",
-                  STARTING="cyan", EXPORTING="cyan", PENDING="dim")
+                  PAUSED="dark_orange", STALE="yellow", FAILED="red", PARTIAL="yellow",
+                  SESSION_EXPIRED="red", STOPPED="grey62", STOPPING="yellow",
+                  STARTING="grey62", EXPORTING="cyan", PENDING="dim")
+    terminal_width, terminal_height = console.size.width, console.size.height
+    wide = terminal_width >= 110
+
     def styled(value):
         return Text(str(value), style=colors.get(str(value), "white"))
-    def panel(value, title, style="cyan"):
-        return Panel(value, title=title, border_style=style, padding=(0, 1))
+
+    def panel(value, title, style="cyan", height=None):
+        return Panel(value, title=title, border_style=style, padding=(0, 1), height=height)
+
     def short(value, length=65):
-        return str(value or "—")[:length]
+        value = "—" if value is None or value == "" else str(value)
+        return value if len(value) <= length else value[:max(0, length - 1)] + "…"
+
     def elapsed(start, end=None):
         a, b = parse_time(start), parse_time(end)
         return max(0, int(((b or datetime.now(timezone.utc)) - a).total_seconds())) if a else 0
+
+    def ms(value):
+        return f"{value:,.0f} ms" if value is not None else "—"
+
+    def rate(value):
+        return f"{value:.2f}/s" if value is not None else "—"
+
+    def latency(value):
+        color = ("dim" if value is None else "green" if value < 1000 else
+                 "white" if value < 5000 else "yellow" if value < 15000 else "dark_orange")
+        return Text(ms(value), style=color)
+
+    def offset(w):
+        x, y = w.get("current_x_offset"), w.get("current_y_offset")
+        if x is not None and y is not None:
+            return f"{x}/{y}"
+        match = re.search(r"_x(\d+)_y(\d+)$", str(w.get("current_request") or ""))
+        return f"{int(match[1])}/{int(match[2])}" if match else "—"
+
+    def pair(left, right):
+        grid = Table.grid(expand=True, padding=(0, 0))
+        grid.add_column(ratio=1, overflow="ellipsis", no_wrap=True)
+        grid.add_column(justify="right", overflow="ellipsis", no_wrap=True)
+        grid.add_row(left, right)
+        return grid
+
     done = sum(e.get("status") == "COMPLETED" for e in entries)
     failed = sum(e.get("status") in ("FAILED", "PARTIAL", "SESSION_EXPIRED") for e in entries)
     stopped = sum(e.get("status") == "STOPPED" for e in entries)
     waiting = sum(e.get("status") == "PENDING" for e in entries)
     n = len(entries)
     coverage = done / n if n else 0.0
-    query_elapsed = elapsed(entry.get("started_at"), entry.get("finished_at"))
     calls = int(totals.get("requests_total") or 0)
-    avg = totals.get("average_request_ms")
-    rate = f"{calls / query_elapsed:.2f}/s" if query_elapsed else "—"
-    cool = max(0, int(float(cooldown.get("until_ts") or 0) - time.time()))
+    finished = int(totals.get("requests_finished") or 0)
+    cool = max(0, math.ceil(float(cooldown.get("until_ts") or 0) - time.time()))
     bytes_mb = int(totals.get("bytes") or 0) / 1024 ** 2
     engine = ", ".join(sorted({str(w["http_engine"]) for w in workers if w.get("http_engine")})) or "—"
-    active = sum(totals.get("workers_" + k, 0) for k in ("running", "retrying", "paused"))
     running = totals.get("workers_running", 0)
     retrying = totals.get("workers_retrying", 0)
     paused = totals.get("workers_paused", 0)
+    complete = totals.get("workers_completed", 0)
+    active = running + retrying + paused
     count = int(config.get("workers") or 0)
     header = panel(Text("OIC PARALLEL COLLECTOR | LIVE EXTRACTION MONITOR", justify="center",
-                        style="bold bright_cyan"), "XMLA / MDX / EXCEL")
-    overview = Text.assemble(("Run: ", "dim"), short(manifest.get("run_id"), 45),
-        (" | ", "dim"), styled(status),
-        f" | Elapsed {format_duration(elapsed(manifest.get('started_at'), manifest.get('finished_at')))}",
-        f"\nQuery: {entry.get('query_id', '—')} | {config.get('code', '—')}/{config.get('cube_type', '—')}"
-        f" | HTTP: {engine} | Parallel {count}")
+                        style="bold bright_cyan"), "XMLA / MDX / CURL_CFFI / EXCEL")
+    overview = Text.assemble(
+        ("Run: ", "dim"), short(manifest.get("run_id"), 45), "\n",
+        ("Status: ", "dim"), styled(status),
+        f" | Elapsed {format_duration(elapsed(manifest.get('started_at'), manifest.get('finished_at')))}\n",
+        f"Query: {entry.get('query_id', '—')} | {config.get('code', '—')}/{config.get('cube_type', '—')}\n",
+        f"Engine: {engine} | Active {active}/{count}")
     def captions(axis):
         values = config.get(axis, [])
-        # Config contains stable MDX; don't guess human-readable captions.
-        width = console.size.width // 2 if console.size.width >= 110 else console.size.width
-        return short(", ".join(str(v) for v in values), max(22, width - 20))
+        width = terminal_width // 2 if wide else terminal_width
+        return short(", ".join(str(v) for v in values), max(12, width - 18))
     configuration = Text(f"X / ROWS: {captions('x')}\nY / COLUMNS: {captions('y')}\n"
-        f"Values: {len(config.get('measures', []))} | X/Y chunk: "
-        f"{config.get('x_chunk', '—')}/{config.get('y_chunk', '—')}")
-    width = 18
-    bar = "█" * int(coverage * width) + "░" * (width - int(coverage * width))
-    progress = Text.assemble((f"{bar} {done}/{n} COMPLETED ({coverage * 100:.1f}%)", "green"),
-        f" | Pending {waiting} | Failed/partial {failed} | Stopped {stopped}")
-    metrics = Text(
-        f"Chunks OK {totals.get('chunks_ok', 0):,} | Failed {totals.get('chunks_failed', 0):,}"
-        f" | Cells {totals.get('cells', 0):,} | {bytes_mb:.2f} MiB\n"
-        f"Active {active}/{count} (run {running}, retry {retrying}, pause {paused}) | Execute calls {calls:,} | Avg "
-        + (f"{avg:.0f} ms" if avg is not None else "—")
-        + f" | Rate {rate} | Cooldown {str(cool) + 's' if cool else 'NONE'}\n"
-        f"Excel: {entry.get('export_status', 'PENDING')} | Rows {entry.get('rows', '—')} "
-        "| Dynamic chunks: total unknown")
-    worker_table = Table(box=rich_box.SIMPLE, expand=True, padding=(0, 1), title="05 / PARALLEL WORKERS")
-    for name in ("ID", "Status", "Current X/Y", "OK", "Fail", "HTTP", "ms", "HB", "Last event"):
-        worker_table.add_column(name, no_wrap=True, overflow="ellipsis")
-    for w in workers:
-        current_key = str(w.get("current_request") or "")
-        match = re.search(r"_x(\d+)_y(\d+)$", current_key)
-        xy = f"{int(match[1])}/{int(match[2])}" if match else "—"
-        latency = w.get("last_request_ms")
+                         f"Measures: {len(config.get('measures', []))} | Workers: {count}\n"
+                         f"Chunk X/Y: {config.get('x_chunk', '—')}/{config.get('y_chunk', '—')}"
+                         f" | Delay: {config.get('delay', '—')}s")
+    progress = Group(
+        pair(Text(f"{done}/{n} QUERIES COMPLETED", style="green"),
+             Text(f"{coverage * 100:.1f}%")),
+        Bar(1.0, 0.0, coverage, color="green", bgcolor="grey23"),
+        Text(f"Pending {waiting} | Failed/partial {failed} | Stopped {stopped}"),
+        Text(f"Current: {entry.get('query_id', '—')} / {entry.get('status', '—')}"),
+        Text("Dynamic pagination: total chunks unknown", style="dim"))
+    sample_count = totals.get("recent_sample_count", 0)
+    limited = " (limited)" if totals.get("recent_history_limited") else ""
+    alerts = []
+    if totals.get("slow_inflight_workers"):
+        alerts.append(f"SLOW IN-FLIGHT {totals['slow_inflight_workers']}")
+    if (totals.get("recent_average_ms") or 0) >= 5000:
+        alerts.append("HIGH LATENCY")
+    if (totals.get("recent_p95_ms") or 0) >= 5000:
+        alerts.append("HIGH P95")
+    if totals.get("workers_stale"):
+        alerts.append(f"STALE {totals['workers_stale']}")
+    if totals.get("workers_failed"):
+        alerts.append(f"WORKER ERROR {totals['workers_failed']}")
+    if cool:
+        alerts.append(f"COOLDOWN {cool}s")
+    metric_lines = [
+        Text(f"Chunks OK {totals.get('chunks_ok', 0):,} | Failed {totals.get('chunks_failed', 0):,}"
+             f" | Cells {totals.get('cells', 0):,}"),
+        Text(f"Data {totals.get('data_chunks', 0):,} | Empty {totals.get('empty_pages', 0):,}"
+             f" | No cells {totals.get('no_cell_chunks', 0):,} | Unknown {totals.get('unclassified_chunks', 0):,}"),
+        Text(f"Saved XML {bytes_mb:.2f} MiB | Calls {finished:,}/{calls:,} finished | Rate {rate(totals.get('overall_request_rate'))}"),
+        Text.assemble("Avg ", latency(totals.get("average_request_ms")),
+                      " | Recent ", latency(totals.get("recent_average_ms")),
+                      " | P95 ", latency(totals.get("recent_p95_ms"))),
+        Text(f"Recent 60s: n={sample_count}{limited} | Rate {rate(totals.get('recent_request_rate'))}"
+             f" | Slow {totals.get('slow_requests', 0)}"),
+        Text(f"Header {ms(totals.get('recent_header_wait_ms'))} | First body {ms(totals.get('recent_first_body_ms'))}"),
+        Text(f"Receive {ms(totals.get('recent_receive_ms'))} | Write {ms(totals.get('recent_file_write_ms'))}"
+             f" | Parse {ms(totals.get('recent_parse_ms'))}"),
+        Text(f"Token {ms(totals.get('recent_token_refresh_ms'))} | Finalize {ms(totals.get('recent_finalize_ms'))}"
+             f" | Cooldown {str(cool) + 's' if cool else 'NONE'}"),
+        Text(f"Excel: {entry.get('export_status', 'PENDING')} | Rows {entry.get('rows', '—')}"),
+        Text(" | ".join(alerts) if alerts else "No performance alerts",
+             style="yellow" if alerts else "dim")]
+    # On very wide consoles use two metric columns to leave room for worker bars.
+    if terminal_width >= 180:
+        metric_grid = Table.grid(expand=True, padding=(0, 1))
+        metric_grid.add_column(ratio=1)
+        metric_grid.add_column(ratio=1)
+        for pos in range(0, len(metric_lines), 2):
+            metric_grid.add_row(metric_lines[pos], metric_lines[pos + 1] if pos + 1 < len(metric_lines) else Text(""))
+        metrics = metric_grid
+    else:
+        metrics = Group(*metric_lines)
+    # Measure actual rendered heights so adjacent panels have equal borders.
+    def paired_panels(left, right, left_title, right_title):
+        available = max(12, terminal_width // 2)
+        height = max(len(console.render_lines(panel(value, title),
+                    console.options.update(width=available), pad=False))
+                     for value, title in ((left, left_title), (right, right_title)))
+        grid = Table.grid(expand=True, padding=(0, 0))
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+        grid.add_row(panel(left, left_title, height=height), panel(right, right_title, height=height))
+        return grid
+
+    if wide:
+        sections = [paired_panels(overview, configuration, "01 / RUN OVERVIEW", "02 / QUERY CONFIGURATION"),
+                    paired_panels(progress, metrics, "03 / BATCH PROGRESS", "04 / EXTRACTION METRICS")]
+    else:
+        sections = [panel(overview, "01 / RUN OVERVIEW"), panel(configuration, "02 / QUERY CONFIGURATION"),
+                    panel(progress, "03 / BATCH PROGRESS"), panel(metrics, "04 / EXTRACTION METRICS")]
+
+    # Budget vertical space using Rich's actual line count, not a fixed worker count.
+    top_lines = sum(len(console.render_lines(value, pad=False)) for value in [header, *sections])
+    available_rows = max(1, terminal_height - top_lines - 11)
+    normal = terminal_width >= 72 and available_rows >= 3 * len(workers) + 4
+    extra_detail = normal and available_rows >= 5 * len(workers) + 4
+    limit = len(workers) if normal else max(1, available_rows - 4)
+    shown = workers[:limit]
+    worker_rows = []
+    for w in shown:
+        wid = f"W{int(w.get('worker_id') or 0):02d}"
+        state = w.get("status", "STARTING")
+        color = colors.get(state, "white")
+        ratio = min(1.0, max(0.0, float(w.get("relative_progress") or 0)))
+        last_ms = w.get("last_request_ms")
+        inflight = w.get("current_request_ms")
         hb = w.get("heartbeat_age")
-        worker_table.add_row(f"W{int(w.get('worker_id') or 0):02d}", styled(w.get("status", "STARTING")),
-            xy, str(w.get("chunks_ok", 0)), str(w.get("chunks_failed", 0)),
-            str(w.get("last_http") or "—"), f"{latency:.0f}" if latency is not None else "—",
-            f"{hb}s" if hb is not None else "—", short(w.get("last_message"), 45))
+        heartbeat_text = f"{hb}s" if hb is not None else "—"
+        http = str(w.get("last_http") or "—")
+        phase = w.get("current_phase") or "—"
+        result = f"{w.get('chunks_ok', 0):,} chunks | {w.get('chunks_failed', 0):,} failed"
+        bar = Bar(1.0, 0.0, ratio, color=color, bgcolor="grey23")
+        if normal:
+            left = Text.assemble((wid, "bold"), "  ", styled(state))
+            right = Text.assemble(("LAST ", "dim"), latency(last_ms))
+            detail = Text(f"Offset {offset(w)}")
+            if not extra_detail:
+                left.append(f" | {phase}", style="dim")
+                right.append(" | NOW ")
+                right.append_text(latency(inflight))
+                detail.append(f" | HTTP {http} | HB {heartbeat_text}", style="dim")
+            worker_rows.extend([pair(left, right), bar, pair(detail, Text(result))])
+            if extra_detail:
+                worker_rows.extend([
+                    pair(Text(f"HTTP {http} | {phase}"),
+                         Text.assemble("Current ", latency(inflight), f" | HB {heartbeat_text}")),
+                    Text(""),
+                ])
+        else:
+            grid = Table.grid(expand=True, padding=(0, 1))
+            grid.add_column(no_wrap=True, overflow="ellipsis")
+            grid.add_column(ratio=1, min_width=1)
+            grid.add_column(justify="right", no_wrap=True, overflow="ellipsis")
+            left = Text.assemble((wid, "bold"), " ", styled(state))
+            right = Text(f"{w.get('chunks_ok', 0)} OK / {w.get('chunks_failed', 0)} F")
+            if terminal_width >= 90:
+                right.append(f" | {offset(w)} | HTTP {http} | ")
+                right.append_text(latency(last_ms))
+                right.append(" / ")
+                right.append_text(latency(inflight))
+                right.append(f" | HB {heartbeat_text}")
+            elif terminal_width >= 58:
+                right.append(f" | {offset(w)} | ")
+                right.append_text(latency(inflight if inflight is not None else last_ms))
+            grid.add_row(left, bar, right)
+            worker_rows.append(grid)
+    if not workers:
+        worker_rows.append(Text("Waiting for workers", style="dim"))
+    if len(shown) < len(workers):
+        worker_rows.append(Text(f"{len(workers) - len(shown)} workers not shown; see worker tabs", style="yellow"))
+    worker_rows.append(Text(f"Running {running} | Retrying {retrying} | Paused {paused} | Completed {complete}"))
+    worker_rows.append(Text("Relative successful chunks vs leading worker — not completion %", style="dim"))
+    worker_panel = panel(Group(*worker_rows), "05 / PARALLEL WORKERS")
+    worker_lines = len(console.render_lines(worker_panel, pad=False))
+    remaining = max(1, terminal_height - top_lines - worker_lines - 8)
+
     queue = Table(box=rich_box.SIMPLE, expand=True, padding=(0, 1), title="06 / QUERY QUEUE")
-    for name in ("Query", "Class/Cube", "Status", "Workers", "Chunks", "Rows"):
+    for name in ("Query", "Class/Cube", "Status", "Workers", "Chunks", "Excel", "Rows"):
         queue.add_column(name, overflow="ellipsis", no_wrap=True)
-    # Keep current query visible on shorter terminals.
-    wide = console.size.width >= 110
-    row_limit = max(1, min(len(entries), console.size.height - (19 if wide else 28) - len(workers)))
+    row_limit = max(1, min(len(entries), remaining // 2))
     index = next((i for i, e in enumerate(entries) if e.get("query_id") == current), len(entries) - 1)
     first = max(0, min(index - row_limit // 2, len(entries) - row_limit))
     for e in entries[first:first + row_limit]:
-        running = e.get("query_id") == current
+        is_current = e.get("query_id") == current
+        worker_label = (f"{active}/{count} active" if is_current and active else
+                        f"{complete}/{count} done" if is_current else str(e.get("workers", "—")))
         queue.add_row(str(e.get("query_id", "—")), f"{e.get('code', '—')}/{e.get('cube_type', '—')}",
-                      styled(e.get("status", "PENDING")),
-                      f"{totals.get('workers_terminal', 0)}/{count} ended" if running else str(e.get("workers", "—")),
-                      str(totals.get("chunks_ok", 0) if running else e.get("chunks_ok", "—")),
-                      str(e.get("rows", "—")))
+                      styled(e.get("status", "PENDING")), worker_label,
+                      str(totals.get("chunks_ok", 0) if is_current else e.get("chunks_ok", "—")),
+                      str(e.get("export_status", "PENDING")), str(e.get("rows", "—")))
     if len(entries) > row_limit:
         queue.caption = f"Showing {first + 1}–{first + row_limit} of {len(entries)} queries"
-    recent = sorted(workers, key=lambda w: str(w.get("updated_at", "")), reverse=True)[:(3 if console.size.height >= 36 else 1)]
-    events = Text("\n".join(f"{str(w.get('updated_at', ''))[11:19]} W{int(w.get('worker_id') or 0):02d} "
-                             f"{short(w.get('last_message'), 110)}" for w in recent) or "Waiting for workers")
+    queue_lines = len(console.render_lines(queue, pad=False))
+    event_limit = max(1, terminal_height - top_lines - worker_lines - queue_lines - 5)
+    recent = sorted(workers, key=lambda w: str(w.get("last_event_at") or w.get("updated_at") or ""),
+                    reverse=True)
+    events = Text()
+    for w in recent[:event_limit]:
+        stamp = parse_time(w.get("last_event_at") or w.get("updated_at"))
+        local = stamp.astimezone().strftime("%H:%M:%S") if stamp else "—"
+        message = str(w.get("last_message") or "Waiting")
+        message = re.sub(r"[0-9a-fA-F]+_x(\d+)_y(\d+)", lambda m: f"X={int(m[1])} Y={int(m[2])}", message)
+        if events:
+            events.append("\n")
+        events.append(f"{local} W{int(w.get('worker_id') or 0):02d} {short(message, max(10, terminal_width - 22))}")
+    if not events:
+        events.append("Waiting for workers")
+    if len(recent) > event_limit:
+        events.append(f"\n{len(recent) - event_limit} more worker events", style="dim")
     if manifest.get("error") or entry.get("error"):
-        events.append("\n" + short(manifest.get("error") or entry.get("error"), 160), style="red")
-    info = (panel(overview, "01 / RUN OVERVIEW"), panel(configuration, "02 / QUERY CONFIGURATION"))
-    stats = (panel(progress, "03 / BATCH PROGRESS"), panel(metrics, "04 / EXTRACTION METRICS"))
-    if wide:
-        top = Table.grid(expand=True)
-        top.add_column(ratio=1)
-        top.add_column(ratio=1)
-        top.add_row(*info)
-        top.add_row(*stats)
-        sections = [top]
-    else:
-        sections = [*info, *stats]
-    return Group(header, *sections, worker_table, queue, panel(events, "07 / LATEST ACTIVITY"),
-                 Text("Refresh 1s | STOP / FORCE STOP: Main | Ctrl+C: close monitor", style="dim"))
-
+        events.append("\n" + short(manifest.get("error") or entry.get("error"), max(10, terminal_width - 8)), style="red")
+    return Group(header, *sections, worker_panel, queue, panel(events, "07 / LATEST ACTIVITY"),
+                 Text("Local time | Refresh 1s | STOP / FORCE STOP: Main | Ctrl+C: close monitor", style="dim"))
 
 def batch_monitor(batch_dir: Path) -> int:
     with Live(console=console, refresh_per_second=1, screen=True,

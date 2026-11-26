@@ -291,13 +291,21 @@ def _cube_index() -> dict:
 
 
 def _year_from_fields(fields: list[dict], kind: str) -> str | None:
-    names = {"FY": ("YEAR", "FY YEAR"), "UY": ("UY YEAR",), "AY": ("AY YEAR",)}[kind]
+    names = (f"{kind} YEAR", "YEAR")
+    matches = set()
     for f in fields:
         mdx = f.get("mdx")
         if (f.get("type") == "DIMENSION" and f.get("status") in ("MAPPED", "VERIFIED")
                 and isinstance(mdx, str) and IDENTIFIER.fullmatch(mdx)
-                and mdx.upper().rsplit(".[", 1)[-1].rstrip("]") in names):
-            return mdx
+                and mdx.upper().rsplit(".[", 1)[-1].rstrip("]") in names
+                and mdx.upper().split("].[", 1)[0].endswith(f"AGGREGATE {kind}")):
+            matches.add(mdx)
+    for name in names:
+        candidates = {mdx for mdx in matches if mdx.upper().endswith(f".[{name}]")}
+        if len(candidates) == 1:
+            return candidates.pop()
+        if len(candidates) > 1:
+            return None
     return None
 
 
@@ -314,7 +322,7 @@ def cube_status(code: str, cube_type: str) -> dict:
         return {"status": "AVAILABLE", "cube": report["cube"],
                 "year": _year_from_fields(report["fields"], cube_type),
                 "source": "VERIFICATION_REPORT", "checked_at": _catalog_time(report)}
-    if isinstance(found, dict):
+    if isinstance(found, dict) and found.get("status") != "UNKNOWN":
         return found
     bundled = load_bundled_catalog(code, cube_type)
     if bundled:
@@ -348,6 +356,8 @@ def save_cube_status(code: str, cube_type: str, status: str,
         return
     if status not in ("AVAILABLE", "NOT_AVAILABLE", "UNKNOWN"):
         raise ValueError("Invalid cube status")
+    if status == "UNKNOWN" and cube_status(code, cube_type)["status"] == "AVAILABLE":
+        return
     data = _read_catalog_json(CUBE_INDEX) or {}
     data.setdefault(code, {})[cube_type] = {
         "status": status,
@@ -572,6 +582,10 @@ def _normalize_report_field(code: str, kind: str, field: dict) -> dict:
         if status in ("VERIFIED", "MAPPED"):
             status = "UNVERIFIED"
     reason = str(field.get("mapping_reason") or "")
+    if status == "VERIFIED" and (field.get("verification_method") != "XMLA_EXECUTE"
+                                 or not field.get("verified_at")):
+        status = "UNVERIFIED"
+        reason = "Missing XMLA Execute verification evidence"
     # Preserve the report status separately from execution eligibility.
     # A base-measure Execute is not proof of a calculated UI value.
     calculated = typ == "MEASURE" and (
@@ -625,6 +639,19 @@ def _merge_catalog_fields(base: dict, incoming: dict, *, report: bool = False) -
                             item[name] = previous[name]
             if not report and previous.get("reported_status") and item.get("mdx") == previous.get("mdx"):
                 item["reported_status"] = previous["reported_status"]
+            if report and item.get("mdx") and previous.get("mdx") and (
+                    item["mdx"] != previous["mdx"]
+                    and _catalog_time(base) > _catalog_time(incoming)):
+                # Do not replace a more recent mapping with an old verification.
+                item.update(mdx=previous["mdx"], status="MAPPED", mapping_status="MAPPED",
+                            verified_at=None, verification_method="",
+                            mapping_reason="Mapping changed after saved verification")
+            if (not report and previous.get("reported_status") == "VERIFIED"
+                    and previous.get("status") == "UNSUPPORTED"
+                    and item.get("status") in ("VERIFIED", "MAPPED")):
+                item.update(mdx=None, status="UNSUPPORTED", mapping_status="UNSUPPORTED",
+                            reported_status="VERIFIED",
+                            mapping_reason=previous.get("mapping_reason", "Calculation semantics not confirmed"))
         result[key] = item
     if not report:
         for key, f in old.items():
@@ -2023,7 +2050,7 @@ def discover_fields(
     catalog = _merge_catalog_fields(existing, catalog)
     # Retain a confirmed mapping only when its identifier still exists in live XMLA.
     previous = {_field_identity(code, cube_type, f): f for f in existing["fields"]}
-    identifiers = {f.get("mdx") for f in xmla_fields}
+    identifiers = {f.get("mdx") for f in xmla_fields if f.get("mdx")}
     for field in catalog["fields"]:
         old = previous.get(_field_identity(code, cube_type, field))
         if (old and old.get("status") == "VERIFIED" and old.get("mdx") in identifiers
@@ -2033,17 +2060,14 @@ def discover_fields(
                 if key in old:
                     field[key] = old[key]
 
-    year = next(
-        (
-            field["mdx"]
-            for field in catalog["fields"]
-            if field.get("mdx")
-            and field["mdx"].upper().endswith(
-                f".[{cube_type} YEAR]"
-            )
-        ),
-        None,
-    )
+    # XMLA-only fields from older snapshots must still exist in the refreshed cube.
+    catalog["fields"] = [
+        field for field in catalog["fields"]
+        if field.get("source") != "XMLA_DISCOVER" or field.get("mdx") in identifiers
+    ]
+    catalog["view_count"] = sum(f["type"] == "DIMENSION" for f in catalog["fields"])
+    catalog["data_count"] = sum(f["type"] == "MEASURE" for f in catalog["fields"])
+    year = _year_from_fields(catalog["fields"], cube_type)
 
     if cube_type != "FY":
         save_cube_status(

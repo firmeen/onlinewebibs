@@ -5100,8 +5100,10 @@ def launch_terminal_ui(args, return_app: bool = False):
         .designer_axis_actions Button {
             width: 7;
             min-width: 7;
-            height: 2;
-            min-height: 2;
+            height: 3;
+            min-height: 3;
+            padding: 0;
+            content-align: center middle;
         }
 
         #designer_add_controls {
@@ -5519,46 +5521,146 @@ def launch_terminal_ui(args, return_app: bool = False):
             )
 
             tree = self.query_one("#catalog_tree", Tree)
-
             tree.root.remove_children()
 
             groups = {}
             folders = {}
+            xmla_groups = {}
+            xmla_folders = {}
+
             visible = 0
 
-            for field in self.catalog["fields"]:
+            fields = self.catalog["fields"]
+
+            # Existing selectable OIC identifiers.
+            # Compare MDX identifiers, not display captions.
+            existing_mdx = {
+                (
+                    field["type"],
+                    str(field["mdx"]).strip().casefold(),
+                )
+                for field in fields
+                if field.get("source") == "GETSTRUCTURE"
+                and field.get("status") in ("MAPPED", "VERIFIED")
+                and field.get("mdx")
+            }
+
+            # Preserve the original OIC field order.
+            # Display additional XMLA fields after existing fields.
+            ordered_fields = sorted(
+                fields,
+                key=lambda field: (
+                    field.get("source") == "XMLA_DISCOVER"
+                ),
+            )
+
+            displayed_xmla = set()
+
+            for field in ordered_fields:
                 caption = field.get(
                     "caption",
                     field.get("display", ""),
                 )
 
-                terms = " ".join(
-                    str(field.get(key) or "")
-                    for key in (
-                        "caption",
-                        "group_dimension",
-                        "dimension",
-                        "mdx",
+                field_type = field.get("type")
+                source = field.get("source")
+                status = field.get("status")
+                mdx = str(field.get("mdx") or "").strip()
+
+                details = field.get("details") or {}
+
+                is_xmla = source == "XMLA_DISCOVER"
+
+                # Hide duplicate XMLA identifiers when the same
+                # selectable identifier already exists in GetStructure.
+                if is_xmla and mdx:
+                    identifier = (
+                        field_type,
+                        mdx.casefold(),
                     )
+
+                    if identifier in existing_mdx:
+                        continue
+
+                    if identifier in displayed_xmla:
+                        continue
+
+                # Preserve original OIC groups and folders.
+                group = field.get("group_dimension") or (
+                    "ข้อมูล"
+                    if field_type == "MEASURE"
+                    else "มุมมอง"
                 )
 
-                terms += " " + " ".join(
-                    str(field.get("details", {}).get(key) or "")
-                    for key in (
-                        "DATAFIELD",
-                        "DATATABLE",
+                folder = field.get("dimension") or ""
+
+                xmla_folder = ""
+
+                if is_xmla:
+                    # Apply dynamically to all insurance categories
+                    # and all FY / UY / AY cubes.
+                    group = (
+                        "ข้อมูล"
+                        if field_type == "MEASURE"
+                        else "มุมมอง"
+                    )
+
+                    if field_type == "DIMENSION":
+                        # Extract the actual Dimension name.
+                        #
+                        # Example:
+                        # [DIM CT COUNTRY INS].[COUNTRY NAME EN]
+                        #
+                        # Folder:
+                        # DIM CT COUNTRY INS
+
+                        match = re.match(
+                            r"^\[((?:[^\]]|\]\])+)\]\.",
+                            mdx,
+                        )
+
+                        if match:
+                            xmla_folder = (
+                                match.group(1)
+                                .replace("]]", "]")
+                                .strip()
+                            )
+                        else:
+                            xmla_folder = (
+                                folder
+                                or details.get("DIMENSION_UNIQUE_NAME")
+                                or "OTHER DIMENSIONS"
+                            )
+
+                    elif field_type == "MEASURE":
+                        # Use the existing Measure Display Folder
+                        # when available.
+                        xmla_folder = (
+                            details.get("MEASURE_DISPLAY_FOLDER")
+                            or folder
+                            or ""
+                        )
+
+                # Search original captions, metadata, identifiers,
+                # and additional XMLA folders.
+                terms = " ".join(
+                    str(value or "")
+                    for value in (
+                        caption,
+                        group,
+                        folder,
+                        xmla_folder,
+                        mdx,
+                        source,
+                        details.get("DATAFIELD"),
+                        details.get("DATATABLE"),
                     )
                 )
 
                 if search and search not in terms.casefold():
                     continue
 
-                group = field.get("group_dimension") or (
-                    "ข้อมูล"
-                    if field["type"] == "MEASURE"
-                    else "มุมมอง"
-                )
-
+                # Create the main OIC group.
                 if group not in groups:
                     groups[group] = tree.root.add(
                         group,
@@ -5566,10 +5668,43 @@ def launch_terminal_ui(args, return_app: bool = False):
                     )
 
                 parent = groups[group]
-                folder = field.get("dimension") or ""
 
-                if folder:
-                    folder_key = (group, folder)
+                # ============================================
+                # ADDITIONAL XMLA FIELDS
+                # ============================================
+
+                if is_xmla:
+                    if group not in xmla_groups:
+                        xmla_groups[group] = parent.add(
+                            "XMLA ADDITIONAL FIELDS",
+                            expand=bool(search),
+                        )
+
+                    parent = xmla_groups[group]
+
+                    if xmla_folder:
+                        folder_key = (
+                            group,
+                            xmla_folder,
+                        )
+
+                        if folder_key not in xmla_folders:
+                            xmla_folders[folder_key] = parent.add(
+                                xmla_folder,
+                                expand=bool(search),
+                            )
+
+                        parent = xmla_folders[folder_key]
+
+                # ============================================
+                # ORIGINAL OIC FIELDS
+                # ============================================
+
+                elif folder:
+                    folder_key = (
+                        group,
+                        folder,
+                    )
 
                     if folder_key not in folders:
                         folders[folder_key] = parent.add(
@@ -5579,7 +5714,9 @@ def launch_terminal_ui(args, return_app: bool = False):
 
                     parent = folders[folder_key]
 
-                status = field.get("status")
+                # ============================================
+                # FIELD STATUS
+                # ============================================
 
                 if status == "UNSUPPORTED":
                     suffix = "  [UNSUPPORTED]"
@@ -5595,6 +5732,14 @@ def launch_terminal_ui(args, return_app: bool = False):
                     data=field["id"],
                 )
 
+                if is_xmla and mdx:
+                    displayed_xmla.add(
+                        (
+                            field_type,
+                            mdx.casefold(),
+                        )
+                    )
+
                 visible += 1
 
             tree.root.expand()
@@ -5604,7 +5749,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 Static,
             ).update(
                 f"{visible} visible / "
-                f"{len(self.catalog['fields'])} total"
+                f"{len(fields)} total"
                 " · A = ROWS / S = COLUMNS / D = VALUES"
             )
 

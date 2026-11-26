@@ -6,7 +6,7 @@ OIC PARALLEL COLLECTOR
 ======================
 
 XMLA / MDX / OLAP Aggregate Collector
-Rich Terminal Monitor + Windows Terminal Tabs
+Rich Terminal Monitor + PowerShell background workers
 4 Parallel Workers + Raw XML + Excel + Resume
 
 INSTALL
@@ -18,14 +18,14 @@ COMMANDS
 Prepare jobs:
     python oic_parallel_collector.py --prepare
 
-Start 4 workers in ONE NEW Windows Terminal window:
+Start a PowerShell worker supervisor:
     python oic_parallel_collector.py
 
 Or:
     python oic_parallel_collector.py --launch
 
 The original PowerShell displays a LIVE RICH MONITOR.
-A new Windows Terminal window opens with 4 worker tabs.
+Workers are background Python processes; monitor uses PowerShell.
 
 Test one job:
     python oic_parallel_collector.py --worker-id 1 --max-jobs 1 --max-years 1
@@ -91,7 +91,7 @@ output/oic_parallel/MV/
 REQUIREMENTS
 ------------
 Windows 10/11
-Windows Terminal (wt.exe)
+Windows PowerShell (no Windows Terminal required)
 Python 3.10+
 requests
 openpyxl
@@ -105,6 +105,7 @@ rich
 from __future__ import annotations
 
 import argparse
+import csv
 import base64
 import json
 import math
@@ -321,19 +322,16 @@ def write_json(
     )
 
     temporary = path.with_name(
-        path.name + ".tmp"
+        path.name + "." + uuid.uuid4().hex + ".tmp"
     )
-
-    temporary.write_text(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2,
-        ) + "\n",
-        encoding="utf-8",
-    )
-
-    temporary.replace(path)
+    try:
+        temporary.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def read_env() -> dict[str, str]:
@@ -3286,315 +3284,54 @@ def find_powershell() -> str:
 
 # oic_parallel_collector.py
 
-def find_windows_terminal() -> str | None:
-    if os.name != "nt":
-        return None
-
-    candidates = [
-        shutil.which("wt.exe"),
-        shutil.which("wt"),
-    ]
-
-    local_app_data = os.environ.get("LOCALAPPDATA")
-
-    if local_app_data:
-        candidates.append(
-            str(
-                Path(local_app_data)
-                / "Microsoft"
-                / "WindowsApps"
-                / "wt.exe"
-            )
-        )
-
-    try:
-        shell = find_powershell()
-
-        result = subprocess.run(
-            [
-                shell,
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                (
-                    "$command = Get-Command wt.exe "
-                    "-ErrorAction SilentlyContinue; "
-                    "if ($command -and "
-                    "$command.CommandType -eq 'Application') "
-                    "{ $command.Source }"
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-
-        if result.returncode == 0:
-            candidates.extend(
-                line.strip()
-                for line in result.stdout.splitlines()
-                if line.strip()
-            )
-
-    except (OSError, RuntimeError, subprocess.TimeoutExpired):
-        pass
-
-    seen = set()
-
-    for candidate in candidates:
-        if not candidate:
-            continue
-
-        path = Path(candidate)
-
-        if not path.is_absolute():
-            resolved = shutil.which(str(candidate))
-
-            if not resolved:
-                continue
-
-            path = Path(resolved)
-
-        normalized = str(path).casefold()
-
-        if normalized in seen:
-            continue
-
-        seen.add(normalized)
-
-        if path.is_file():
-            return str(path)
-
-    return None
-
-
-# oic_parallel_collector.py
-# New shared launcher function.
-
 def launch_terminal_window(
-    commands: list[list[str]],
-    *,
+    commands: list[list[str]], *,
     title: str,
     cwd: Path,
     tab_titles: list[str] | None = None,
     keep_open: bool = True,
+    maximized: bool = False,
 ) -> str:
-    """
-    Launch one terminal window.
-
-    Windows Terminal:
-        One window with one or more tabs.
-
-    PowerShell fallback:
-        One console window.
-        Multiple commands run as independent processes
-        inside that console.
-
-    Returns:
-        "WINDOWS_TERMINAL" or "POWERSHELL"
-    """
-
+    """Open PowerShell directly without a terminal multiplexer."""
     if os.name != "nt":
-        raise RuntimeError("Windows terminal launcher requires Windows")
-
-    if not commands or any(not command for command in commands):
-        raise ValueError("At least one valid command is required")
-
-    working_dir = Path(cwd).expanduser().resolve()
-
-    if not working_dir.is_dir():
-        raise FileNotFoundError(
-            f"Working directory not found: {working_dir}"
-        )
-
+        raise RuntimeError("PowerShell launcher requires Windows")
+    if not commands or any(not cmd for cmd in commands):
+        raise ValueError("No terminal command")
+    workdir = Path(cwd).resolve()
+    if not workdir.is_dir():
+        raise FileNotFoundError(str(workdir))
     shell = find_powershell()
-    wt = find_windows_terminal()
-
-    normalized_commands = [
-        [str(argument) for argument in command]
-        for command in commands
-    ]
-
-    titles = tab_titles or [
-        f"{title} | {index:02d}"
-        for index in range(1, len(commands) + 1)
-    ]
-
-    if len(titles) != len(commands):
-        raise ValueError(
-            "tab_titles count must match commands count"
-        )
-
-    def as_powershell_command(arguments: list[str]) -> str:
-        return "& " + " ".join(
-            powershell_quote(argument)
-            for argument in arguments
-        )
-
-    if wt:
-        terminal_command = [
-            wt,
-            "-w",
-            "new",
-        ]
-
-        for index, arguments in enumerate(normalized_commands):
-            if index:
-                terminal_command.append(";")
-
-            terminal_command.extend(
-                [
-                    "new-tab",
-                    "--title",
-                    titles[index],
-                    "--startingDirectory",
-                    str(working_dir),
-                    shell,
-                    "-NoLogo",
-                    "-NoProfile",
-                ]
-            )
-
-            if keep_open:
-                terminal_command.append("-NoExit")
-
-            terminal_command.extend(
-                [
-                    "-Command",
-                    as_powershell_command(arguments),
-                ]
-            )
-
-        try:
-            subprocess.Popen(
-                terminal_command,
-                cwd=str(working_dir),
-                close_fds=True,
-            )
-
-            return "WINDOWS_TERMINAL"
-
-        except OSError:
-            # Windows Terminal is unavailable or its alias is invalid.
-            # Continue with the PowerShell fallback.
-            pass
-
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-
-    if len(normalized_commands) == 1:
-        shell_command = [
-            shell,
-            "-NoLogo",
-            "-NoProfile",
-        ]
-
+    if len(commands) == 1:
+        command = "& " + " ".join(powershell_quote(str(a)) for a in commands[0])
+        args = [shell, "-NoLogo", "-NoProfile"]
         if keep_open:
-            shell_command.append("-NoExit")
-
-        shell_command.extend(
-            [
-                "-Command",
-                (
-                    "$Host.UI.RawUI.WindowTitle = "
-                    + powershell_quote(title)
-                    + "; "
-                    + as_powershell_command(normalized_commands[0])
-                ),
-            ]
-        )
-
-        subprocess.Popen(
-            shell_command,
-            cwd=str(working_dir),
-            creationflags=flags,
-            close_fds=True,
-        )
-
-        return "POWERSHELL"
-
-    # Multiple workers without Windows Terminal:
-    # one PowerShell window, multiple independent child processes.
-    #
-    # Start-Process -NoNewWindow keeps all worker processes
-    # attached to the same console instead of opening N windows.
-
-    script_lines = [
-        "$ErrorActionPreference = 'Stop'",
-        (
-            "$Host.UI.RawUI.WindowTitle = "
-            + powershell_quote(title)
-        ),
-        (
-            "$processes = New-Object "
-            "'System.Collections.Generic.List[System.Diagnostics.Process]'"
-        ),
-    ]
-
-    for index, arguments in enumerate(normalized_commands, start=1):
-        executable = arguments[0]
-
-        # Windows argument quoting, then PowerShell string quoting.
-        argument_string = subprocess.list2cmdline(arguments[1:])
-
-        script_lines.extend(
-            [
-                (
-                    "Write-Host "
-                    + powershell_quote(
-                        f"Starting process {index}/{len(commands)}"
-                    )
-                    + " -ForegroundColor Cyan"
-                ),
-                (
-                    "$process = Start-Process "
-                    "-FilePath "
-                    + powershell_quote(executable)
-                    + " -ArgumentList "
-                    + powershell_quote(argument_string)
-                    + " -WorkingDirectory "
-                    + powershell_quote(str(working_dir))
-                    + " -NoNewWindow -PassThru"
-                ),
-                "$processes.Add($process)",
-            ]
-        )
-
-    script_lines.extend(
-        [
-            "Write-Host 'All processes launched.' -ForegroundColor Green",
-            "foreach ($process in $processes) {",
-            "    $process.WaitForExit()",
-            "}",
-            "Write-Host 'All processes finished.' -ForegroundColor Cyan",
-        ]
-    )
-
-    shell_command = [
-        shell,
-        "-NoLogo",
-        "-NoProfile",
-    ]
-
-    if keep_open:
-        shell_command.append("-NoExit")
-
-    shell_command.extend(
-        [
-            "-Command",
-            "; ".join(script_lines),
-        ]
-    )
-
-    subprocess.Popen(
-        shell_command,
-        cwd=str(working_dir),
-        creationflags=flags,
-        close_fds=True,
-    )
-
+            args.append("-NoExit")
+        args += ["-Command", "$Host.UI.RawUI.WindowTitle = " +
+                 powershell_quote(title) + "; " + command]
+    else:
+        # The multi-command legacy diagnostic opens one PowerShell console,
+        # but starts its workers as hidden child processes.
+        instructions = ["$ErrorActionPreference='Stop'",
+                        "$Host.UI.RawUI.WindowTitle = " + powershell_quote(title)]
+        for cmd in commands:
+            arguments = subprocess.list2cmdline([str(v) for v in cmd[1:]])
+            instructions.append(
+                "Start-Process -WindowStyle Hidden -FilePath " +
+                powershell_quote(str(cmd[0])) +
+                " -ArgumentList " + powershell_quote(arguments) +
+                " -WorkingDirectory " + powershell_quote(str(workdir)))
+        args = [shell, "-NoLogo", "-NoProfile"]
+        if keep_open:
+            args.append("-NoExit")
+        args += ["-Command", "; ".join(instructions)]
+    startupinfo = None
+    if maximized:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 3  # SW_MAXIMIZE
+    subprocess.Popen(args, cwd=str(workdir), creationflags=flags,
+                     startupinfo=startupinfo, close_fds=True)
     return "POWERSHELL"
 
 
@@ -3983,8 +3720,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "OIC XMLA Parallel Collector "
-            "with Rich Live Monitor and "
-            "Windows Terminal worker tabs"
+            "with Rich Live Monitor and PowerShell workers"
         ),
         formatter_class=(
             argparse.RawDescriptionHelpFormatter
@@ -4005,7 +3741,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--launch",
         action="store_true",
         help=(
-            "Launch workers as tabs "
+            "Launch background workers "
             "and display Rich monitor"
         ),
     )
@@ -4133,9 +3869,38 @@ def build_parser() -> argparse.ArgumentParser:
 
 # ============================================================
 # SELECTED-QUERY WORKFLOW — reuses OICClient, XMLA HTTP, logging,
-# Rich, Windows Terminal and file helpers from the legacy engine.
+# Rich, PowerShell and file helpers from the legacy engine.
 # The old full-hierarchy CLI remains diagnostic, never the default.
 # ============================================================
+
+def build_selected_task_plan(config: dict) -> dict:
+    """Immutable, deterministic worker allocations prepared at APPLY time.
+
+    Exact chunk count depends on server member counts: discovery remains
+    dynamic, but every X page already has exactly one worker owner.
+    """
+    validate_query(config)
+    count = int(config["workers"])
+    x_size = int(config["x_chunk"])
+    return {
+        "query_hash": query_hash(config),
+        "query_id": config.get("query_id"),
+        "code": config["code"],
+        "cube": config["cube"],
+        "cube_type": config.get("cube_type", "FY"),
+        "created_at": utc_now(),
+        "task_count": None,
+        "task_count_status": "DYNAMIC",
+        "assignments": [
+            {"worker_id": wid,
+             "x_offset_start": (wid - 1) * x_size,
+             "x_offset_stride": count * x_size,
+             "y_offset_start": 0,
+             "y_offset_step": int(config["y_chunk"])}
+            for wid in range(1, count + 1)
+        ],
+    }
+
 
 def selected_paths(config_path: Path):
     config_path = config_path.resolve()
@@ -4167,6 +3932,37 @@ def selected_worker(args) -> int:
     manifest["worker_id"] = worker_id
     manifest["updated_at"] = utc_now()
     stop_file = run_dir / "stop.flag"
+    batch_stop = run_dir.parent / "stop.flag"
+    def stop_requested():
+        return stop_file.exists() or batch_stop.exists()
+    shared_cooldown = run_dir.parent / "cooldown.json"
+    def wait_for_server():
+        while not stop_requested():
+            info = read_json(shared_cooldown, {}) or {}
+            remaining = float(info.get("until_ts", 0)) - time.time()
+            if remaining <= 0:
+                return
+            state["status"] = "PAUSED"
+            state["last_message"] = "Shared server cooldown"
+            save_state()
+            time.sleep(min(1, remaining))
+        return
+    def backoff_server(http_status: int, attempt: int):
+        old = read_json(shared_cooldown, {}) or {}
+        until = max(float(old.get("until_ts", 0)),
+                    time.time() + min(120, 5 * (2 ** attempt) + worker_id))
+        write_json(shared_cooldown, {
+            "until_ts": until, "http_status": http_status,
+            "worker_id": worker_id, "updated_at": utc_now(),
+        })
+    planned = read_json(run_dir / "task_plan.json", {}) or {}
+    if planned.get("query_hash") != query_hash(config):
+        raise RuntimeError("Missing or stale apply-time task plan")
+    allocations = {int(item["worker_id"]): item
+                   for item in planned.get("assignments", [])}
+    allocation = allocations.get(worker_id)
+    if not allocation:
+        raise RuntimeError("Worker was not assigned in task plan")
     heartbeat_stop = threading.Event()
     state = dict(run_id=config["run_id"], worker_id=worker_id, pid=os.getpid(),
                  status="STARTING", current_request=None, request_started_at=None,
@@ -4197,18 +3993,18 @@ def selected_worker(args) -> int:
         state["status"] = "RUNNING"
         save_state()
         # Deterministic X paging: a given X page belongs to exactly one worker.
-        x_offset = (worker_id - 1) * x_size
-        while not stop_file.exists():
+        x_offset = int(allocation["x_offset_start"])
+        while not stop_requested():
             y_offset = 0
             if (run_dir / "pause.flag").exists():
                 state["status"] = "PAUSED"; save_state()
-                while (run_dir / "pause.flag").exists() and not stop_file.exists():
+                while (run_dir / "pause.flag").exists() and not stop_requested():
                     time.sleep(1)
                 state["status"] = "RUNNING"; save_state()
-            if stop_file.exists():
+            if stop_requested():
                 break
             x_returned = None
-            while not stop_file.exists():
+            while not stop_requested():
                 key = f"{query_hash(config)}_x{x_offset:06d}_y{y_offset:06d}"
                 req_path = chunks_dir / f"{key}.request.xml"
                 resp_path = chunks_dir / f"{key}.response.xml"
@@ -4220,6 +4016,9 @@ def selected_worker(args) -> int:
                     except (ValueError, ET.ParseError, OSError):
                         data = None
                 if data is None:
+                    wait_for_server()
+                    if stop_requested():
+                        break
                     req_path.write_bytes(query_soap(config, x_offset, y_offset))
                     state.update(status="RUNNING", current_request=key,
                                  request_started_at=utc_now(), last_message=f"Request {key}")
@@ -4235,16 +4034,23 @@ def selected_worker(args) -> int:
                                 break
                             if http["http_status"] in (401, 403):
                                 raise RuntimeError(f"AUTH HTTP {http['http_status']}")
-                            if http["http_status"] not in (429, 500, 502, 503, 504) or attempt:
+                            if http["http_status"] not in (408, 425, 429, 500, 502, 503, 504) or attempt:
                                 raise RuntimeError(f"XMLA HTTP {http['http_status']}")
-                            state["status"] = "PAUSED"; save_state()
-                            time.sleep(5 + worker_id)
+                            if http["http_status"] in (429, 503):
+                                backoff_server(http["http_status"], attempt)
+                            wait_for_server()
+                            if stop_requested():
+                                break
+                            state["status"] = "RUNNING"; save_state()
                             state["status"] = "RUNNING"; save_state()
                         except (requests.RequestException, ValueError, ET.ParseError, RuntimeError) as exc:
-                            if attempt == 1 or (http and http.get("http_status") not in (429, 500, 502, 503, 504)):
+                            if attempt == 1 or (http and http.get("http_status") not in
+                                                       (408, 425, 429, 500, 502, 503, 504)):
                                 raise
                             log(f"Transient error: {exc}", worker_id, "WARN")
-                            time.sleep(5 + worker_id)
+                            if stop_requested():
+                                break
+                            time.sleep(min(30, 2 ** (attempt + 1) + worker_id))
                     if data is None:
                         raise RuntimeError("Empty XMLA dataset after attempts")
                     record = dict(status="OK", x_offset=x_offset, y_offset=y_offset,
@@ -4279,9 +4085,9 @@ def selected_worker(args) -> int:
             if x_returned is None or x_returned < x_size:
                 completed = True
                 break
-            x_offset += x_size * worker_count
+            x_offset += int(allocation["x_offset_stride"])
             time.sleep(float(config.get("delay", 1)))
-        state["status"] = "STOPPED" if stop_file.exists() else "COMPLETED" if completed else "PARTIAL"
+        state["status"] = "STOPPED" if stop_requested() else "COMPLETED" if completed else "PARTIAL"
     except KeyboardInterrupt:
         state["status"] = "STOPPED"
     except Exception as exc:
@@ -4348,12 +4154,16 @@ def selected_summary(config: dict, run_dir: Path):
 def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
     if Workbook is None:
         raise RuntimeError("openpyxl required for Excel export")
-    excel_dir = run_dir / "excel"
+    output_root = Path(config.get("output_root", run_dir)).resolve()
+    excel_dir = output_root / "Excel"
     excel_dir.mkdir(parents=True, exist_ok=True)
-    path = excel_dir / "selected_query.xlsx"
-    tmp = excel_dir / "selected_query.tmp.xlsx"
+    query_id = str(config.get("query_id", "Q001"))
+    cube_type = str(config.get("cube_type", "FY"))
+    filename = f"{config['run_id']}_{config['code']}_{cube_type}_{query_id}.xlsx"
+    path = excel_dir / filename
+    tmp = excel_dir / (filename + ".tmp")
     workbook = Workbook(write_only=True)
-    sheet = workbook.create_sheet("Data_1")
+    sheet = workbook.create_sheet("DATA")
     x_count, y_count = len(config["x"]), len(config["y"])
     headers = ["INSURANCE_CODE", "CUBE", "CATALOG"]
     for axis, count in (("X", x_count), ("Y", y_count)):
@@ -4403,9 +4213,24 @@ def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
                 sheet_rows += 1
     workers, totals = selected_summary(config, run_dir)
     info = workbook.create_sheet("INFO")
-    for key, val in (("RUN_ID", config["run_id"]), ("QUERY_HASH", query_hash(config)),
+    for key, val in (("RUN_ID", config["run_id"]),
+                     ("QUERY_ID", config.get("query_id", "Q001")),
+                     ("INSURANCE_CODE", config["code"]),
+                     ("CUBE_TYPE", config.get("cube_type", "FY")),
+                     ("CUBE", config["cube"]),
+                     ("CATALOG", config["catalog"]),
+                     ("STARTED_AT", config.get("created_at", "")),
+                     ("EXPORTED_AT", utc_now()),
+                     ("QUERY_HASH", query_hash(config)),
+                     ("X_ROWS", " | ".join(config["x"])),
+                     ("Y_COLUMNS", " | ".join(config["y"])),
+                     ("VALUES", " | ".join(config["measures"])),
+                     ("WORKERS", config["workers"]),
+                     ("X_CHUNK", config["x_chunk"]),
+                     ("Y_CHUNK", config["y_chunk"]),
                      ("STATUS", "COMPLETED" if totals["workers_completed"] == config["workers"] else "PARTIAL"),
-                     ("OUTPUT_ROWS", row_count), ("NOTE", "OLAP aggregates; do not add All and detail totals")):
+                     ("OUTPUT_ROWS", row_count),
+                     ("NOTE", "OLAP aggregates; do not add All and detail totals")):
         info.append([key, val])
     workbook.save(tmp)
     tmp.replace(path)
@@ -4517,7 +4342,7 @@ def selected_launch(
     ]
 
     # Worker Window:
-    # Windows Terminal -> N tabs in one window.
+    # PowerShell -> N background processes supervised in one console.
     # PowerShell fallback -> N processes in one window.
 
     worker_mode = launch_terminal_window(
@@ -4555,6 +4380,212 @@ def selected_launch(
     return 0
 
 
+# ============================================================
+# BATCH SUPERVISOR — one monitor, sequential queries, parallel
+# hidden workers; all state survives application restarts.
+# ============================================================
+
+BATCH_TERMINAL = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED", "PENDING"}
+
+def _batch_snapshot(batch_dir: Path, *, status: str, current: str | None,
+                    entries: list[dict], error: str = "") -> None:
+    write_json(batch_dir / "batch_manifest.json", {
+        "run_id": batch_dir.name, "pid": os.getpid(),
+        "status": status, "current_query": current,
+        "queries": entries, "error": error,
+        "updated_at": utc_now(),
+    })
+
+def _update_history(root: Path, record: dict) -> None:
+    path = root / "history.csv"
+    columns = ("run_id", "query_id", "code", "cube_type", "cube",
+               "status", "started_at", "finished_at", "rows", "excel_path", "error")
+    rows = []
+    if path.is_file():
+        with path.open("r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+    rows = [row for row in rows
+            if (row.get("run_id"), row.get("query_id")) !=
+            (record["run_id"], record["query_id"])]
+    rows.append(record)
+    temp = path.with_suffix(".tmp")
+    with temp.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    temp.replace(path)
+
+def batch_monitor(batch_dir: Path) -> int:
+    with Live(console=console, refresh_per_second=1,
+              screen=True, transient=False) as live:
+        while True:
+            manifest = read_json(batch_dir / "batch_manifest.json", {}) or {}
+            rows = manifest.get("queries", [])
+            table = Table(title="OIC | MULTI-QUERY LIVE MONITOR",
+                          box=rich_box.ROUNDED, expand=True)
+            for name in ("Query", "Category", "Cube", "Status", "Workers", "Chunks", "Last Event"):
+                table.add_column(name)
+            for entry in rows:
+                qdir = batch_dir / entry["query_id"]
+                cfg = read_json(qdir / "query_config.json", {}) or {}
+                if cfg and entry.get("status") in ("RUNNING", "STOPPING"):
+                    workers, summary = selected_summary(cfg, qdir)
+                    workers_label = f"{summary['workers_terminal']}/{len(workers)}"
+                    chunks_label = str(summary["chunks_ok"])
+                    last = next((w.get("last_message") for w in reversed(workers)
+                                 if w.get("last_message")), "—")
+                else:
+                    workers_label = str(entry.get("workers", "—"))
+                    chunks_label = str(entry.get("chunks_ok", "—"))
+                    last = str(entry.get("error") or "—")
+                table.add_row(entry["query_id"], str(entry.get("code", "")),
+                              str(entry.get("cube_type", "FY")),
+                              str(entry.get("status", "PENDING")),
+                              workers_label, chunks_label, str(last)[:55])
+            head = (f"Run: {batch_dir.name} | Status: {manifest.get('status','STARTING')}\n"
+                    f"Current: {manifest.get('current_query') or '—'} | "
+                    f"Queries: {len(rows)} | Ctrl+C closes only this monitor")
+            live.update(Group(Panel(head, title="BATCH OVERVIEW"), table), refresh=True)
+            if manifest.get("status") in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED"):
+                break
+            time.sleep(1)
+    return 0
+
+def run_batch(batch_dir: Path) -> int:
+    batch_dir = Path(batch_dir).resolve()
+    batch = read_json(batch_dir / "batch_config.json", {}) or {}
+    entries = [dict(entry, status=entry.get("status", "PENDING"))
+               for entry in batch.get("queries", [])]
+    if not entries or batch.get("run_id") != batch_dir.name:
+        raise RuntimeError("Invalid or missing batch configuration")
+    output_root = Path(batch["output_root"]).resolve()
+    earlier = read_json(batch_dir / "batch_manifest.json", {}) or {}
+    earlier_entries = {item["query_id"]: item for item in earlier.get("queries", [])
+                       if isinstance(item, dict) and item.get("query_id")}
+    stop = batch_dir / "stop.flag"
+    force = batch_dir / "force_stop.flag"
+    for entry in entries:
+        previous = earlier_entries.get(entry["query_id"], {})
+        if previous.get("status") == "COMPLETED" and previous.get("excel_path") and Path(previous["excel_path"]).is_file():
+            entry.update(previous)
+    _batch_snapshot(batch_dir, status="STARTING", current=None, entries=entries)
+    python = str(Path(sys.executable).resolve())
+    script = str(Path(__file__).resolve())
+    try:
+        launch_terminal_window(
+            [[python, script, "--batch-monitor", str(batch_dir)]],
+            title="OIC | Live Monitor", cwd=HERE, keep_open=False)
+        for entry in entries:
+            qid = entry["query_id"]
+            qdir = batch_dir / qid
+            cfg_path = qdir / "query_config.json"
+            config, _ = selected_paths(cfg_path)
+            expected = read_json(qdir / "task_plan.json", {})
+            if expected.get("query_hash") != query_hash(config):
+                entry.update(status="FAILED", error="Apply-time plan does not match configuration")
+                _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
+                continue
+            previous = earlier_entries.get(qid, {})
+            if (previous.get("status") == "COMPLETED"
+                    and previous.get("excel_path")
+                    and Path(previous["excel_path"]).is_file()):
+                entry.update(previous)
+                continue
+            if stop.exists():
+                break
+            (qdir / "stop.flag").unlink(missing_ok=True)
+            entry.update(status="RUNNING", error="", started_at=utc_now())
+            _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
+            processes = []
+            launch_error = None
+            for worker_id in range(1, int(config["workers"]) + 1):
+                if stop.exists():
+                    break
+                wd = qdir / f"worker_{worker_id:02d}"
+                wd.mkdir(parents=True, exist_ok=True)
+                state_path = wd / "state.json"
+                write_json(state_path, dict(run_id=config["run_id"],
+                           worker_id=worker_id, status="STARTING",
+                           last_message="Launching", updated_at=utc_now()))
+                logfile = (wd / "worker.log").open("a", encoding="utf-8")
+                try:
+                    proc = subprocess.Popen(
+                        [python, script, "--query-config", str(cfg_path),
+                         "--worker-id", str(worker_id)],
+                        cwd=str(HERE), stdout=logfile, stderr=subprocess.STDOUT,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    processes.append((worker_id, proc, logfile))
+                except Exception as exc:
+                    logfile.close()
+                    launch_error = str(exc)
+                    stop_requested_for_query = True
+                    for _, active_proc, _ in processes:
+                        if active_proc.poll() is None:
+                            active_proc.terminate()
+                    break
+            if launch_error:
+                entry.update(status="FAILED", error="WORKER LAUNCH: " + launch_error[:250])
+            try:
+                stopping_since = None
+                while any(proc.poll() is None for _, proc, _ in processes):
+                    if stop.exists() and stopping_since is None:
+                        stopping_since = time.monotonic()
+                        entry["status"] = "STOPPING"
+                        _batch_snapshot(batch_dir, status="STOPPING", current=qid, entries=entries)
+                    if force.exists() or (stopping_since is not None and
+                        time.monotonic() - stopping_since >
+                        max(30, int(config.get("timeout", 60)) + 30)):
+                        for _, proc, _ in processes:
+                            if proc.poll() is None:
+                                proc.terminate()
+                    time.sleep(0.5)
+            finally:
+                for wid, proc, logfile in processes:
+                    proc.wait()
+                    logfile.close()
+                    state_path = qdir / f"worker_{wid:02d}" / "state.json"
+                    state = read_json(state_path, {}) or {}
+                    if proc.returncode and state.get("status") not in (
+                        "FAILED", "PARTIAL", "SESSION_EXPIRED", "STOPPED"):
+                        state.update(status="STOPPED" if stop.exists() else "FAILED",
+                                     last_message=f"Worker exited: {proc.returncode}",
+                                     updated_at=utc_now())
+                        write_json(state_path, state)
+            workers, totals = selected_summary(config, qdir)
+            entry["chunks_ok"] = totals["chunks_ok"]
+            entry["finished_at"] = utc_now()
+            if stop.exists():
+                entry["status"] = "STOPPED"
+            elif launch_error:
+                entry["status"] = "PARTIAL" if totals["chunks_ok"] else "FAILED"
+            elif totals["workers_completed"] == config["workers"]:
+                entry["status"] = "COMPLETED"
+            else:
+                entry["status"] = "PARTIAL" if totals["chunks_ok"] else "FAILED"
+            try:
+                output, row_count = selected_export(config, qdir)
+                entry.update(excel_path=output, rows=row_count)
+            except Exception as exc:
+                entry.update(status="PARTIAL" if totals["chunks_ok"] else "FAILED",
+                             error=f"EXCEL: {exc}")
+            _update_history(output_root, dict(
+                run_id=batch_dir.name, query_id=qid, code=config["code"],
+                cube_type=config.get("cube_type", "FY"), cube=config["cube"],
+                status=entry["status"], started_at=entry["started_at"],
+                finished_at=entry["finished_at"], rows=entry.get("rows", 0),
+                excel_path=entry.get("excel_path", ""), error=entry.get("error", "")))
+            _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
+        final_status = ("STOPPED" if stop.exists()
+                        else "COMPLETED" if all(e["status"] == "COMPLETED" for e in entries)
+                        else "PARTIAL")
+        _batch_snapshot(batch_dir, status=final_status, current=None, entries=entries)
+        return 0 if final_status == "COMPLETED" else 1
+    except Exception as exc:
+        _batch_snapshot(batch_dir, status="FAILED", current=None,
+                        entries=entries, error=str(exc)[:400])
+        raise
+
+
 def selected_main(argv) -> int:
     parser = argparse.ArgumentParser(description="Run an explicit user-selected OIC XMLA query")
     parser.add_argument("--query-config", type=Path, required=True)
@@ -4584,6 +4615,12 @@ def selected_main(argv) -> int:
 
 def main() -> int:
 
+    if "--batch-run" in sys.argv or "--batch-monitor" in sys.argv:
+        operation = sys.argv[1] if len(sys.argv) > 1 else ""
+        if len(sys.argv) != 3 or operation not in ("--batch-run", "--batch-monitor"):
+            raise ValueError("Expected --batch-run/--batch-monitor directory")
+        directory = Path(sys.argv[2]).resolve()
+        return run_batch(directory) if operation == "--batch-run" else batch_monitor(directory)
     if "--query-config" in sys.argv:
         return selected_main(sys.argv[1:])
 
@@ -4776,11 +4813,11 @@ def main() -> int:
             )
 
             log(
-                "Opening ONE new Windows Terminal window"
+                "Opening PowerShell collection window"
             )
 
             log(
-                f"Creating {plan['workers']} worker tabs"
+                f"Creating {plan['workers']} worker processes"
             )
 
             run_id = launch_worker_tabs(
@@ -4790,7 +4827,7 @@ def main() -> int:
             )
 
             log(
-                "Worker tabs launched",
+                "Worker processes launched",
                 level="OK",
             )
 

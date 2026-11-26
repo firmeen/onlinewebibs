@@ -66,7 +66,9 @@ import subprocess
 import shutil
 
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
-                       validate_query, build_mdx as selected_mdx, query_hash)
+                       validate_query, build_mdx as selected_mdx, query_hash,
+                        cube_status, cube_profile, cube_options, CUBE_TYPES,
+                        verify_field)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2079,6 +2081,221 @@ def run_headless(args) -> int:
         return 1
 
 
+
+# ============================================================
+# APPLIED QUERY STORAGE — CANONICAL + LEGACY COMPATIBILITY
+# ============================================================
+# Historical local branches stored each entry in "config" and optionally
+# "plan". This branch stores "query" and "task_plan". Both are accepted,
+# but only the canonical format is written after backing up the original.
+
+from contextlib import contextmanager
+
+APPLIED_STORAGE_VERSION = 2
+
+
+@contextmanager
+def applied_list_write_lock(path: Path):
+    """Serialize Main App and Designer read/modify/write transactions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(path.name + ".write.lock")
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        acquired = False
+        start = time.monotonic()
+        try:
+            while not acquired:
+                try:
+                    handle.seek(0)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except (OSError, BlockingIOError):
+                    if time.monotonic() - start >= 10:
+                        raise TimeoutError("Applied Query List is busy; retry APPLY")
+                    time.sleep(0.08)
+            yield
+        finally:
+            if acquired:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _applied_query_number(value) -> int | None:
+    if not isinstance(value, str) or not re.fullmatch(r"Q[0-9]{3,}", value):
+        return None
+    return int(value[1:])
+
+
+def applied_query_identity(config: dict) -> str:
+    """Order-sensitive fingerprint; ignores worker count and run history."""
+    values = {
+        key: config.get(key, [] if key in ("x", "y", "measures", "filters") else None)
+        for key in ("code", "cube", "x", "y", "measures", "filters")
+    }
+    return json.dumps(values, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def read_applied_queries(path: Path) -> tuple[dict, bool]:
+    """Read old 'config'/'plan' and current 'query'/'task_plan' schemas.
+
+    Never modify the file during reading. An invalid legacy record is
+    reported with its index rather than discarded or silently overwritten.
+    """
+    from oic_parallel_collector import build_selected_task_plan
+
+    try:
+        original = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {
+            "storage_version": APPLIED_STORAGE_VERSION,
+            "revision": uuid.uuid4().hex,
+            "next_query_sequence": 1,
+            "queries": [],
+        }, False
+
+    if isinstance(original, list):
+        raw_queries = original
+        document = {}
+    elif isinstance(original, dict):
+        document = original
+        raw_queries = document.get("queries")
+        if raw_queries is None and isinstance(document.get("query"), dict):
+            raw_queries = [document]
+        if not isinstance(raw_queries, list):
+            raise ValueError("Invalid applied_queries.json: expected a queries array")
+    else:
+        raise ValueError("Invalid applied_queries.json: expected an object or array")
+
+    reserved = set()
+    for raw_entry in raw_queries:
+        if not isinstance(raw_entry, dict):
+            continue
+        possible_query = raw_entry.get("query") or raw_entry.get("config")
+        if not isinstance(possible_query, dict):
+            possible_query = raw_entry
+        for candidate in (raw_entry.get("query_id"), possible_query.get("query_id")):
+            if _applied_query_number(candidate) is not None:
+                reserved.add(candidate)
+
+    stored_sequence = document.get(
+        "next_query_sequence", document.get("next_id", 1))
+    try:
+        sequence = max(1, int(stored_sequence))
+    except (TypeError, ValueError):
+        sequence = 1
+    sequence = max(sequence, (max(
+        (_applied_query_number(qid) for qid in reserved), default=0) or 0) + 1)
+
+    normalized = []
+    seen = set()
+    for index, raw_entry in enumerate(raw_queries, start=1):
+        if not isinstance(raw_entry, dict):
+            raise ValueError(f"Applied Query item #{index} is not an object")
+
+        query = raw_entry.get("query")
+        if not isinstance(query, dict):
+            query = raw_entry.get("config")
+        if not isinstance(query, dict) and all(
+            key in raw_entry for key in ("code", "cube", "x", "y", "measures")
+        ):
+            query = raw_entry
+        if not isinstance(query, dict):
+            raise ValueError(
+                f"Applied Query item #{index} has no query/config; "
+                "original file was not changed"
+            )
+
+        config = dict(query)
+        if "cube_type" not in config:
+            cube = str(config.get("cube") or "")
+            config["cube_type"] = next(
+                (kind for kind in ("UY", "AY") if cube.endswith("_" + kind)), "FY")
+
+        query_id = raw_entry.get("query_id") or config.get("query_id")
+        if _applied_query_number(query_id) is None or query_id in seen:
+            while f"Q{sequence:03d}" in reserved or f"Q{sequence:03d}" in seen:
+                sequence += 1
+            query_id = f"Q{sequence:03d}"
+            sequence += 1
+
+        config["query_id"] = query_id
+        try:
+            validate_query(config)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError(
+                f"Applied Query {query_id} (item #{index}) cannot be migrated: {exc}; "
+                "original file was not changed"
+            ) from exc
+
+        # Old plans have different allocation keys; always regenerate them
+        # from the actual validated query if stale or structurally different.
+        expected_plan = build_selected_task_plan(config)
+        plan = raw_entry.get("task_plan")
+        if (not isinstance(plan, dict) or
+                plan.get("query_hash") != expected_plan["query_hash"] or
+                plan.get("assignments") != expected_plan["assignments"]):
+            plan = expected_plan
+
+        normalized.append({
+            "query_id": query_id,
+            "query": config,
+            "task_plan": plan,
+            "applied_at": raw_entry.get("applied_at")
+            if isinstance(raw_entry.get("applied_at"), str)
+            else datetime.now(timezone.utc).isoformat(),
+        })
+        seen.add(query_id)
+
+    sequence = max(sequence, max(
+        (_applied_query_number(value) for value in seen), default=0) + 1)
+    revision = document.get("revision")
+    if not isinstance(revision, str) or not revision:
+        revision = uuid.uuid4().hex
+    result = {
+        "storage_version": APPLIED_STORAGE_VERSION,
+        "revision": revision,
+        "next_query_sequence": sequence,
+        "queries": normalized,
+    }
+    return result, result != original
+
+
+def save_applied_queries(path: Path, document: dict, *,
+                         backup_legacy: bool = False) -> None:
+    """Atomic replacement; first migration keeps the byte-for-byte old JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if backup_legacy and path.exists():
+        backup = path.with_name(
+            f"{path.stem}.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+            f"{uuid.uuid4().hex[:8]}{path.suffix}")
+        shutil.copy2(path, backup)
+    payload = dict(document)
+    payload["storage_version"] = APPLIED_STORAGE_VERSION
+    payload["revision"] = uuid.uuid4().hex
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    document.update(payload)
+
+
 # ============================================================
 # TERMINAL APPLICATION
 # ============================================================
@@ -2106,6 +2323,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             Static,
             Select,
             Tree,
+            OptionList,
         )
 
     except ImportError as exc:
@@ -2148,6 +2366,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         #workspace {
             height: 1fr;
             padding: 0 2 1 2;
+            overflow-y: auto;
         }
 
         #brand {
@@ -2389,10 +2608,19 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         #categories, #catalog_panel { display: none; }
         #cube_select { width: 1fr; }
-        #selected_query_summary {
-            height: 5; padding: 1 2; margin-top: 1;
-            border: solid #304352; background: #16232e;
+        #applied_panel {
+            height: 15;
+            min-height: 9;
+            margin-top: 1;
+            border: solid #304352;
+            background: #16232e;
+            padding: 0 1;
         }
+        #applied_title { height: 1; color: #c9b996; text-style: bold; }
+        #applied_query_list { height: 1fr; overflow-y: auto; }
+        #applied_actions { height: 3; }
+        #applied_actions Button { min-width: 12; margin-right: 1; }
+        #selected_query_summary { height: 2; padding: 0 1; color: #9fb0ba; }
         #catalog_status { height: 3; margin-top: 1; padding: 0 2;
                            border: solid #293c49; color: #9fb0ba; }
         #activity_panel { height: 1fr; min-height: 8; }
@@ -2425,10 +2653,17 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.active_run = None
             self.last_run_path = None
             self.applied_config = None
+            self.applied_queries = []
             self.selection_revision = None
+            self.batch_process = None
+            self.query_states = {}
+            self.force_confirm_until = 0
             self.catalog_running = False
             self.catalog_started = False
-            self.catalog_statuses = {code: "CACHE" if load_catalog(code)["source"] == "CACHE" else "PROFILE" for code in QUERY_PROFILES}
+            self.catalog_statuses = {
+                f"{code}/{kind}": cube_status(code, kind)["status"]
+                for code in QUERY_PROFILES for kind in CUBE_TYPES
+            }
 
             self.busy = False
             self.stop_event = threading.Event()
@@ -2586,10 +2821,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="start",
                     )
 
-                    yield Button(
-                        "STOP",
-                        id="stop",
-                    )
+                    yield Button("STOP", id="stop")
+                    yield Button("FORCE STOP", id="force_stop")
 
                     yield Button(
                         "OPEN OUTPUT",
@@ -2664,8 +2897,15 @@ def launch_terminal_ui(args, return_app: bool = False):
                     )
 
                 # Field editing is delegated to a separate Textual window.
-                yield Static("QUERY NOT APPLIED / Open Query Designer to select fields",
-                             id="selected_query_summary")
+                with Vertical(id="applied_panel"):
+                    yield Static("APPLIED QUERIES — 0 QUERIES", id="applied_title")
+                    yield OptionList(id="applied_query_list", compact=True, markup=False)
+                    with Horizontal(id="applied_actions"):
+                        yield Button("REMOVE", id="remove_applied")
+                        yield Button("MOVE UP", id="move_applied_up")
+                        yield Button("MOVE DOWN", id="move_applied_down")
+                    yield Static("No applied queries. Open Query Designer.",
+                                 id="selected_query_summary")
                 yield Static("FIELD CATALOG / Local caches", id="catalog_status")
 
                 # PROGRESS
@@ -2743,14 +2983,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                     key=code,
                 )
 
-            self.query_one(
-                "#stop",
-                Button,
-            ).disabled = True
+            self.query_one("#stop", Button).disabled = True
+            self.query_one("#force_stop", Button).disabled = True
             self.select_category("MV")
             self.set_interval(1.0, self.poll_selected_run)
             self.set_interval(1.0, self.poll_applied_selection)
-            self.poll_applied_selection()
             self.update_catalog_summary()
 
             # Load local configuration without making
@@ -2759,6 +2996,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.reload_from_env(
                 auto_check=False
             )
+            # Resolve the configured output location before restoring the
+            # Applied Query List or reconnecting to an active batch.
+            self.poll_applied_selection()
+            self.reconnect_active_batch()
 
             self.info(
                 "Terminal UI initialized.",
@@ -3495,6 +3736,14 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             elif button_id == "stop":
                 self.action_stop_collection()
+            elif button_id == "force_stop":
+                self.force_stop_collection()
+            elif button_id == "remove_applied":
+                self.manage_applied("remove")
+            elif button_id == "move_applied_up":
+                self.manage_applied("up")
+            elif button_id == "move_applied_down":
+                self.manage_applied("down")
 
             elif button_id == "open":
                 self.action_open_output()
@@ -3528,8 +3777,8 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_stop_collection(self) -> None:
             if self.active_run is not None:
                 (self.active_run / "stop.flag").touch()
-                self.info("Stop requested; workers finish their active request.", "warning")
-                self.query_one("#status", Static).update("STOP REQUESTED")
+                self.info("STOPPING / No new queries or tasks; workers finish active requests.", "warning")
+                self.query_one("#status", Static).update("STOPPING / Waiting for workers")
                 return
             if not self.busy:
                 return
@@ -3550,6 +3799,18 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "Finishing current operation"
             )
 
+        def force_stop_collection(self) -> None:
+            if self.active_run is None:
+                return
+            if time.monotonic() > self.force_confirm_until:
+                self.force_confirm_until = time.monotonic() + 8
+                self.info("FORCE STOP will terminate active workers. Press again within 8 seconds to confirm.", "warning")
+                return
+            (self.active_run / "stop.flag").touch()
+            (self.active_run / "force_stop.flag").touch()
+            self.force_confirm_until = 0
+            self.info("FORCE STOP requested; completed chunks remain saved.", "warning")
+
         # ====================================================
         # OPEN OUTPUT DIRECTORY
         # ====================================================
@@ -3557,7 +3818,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_open_output(self) -> None:
             output_dir = resolve_output_path(
                 self.output_value()
-            )
+            ) / "Excel"
 
             try:
                 output_dir.mkdir(
@@ -4190,13 +4451,11 @@ def launch_terminal_ui(args, return_app: bool = False):
         # ====================================================
 
         def selection_file(self) -> Path:
-            return resolve_output_path(self.output_value()) / "query_selection.json"
+            return resolve_output_path(self.output_value()) / "applied_queries.json"
 
         def select_category(self, code: str) -> None:
-            if code not in QUERY_PROFILES:
-                return
-            self.selected_code = code
-            self.update_query_summary()
+            if code in QUERY_PROFILES:
+                self.selected_code = code
 
         def on_select_changed(self, event: Select.Changed) -> None:
             if event.select.id == "cube_select" and event.value in QUERY_PROFILES:
@@ -4205,48 +4464,115 @@ def launch_terminal_ui(args, return_app: bool = False):
         def update_query_summary(self) -> None:
             if not self.is_mounted:
                 return
-            config = self.applied_config
-            if not config or config.get("code") != self.selected_code:
-                self.query_one("#selected_query_summary", Static).update(
-                    f"{self.selected_code} / NO APPLIED QUERY\n"
-                    "Open Query Designer to select Rows, Columns and Values."
-                )
-                return
+            from textual.widgets.option_list import Option
+            listing = self.query_one("#applied_query_list", OptionList)
+            previous = listing.highlighted_option
+            focused = previous.id if previous else None
+            listing.clear_options()
+            for item in self.applied_queries:
+                cfg = item["query"]
+                label = (f"{item['query_id']}  {cfg['code']}/{cfg.get('cube_type','FY')}"
+                         f"  {cfg['cube']}  X:{len(cfg['x'])} Y:{len(cfg['y'])}"
+                         f" V:{len(cfg['measures'])}  W:{cfg['workers']}  "
+                         f"{self.query_states.get(item['query_id'], 'PLANNED')}")
+                listing.add_option(Option(label, id=item["query_id"]))
+            if self.applied_queries:
+                ids = [q["query_id"] for q in self.applied_queries]
+                listing.highlighted = ids.index(focused) if focused in ids else 0
+            self.query_one("#applied_title", Static).update(
+                f"APPLIED QUERIES — {len(self.applied_queries)} QUERIES")
             self.query_one("#selected_query_summary", Static).update(
-                f"APPLIED {config['code']} / {config['cube']}\n"
-                f"X ROWS: {len(config['x'])}  |  Y COLUMNS: {len(config['y'])}  |  "
-                f"VALUES: {len(config['measures'])}\n"
-                f"WORKERS: {config['workers']}  |  "
-                f"CHUNKS: {config['x_chunk']} ROWS × {config['y_chunk']} COLUMNS"
-            )
+                "APPLY creates tasks; START executes the prepared batch. "
+                "Duplicate checks use only this list.")
 
         def query_config(self) -> dict:
-            if not self.applied_config:
-                raise ValueError("Apply a query in Query Designer before Start")
-            if self.applied_config.get("code") != self.selected_code:
-                raise ValueError("Category changed; open Query Designer and Apply this category")
-            return validate_query(dict(self.applied_config))
+            if not self.applied_queries:
+                raise ValueError("Apply at least one query in Query Designer")
+            return validate_query(dict(self.applied_queries[0]["query"]))
+
+        def _write_applied_list(self, entries: list[dict]) -> None:
+            path = self.selection_file()
+            with applied_list_write_lock(path):
+                envelope, legacy = read_applied_queries(path)
+                # This helper is only used for changes initiated from the App;
+                # refuse to overwrite if the on-disk revision moved.
+                if (self.selection_revision is not None
+                        and path.exists()
+                        and envelope["revision"] != self.selection_revision):
+                    raise ValueError("Applied List changed in Designer; refresh and retry")
+                envelope["queries"] = entries
+                save_applied_queries(path, envelope, backup_legacy=legacy)
+            self.applied_queries = entries
+            self.selection_revision = envelope["revision"]
+            self.update_query_summary()
+
+        def manage_applied(self, action: str) -> None:
+            if self.active_run is not None:
+                self.info("Cannot edit applied list during collection.", "warning")
+                return
+            listing = self.query_one("#applied_query_list", OptionList)
+            selected = listing.highlighted_option
+            if selected is None:
+                self.info("Select an Applied Query first.", "warning")
+                return
+            path = self.selection_file()
+            try:
+                with applied_list_write_lock(path):
+                    envelope, legacy = read_applied_queries(path)
+                    entries = envelope["queries"]
+                    index = next((i for i, item in enumerate(entries)
+                                  if item["query_id"] == selected.id), -1)
+                    if index < 0:
+                        raise ValueError("Applied Query changed; select it again")
+                    if action == "remove":
+                        entries.pop(index)
+                    elif action in ("up", "down"):
+                        other = index + (-1 if action == "up" else 1)
+                        if not 0 <= other < len(entries):
+                            return
+                        entries[index], entries[other] = entries[other], entries[index]
+                    else:
+                        raise ValueError("Unknown Applied Query action")
+                    save_applied_queries(path, envelope, backup_legacy=legacy)
+                self.applied_queries = envelope["queries"]
+                self.selection_revision = envelope["revision"]
+                self.applied_config = (self.applied_queries[-1]["query"]
+                                       if self.applied_queries else None)
+                self.update_query_summary()
+                self.info(f"Applied Query {selected.id}: {action}", "success")
+            except (OSError, ValueError, TimeoutError) as exc:
+                self.info(f"Cannot edit Applied List: {exc}", "warning")
 
         def poll_applied_selection(self) -> None:
+            path = self.selection_file()
+            if not path.is_file():
+                return
             try:
-                envelope = json.loads(self.selection_file().read_text(encoding="utf-8"))
+                envelope, legacy = read_applied_queries(path)
                 revision = envelope["revision"]
                 if revision == self.selection_revision:
                     return
-                config = validate_query(envelope["query"])
-                if int(config.get("schema_version", 0)) != SCHEMA_VERSION:
-                    raise ValueError("Old query configuration cannot be applied with reversed axes")
-            except FileNotFoundError:
+                entries = envelope["queries"]
+            except (ValueError, TypeError, KeyError, OSError) as exc:
+                message = str(exc)
+                if getattr(self, "_applied_last_error", None) != message:
+                    self._applied_last_error = message
+                    self.info(f"Applied List cannot be read: {message}", "warning")
                 return
-            except (KeyError, ValueError, TypeError, OSError) as exc:
-                self.info(f"Applied selection rejected: {exc}", "warning")
-                return
-            self.applied_config = config
+            self._applied_last_error = None
+            self.applied_queries = entries
+            self.applied_config = entries[-1]["query"] if entries else None
             self.selection_revision = revision
-            self.selected_code = config["code"]
-            self.query_one("#cube_select", Select).value = config["code"]
             self.update_query_summary()
-            self.info(f"Designer applied {config['code']} ({len(config['selected_fields'])} fields).", "success")
+            if legacy:
+                self.info(
+                    f"Loaded {len(entries)} legacy Applied Queries. "
+                    "Original file will be backed up and upgraded on next edit/APPLY.",
+                    "warning",
+                )
+            else:
+                self.info(f"Applied Query List updated: {len(entries)} queries.", "success")
+
 
         # oic_collector.py
         # Replace OICApp.open_query_designer() inside launch_terminal_ui().
@@ -4336,6 +4662,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     cwd=BASE_DIR,
                     tab_titles=["OIC | Query Designer"],
                     keep_open=False,
+                    maximized=True,
                 )
 
                 self.info(
@@ -4350,9 +4677,12 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
 
         def update_catalog_summary(self) -> None:
-            status = "  |  ".join(f"{code}: {self.catalog_statuses.get(code,'—')}"
-                                  for code in QUERY_PROFILES)
-            self.query_one("#catalog_status", Static).update("FY FIELD CATALOGS\n" + status)
+            status = "  |  ".join(
+                f"{code}/{kind}: {self.catalog_statuses.get(f'{code}/{kind}', 'UNKNOWN')}"
+                for code in QUERY_PROFILES for kind in CUBE_TYPES
+            )
+            self.query_one("#catalog_status", Static).update(
+                "FY / UY / AY CUBE CATALOGS\n" + status)
 
         @work(thread=True, group="five-cube-discovery", exclusive=True)
         def discover_all_catalogs(self, force: bool = False) -> None:
@@ -4362,147 +4692,237 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.catalog_started = True
             sequence = self.auth_sequence
             cookie, token = self.cookie_value(), self.token_value()
-            for code in QUERY_PROFILES:
-                if sequence != self.auth_sequence:
-                    break
-                existing = load_catalog(code)
-                if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
-                    try:
-                        updated = datetime.fromisoformat(existing["refreshed_at"])
-                        if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
-                            self.call_from_thread(self.catalog_discovery_event, code,
-                                                  existing, None)
-                            continue
-                    except (TypeError, ValueError):
-                        pass
-                try:
-                    catalog = discover_fields(code, token, cookie)
-                    self.call_from_thread(self.catalog_discovery_event, code, catalog, None)
-                except Exception as exc:
-                    error = str(exc)[:110]
-                    self.call_from_thread(self.catalog_discovery_event, code, None, error)
-                    if "SESSION_EXPIRED" in error or "401" in error or "403" in error:
-                        break
-            self.catalog_running = False
+            try:
+                for code in QUERY_PROFILES:
+                    for cube_type in CUBE_TYPES:
+                        if sequence != self.auth_sequence:
+                            return
+                        existing = load_catalog(code, cube_type)
+                        if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
+                            try:
+                                updated = datetime.fromisoformat(existing["refreshed_at"])
+                                if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
+                                    self.call_from_thread(self.catalog_discovery_event,
+                                                          code, cube_type, existing, None)
+                                    continue
+                            except (TypeError, ValueError):
+                                pass
+                        try:
+                            result = discover_fields(code, token, cookie, cube_type=cube_type)
+                            self.call_from_thread(self.catalog_discovery_event,
+                                                  code, cube_type, result, None)
+                        except Exception as exc:
+                            error = str(exc)[:150]
+                            self.call_from_thread(self.catalog_discovery_event,
+                                                  code, cube_type, None, error)
+                            if any(x in error.upper() for x in ("SESSION_EXPIRED", "HTTP 401", "HTTP 403")):
+                                return
+            finally:
+                self.catalog_running = False
 
-        def catalog_discovery_event(self, code: str, catalog: dict | None,
-                                    error: str | None) -> None:
+        def catalog_discovery_event(self, code: str, cube_type: str,
+                                    catalog: dict | None, error: str | None) -> None:
+            key = f"{code}/{cube_type}"
             if error:
-                self.catalog_statuses[code] = "ERROR / CACHE KEPT"
-                self.info(f"{code} metadata: {error}", "warning")
+                self.catalog_statuses[key] = cube_status(code, cube_type)["status"]
+                if "NOT_AVAILABLE" not in error:
+                    self.info(f"{key} metadata: {error}", "warning")
             else:
-                self.catalog_statuses[code] = (
-                    f"{catalog['view_count']}+{catalog['data_count']}")
-                self.info(f"{code}: {len(catalog['fields'])} field items cached.", "success")
+                self.catalog_statuses[key] = (
+                    f"AVAILABLE {catalog['view_count']}+{catalog['data_count']}"
+                )
+                self.info(f"{key}: {len(catalog['fields'])} fields cached.", "success")
             self.update_catalog_summary()
 
         # ====================================================
         # SELECTED DATA EXTRACTION / WINDOW HANDOFF
         # ====================================================
 
+        @staticmethod
+        def _batch_pid_alive(pid) -> bool:
+            try:
+                pid = int(pid)
+                if pid <= 0 or sys.platform != "win32":
+                    return False
+                import ctypes
+                handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+                if not handle:
+                    return False
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            except (TypeError, ValueError, OSError):
+                return False
+
+        def reconnect_active_batch(self) -> None:
+            root = resolve_output_path(self.output_value()).resolve() / "Runs"
+            if not root.is_dir():
+                return
+            runs = sorted((p for p in root.glob("*") if (p / "batch_config.json").is_file()),
+                          reverse=True)
+            self.last_run_path = runs[0] if runs else None
+            for path in runs:
+                manifest_path = path / "batch_manifest.json"
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if (manifest.get("status") in ("RUNNING", "STARTING", "STOPPING")
+                        and self._batch_pid_alive(manifest.get("pid"))):
+                    self.active_run = path
+                    self.last_run_path = path
+                    self.query_one("#start", Button).disabled = True
+                    self.query_one("#stop", Button).disabled = False
+                    self.query_one("#force_stop", Button).disabled = False
+                    self.info(f"Reconnected to active batch: {path.name}", "success")
+                    self.poll_selected_run()
+                    return
+
+        def _launch_batch_process(self, path: Path) -> None:
+            script = BASE_DIR / "oic_parallel_collector.py"
+            if not script.is_file():
+                raise FileNotFoundError(str(script))
+            logfile = path / "batch.log"
+            with logfile.open("a", encoding="utf-8") as handle:
+                self.batch_process = subprocess.Popen(
+                    [sys.executable, str(script), "--batch-run", str(path)],
+                    cwd=str(BASE_DIR),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    close_fds=True,
+                )
+            self.active_run = path
+            self.last_run_path = path
+            self.query_one("#start", Button).disabled = True
+            self.query_one("#stop", Button).disabled = False
+            self.query_one("#force_stop", Button).disabled = False
+            self.query_one("#status", Static).update("STARTING / " + path.name)
+
         def start_selected_query(self) -> None:
             if self.active_run is not None:
-                self.info("A collection is already active; Stop or finish before restarting.", "warning")
+                self.info("A batch is active. Stop or finish it before restarting.", "warning")
                 return
             if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
-                self.info("Validate Cookie and JWT before Start; backend readiness is separate.", "error")
+                self.info("Validate Cookie and JWT before START.", "error")
                 return
-            if sys.platform != "win32" or not shutil.which("wt.exe"):
-                self.info("Windows Terminal (wt.exe) is required for the three-window workflow.", "error")
+            if not self.applied_queries:
+                self.info("APPLY at least one query before START.", "warning")
                 return
             try:
-                config = self.query_config()
                 self.save_credentials()
+                root = resolve_output_path(self.output_value()).resolve()
                 run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
-                config["run_id"] = run_id
-                config["created_at"] = datetime.now(timezone.utc).isoformat()
-                path = resolve_output_path(self.output_value()) / "oic_parallel" / run_id
+                path = root / "Runs" / run_id
                 path.mkdir(parents=True, exist_ok=False)
-                config_file = path / "query_config.json"
-                pending = config_file.with_suffix(".tmp")
-                pending.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
-                pending.replace(config_file)
-                job_plan = path / "job_plan.json"
-                plan_temp = job_plan.with_suffix(".tmp")
-                plan_temp.write_text(json.dumps(
-                    {"run_id": run_id, "schema_version": config["schema_version"],
-                     "query_hash": query_hash(config),
-                     "x_rows": config["x"], "y_columns": config["y"],
-                     "measures": config["measures"],
-                     "workers": config["workers"], "partition": "x_row_page_mod_workers"},
-                    ensure_ascii=False, indent=2), encoding="utf-8")
-                plan_temp.replace(job_plan)
-                script = BASE_DIR / "oic_parallel_collector.py"
-                if not script.is_file():
-                    raise RuntimeError("oic_parallel_collector.py not found")
-                flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                subprocess.Popen([sys.executable, str(script), "--query-config",
-                                  str(config_file), "--launch"], cwd=str(BASE_DIR),
-                                 creationflags=flags, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL)
-                self.active_run = path
-                self.last_run_path = path
-                self.query_one("#start", Button).disabled = True
-                self.query_one("#stop", Button).disabled = False
-                self.query_one("#status", Static).update(f"RUNNING / {run_id}")
-                self.info(f"Selected query launched: {run_id}", "success")
+                entries = []
+                from oic_parallel_collector import write_json
+                for item in self.applied_queries:
+                    qid = item["query_id"]
+                    config = dict(validate_query(item["query"]))
+                    plan = dict(item["task_plan"])
+                    if plan.get("query_hash") != query_hash(config):
+                        raise ValueError(f"{qid} changed after APPLY; re-apply to plan tasks")
+                    config["run_id"] = run_id
+                    config["created_at"] = datetime.now(timezone.utc).isoformat()
+                    config["output_root"] = str(root)
+                    qdir = path / qid
+                    qdir.mkdir()
+                    write_json(qdir / "query_config.json", config)
+                    write_json(qdir / "task_plan.json", plan)
+                    entries.append(dict(query_id=qid, code=config["code"],
+                                        cube_type=config.get("cube_type", "FY"),
+                                        cube=config["cube"], workers=config["workers"],
+                                        status="PENDING"))
+                write_json(path / "batch_config.json", {
+                    "run_id": run_id, "output_root": str(root),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "queries": entries,
+                })
+                self._launch_batch_process(path)
+                self.info(f"Batch started: {run_id} / {len(entries)} queries.", "success")
             except Exception as exc:
-                self.info(f"Cannot start collection: {exc}", "error")
+                self.active_run = None
+                self.info(f"Cannot start batch: {type(exc).__name__}: {exc}", "error")
 
         def resume_selected_query(self) -> None:
             if self.active_run is not None:
-                self.info("Finish or stop the active run before resuming.", "warning")
-                return
-            path = self.last_run_path
-            if not path or not (path / "query_config.json").is_file():
-                self.info("No previous query run to resume.", "warning")
+                self.info("Stop or finish the active batch before RESUME.", "warning")
                 return
             if self.cookie_state != "VALID":
-                self.info("Validate the Session before resuming.", "warning")
+                self.info("Validate Cookie session before RESUME.", "warning")
                 return
-            (path / "stop.flag").unlink(missing_ok=True)
-            script = BASE_DIR / "oic_parallel_collector.py"
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            root = resolve_output_path(self.output_value()).resolve()
+            runs_dir = root / "Runs"
+            eligible = sorted((p for p in runs_dir.glob("*")
+                               if (p / "batch_config.json").is_file()),
+                              reverse=True) if runs_dir.is_dir() else []
+            path = self.last_run_path if self.last_run_path and (
+                self.last_run_path / "batch_config.json").is_file() else (
+                eligible[0] if eligible else None)
+            if path is None:
+                self.info("No previous batch to resume.", "warning")
+                return
+            manifest = json.loads((path / "batch_manifest.json").read_text(
+                encoding="utf-8")) if (path / "batch_manifest.json").is_file() else {}
+            if (manifest.get("status") in ("RUNNING", "STARTING", "STOPPING")
+                    and self._batch_pid_alive(manifest.get("pid"))):
+                self.info("That batch is still running; do not launch duplicate workers.", "warning")
+                return
+            if manifest.get("status") == "COMPLETED":
+                self.info("The previous batch is already complete.", "warning")
+                return
             try:
-                subprocess.Popen([sys.executable, str(script), "--query-config",
-                                  str(path / "query_config.json"), "--launch"],
-                                 cwd=str(BASE_DIR), creationflags=flags,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.active_run = path
-                self.query_one("#start", Button).disabled = True
-                self.query_one("#stop", Button).disabled = False
-                self.info(f"Resuming {path.name}", "success")
+                (path / "stop.flag").unlink(missing_ok=True)
+                (path / "force_stop.flag").unlink(missing_ok=True)
+                self._launch_batch_process(path)
+                self.info(f"Resuming batch {path.name} from saved chunks.", "success")
             except Exception as exc:
-                self.info(f"Resume failed: {exc}", "error")
+                self.active_run = None
+                self.info(f"RESUME failed: {exc}", "error")
 
         def poll_selected_run(self) -> None:
             if self.active_run is None:
                 return
-            statuses = []
-            config_path = self.active_run / "query_config.json"
+            manifest = {}
             try:
-                workers = int(json.loads(config_path.read_text(encoding="utf-8"))["workers"])
-            except (OSError, ValueError, KeyError):
-                workers = 4
-            for wid in range(1, workers + 1):
-                path = self.active_run / f"worker_{wid:02d}" / "state.json"
-                if not path.is_file():
-                    continue
-                try:
-                    state = json.loads(path.read_text(encoding="utf-8"))
-                    statuses.append(state.get("status", "STARTING"))
-                except (OSError, ValueError):
-                    pass
+                manifest = json.loads((self.active_run / "batch_manifest.json").read_text(
+                    encoding="utf-8"))
+            except (FileNotFoundError, OSError, ValueError, TypeError):
+                pass
+            status = manifest.get("status", "STARTING")
+            items = manifest.get("queries", [])
+            query_states = {item["query_id"]: item.get("status", "PENDING")
+                            for item in items if item.get("query_id")}
+            if query_states != self.query_states:
+                self.query_states = query_states
+                self.update_query_summary()
+                completed = sum(value == "COMPLETED" for value in query_states.values())
+                self.query_one("#progress", ProgressBar).update(
+                    total=max(1, len(query_states)), progress=completed)
+            details = " / ".join(f"{q['query_id']}:{q.get('status','?')}"
+                                 for q in items[:5])
             self.query_one("#status", Static).update(
-                f"RUN {self.active_run.name} | {len(statuses)}/{workers} workers | "
-                + ", ".join(statuses or ["STARTING"]))
-            if len(statuses) == workers and all(status in (
-                "COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED")
-                for status in statuses):
-                self.info(f"Run ended: {self.active_run.name} / {', '.join(statuses)}")
+                f"BATCH {self.active_run.name} / {status} / {details}"[:190])
+            process_failed = (
+                self.batch_process is not None and
+                self.batch_process.poll() is not None and
+                status not in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED")
+            )
+            if (self.batch_process is None and
+                    status in ("RUNNING", "STARTING", "STOPPING") and
+                    manifest.get("pid") and
+                    not self._batch_pid_alive(manifest.get("pid"))):
+                process_failed = True
+            if process_failed:
+                status = "FAILED"
+                self.info(f"Batch supervisor exited unexpectedly. See {self.active_run / 'batch.log'}", "error")
+            if status in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED"):
+                self.info(f"Batch ended: {self.active_run.name} / {status}.", "success" if status == "COMPLETED" else "warning")
                 self.active_run = None
+                self.batch_process = None
                 self.query_one("#start", Button).disabled = False
                 self.query_one("#stop", Button).disabled = True
+                self.query_one("#force_stop", Button).disabled = True
 
     # ========================================================
     # DEDICATED QUERY DESIGNER — same Textual framework, separate process.
@@ -4510,7 +4930,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
     class OICQueryDesigner(App):
         TITLE = "OIC | Query Designer"
-        SUB_TITLE = "Five-Cube FY Field Catalog"
+        SUB_TITLE = "AH / FI / MR / MI / MV | FY / UY / AY"
         BINDINGS = [
             Binding("a", "field_to_x", "X / ROWS", show=False),
             Binding("s", "field_to_y", "Y / COLUMNS", show=False),
@@ -4548,6 +4968,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         #designer_header Select {
             width: 1fr;
         }
+        #designer_cube { width: 15; }
 
         #designer_status {
             width: 2fr;
@@ -4656,6 +5077,8 @@ def launch_terminal_ui(args, return_app: bool = False):
         #designer_footer Button {
             margin-right: 1;
         }
+        #duplicate_confirm { background: #665334; }
+        #duplicate_cancel { background: #633d40; }
 
         Button {
             background: #2c4c5d;
@@ -4676,11 +5099,14 @@ def launch_terminal_ui(args, return_app: bool = False):
             super().__init__()
             self.code = args.category if args.category in QUERY_PROFILES else "MV"
             self.selection_path = Path(args.selection_file).resolve()
-            self.catalog = load_catalog(self.code)
+            self.cube_type = "FY"
+            self.catalog = load_catalog(self.code, self.cube_type)
             self.fields = {}
             self.chosen = {"x": [], "y": [], "measures": []}
             self.by_category = {}
             self.highlighted_id = None
+            self.pending_duplicate = None
+            self._changing_cube = False
 
         def compose(self) -> ComposeResult:
             from textual.widgets import OptionList
@@ -4704,6 +5130,12 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="designer_category",
                     )
 
+                    yield Select(
+                        [(f"{kind} / {status}", kind)
+                         for kind, status in cube_options(self.code)],
+                        value=self.cube_type, allow_blank=False,
+                        id="designer_cube",
+                    )
                     yield Static(
                         "CATALOG: CACHE",
                         id="designer_status",
@@ -4751,6 +5183,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                             yield Button(
                                 "RELOAD",
                                 id="reload_designer_catalog",
+                            )
+                            yield Button(
+                                "VERIFY",
+                                id="verify_designer_field",
                             )
 
                     with Vertical(id="query_right"):
@@ -4859,7 +5295,15 @@ def launch_terminal_ui(args, return_app: bool = False):
                     )
 
                     yield Button(
-                        "CANCEL",
+                        "ADD ANYWAY",
+                        id="duplicate_confirm",
+                    )
+                    yield Button(
+                        "CANCEL DUPLICATE",
+                        id="duplicate_cancel",
+                    )
+                    yield Button(
+                        "CLOSE DESIGNER",
                         id="designer_cancel",
                     )
 
@@ -4869,8 +5313,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.selection_path.parent.mkdir(parents=True, exist_ok=True)
             self.selection_path.with_suffix(".lock").write_text(
                 str(os.getpid()), encoding="ascii")
+            self.query_one("#duplicate_confirm", Button).display = False
+            self.query_one("#duplicate_cancel", Button).display = False
             self._restore_previous_selection()
-            self.update_catalog(self.code)
+            self.update_catalog(self.code, self.cube_type)
 
         def on_unmount(self) -> None:
             lock = self.selection_path.with_suffix(".lock")
@@ -4882,46 +5328,119 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         def _restore_previous_selection(self) -> None:
             try:
-                envelope = json.loads(self.selection_path.read_text(encoding="utf-8"))
-                previous = validate_query(envelope["query"])
+                envelope, _ = read_applied_queries(self.selection_path)
+                items = envelope["queries"]
+                if not items:
+                    return
+                previous = validate_query(items[-1]["query"])
                 if int(previous.get("schema_version", 1)) != SCHEMA_VERSION:
                     return
-                ids = previous["selection_ids"]
-                self.by_category[previous["code"]] = {
-                    key: list(ids.get(key, [])) for key in self.chosen
+                self.code = previous["code"]
+                self.cube_type = previous.get("cube_type", "FY")
+                self.by_category[(self.code, self.cube_type)] = {
+                    axis: list(previous["selection_ids"].get(axis, []))
+                    for axis in self.chosen
                 }
+                self._changing_cube = True
+                self.query_one("#designer_category", Select).value = self.code
+                control = self.query_one("#designer_cube", Select)
+                control.set_options([(f"{kind} / {status}", kind)
+                                     for kind, status in cube_options(self.code)])
+                control.value = self.cube_type
+                self._changing_cube = False
                 for name, key in (("workers", "designer_workers"),
                                   ("x_chunk", "designer_x_chunk"),
                                   ("y_chunk", "designer_y_chunk")):
                     self.query_one("#" + key, Input).value = str(previous[name])
             except (OSError, ValueError, TypeError, KeyError):
-                pass
+                self._changing_cube = False
 
-        def update_catalog(self, code: str) -> None:
+        def update_catalog(self, code: str, cube_type: str | None = None) -> None:
             self.code = code
-            self.catalog = load_catalog(code)
+            self.cube_type = cube_type or self.cube_type
+            self.catalog = load_catalog(code, self.cube_type)
             self.fields = {field["id"]: field for field in self.catalog["fields"]}
-            previous = self.by_category.get(code, {})
-            self.chosen = {axis: [item for item in previous.get(axis, [])
-                                  if item in self.fields and
-                                  self.fields[item].get("status") in ("MAPPED", "VERIFIED")]
-                           for axis in ("x", "y", "measures")}
+            previous = self.by_category.get((code, self.cube_type), {})
+            self.chosen = {
+                axis: [item for item in previous.get(axis, [])
+                       if item in self.fields and
+                       self.fields[item].get("status") in ("MAPPED", "VERIFIED")]
+                for axis in ("x", "y", "measures")
+            }
             self.highlighted_id = None
             self.refresh_tree()
             self.refresh_layout()
+            availability = cube_status(code, self.cube_type)["status"]
             self.query_one("#designer_status", Static).update(
-                f"CATALOG {code}: {self.catalog.get('view_count', 0)} views / "
-                f"{self.catalog.get('data_count', 0)} data  ·  {self.catalog['source']}"
-            )
+                f"CATALOG {code}/{self.cube_type}: {availability} | "
+                f"{self.catalog.get('view_count', 0)} views / "
+                f"{self.catalog.get('data_count', 0)} measures "
+                f"({self.catalog['source']})")
 
         def on_select_changed(self, event: Select.Changed) -> None:
-            if event.select.id != "designer_category":
+            if self._changing_cube:
                 return
-            code = event.value
-            if code in QUERY_PROFILES and code != self.code:
-                self.by_category[self.code] = {
-                    key: list(value) for key, value in self.chosen.items()}
-                self.update_catalog(str(code))
+            if event.select.id not in ("designer_category", "designer_cube"):
+                return
+            next_code = (str(event.value) if event.select.id == "designer_category"
+                         else self.code)
+            next_type = (str(event.value) if event.select.id == "designer_cube"
+                         else "FY" if next_code != self.code else self.cube_type)
+            if next_code not in QUERY_PROFILES or next_type not in CUBE_TYPES:
+                return
+            if (next_code, next_type) == (self.code, self.cube_type):
+                return
+            self.by_category[(self.code, self.cube_type)] = {
+                axis: list(value) for axis, value in self.chosen.items()
+            }
+            if next_code != self.code:
+                self._changing_cube = True
+                select = self.query_one("#designer_cube", Select)
+                select.set_options([(f"{kind} / {status}", kind)
+                                    for kind, status in cube_options(next_code)])
+                select.value = next_type
+                self._changing_cube = False
+            self.update_catalog(next_code, next_type)
+            self.cancel_duplicate()
+
+        @work(thread=True, group="designer-discovery", exclusive=True)
+        def refresh_catalog_worker(self) -> None:
+            code, cube_type = self.code, self.cube_type
+            env = read_env()
+            try:
+                result = discover_fields(code, env.get("OIC_BEARER_TOKEN", ""),
+                                         env.get("OIC_COOKIE", ""),
+                                         cube_type=cube_type)
+                self.call_from_thread(self.catalog_refreshed, code, cube_type, result, None)
+            except Exception as exc:
+                self.call_from_thread(self.catalog_refreshed, code, cube_type, None, str(exc)[:200])
+
+        @work(thread=True, group="designer-verify", exclusive=True)
+        def verify_selected_field(self) -> None:
+            item = self.highlighted_id
+            field = self.fields.get(item)
+            if not field:
+                self.call_from_thread(self.show_error, "Select a field in the Tree first")
+                return
+            env = read_env()
+            code, cube_type = self.code, self.cube_type
+            try:
+                result = verify_field(code, cube_type, item,
+                                      env.get("OIC_BEARER_TOKEN", ""),
+                                      env.get("OIC_COOKIE", ""))
+                self.call_from_thread(
+                    self.field_verified, code, cube_type, result["caption"])
+            except Exception as exc:
+                self.call_from_thread(self.show_error, f"VERIFY FAILED: {exc}")
+
+        def field_verified(self, code: str, cube_type: str, caption: str) -> None:
+            if (code, cube_type) == (self.code, self.cube_type):
+                self.by_category[(code, cube_type)] = {
+                    axis: list(v) for axis, v in self.chosen.items()
+                }
+                self.update_catalog(code, cube_type)
+            self.query_one("#designer_preview", Static).update(
+                f"VERIFIED {code}/{cube_type}: {caption} — XMLA Execute successful")
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "catalog_search":
@@ -5039,7 +5558,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             else:
                 self.query_one("#field_description", Static).update(
                     f"{field['caption']} · {field.get('status')} · "
-                    "A → X/ROWS   S → Y/COLUMNS"
+                    f"{field.get('mapping_reason', 'Select A=ROWS / S=COLUMNS')}"
                 )
 
         def action_field_to_x(self) -> None:
@@ -5074,7 +5593,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             ):
                 self.show_error(
                     f"{field['caption']}: "
-                    f"mapping not available ({field.get('status')})"
+                    f"mapping not available ({field.get('status')}): "
+                    f"{field.get('mapping_reason', 'No verified MDX identifier')}"
                 )
                 return
 
@@ -5133,7 +5653,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             ):
                 self.show_error(
                     f"{field['caption']}: "
-                    f"{field.get('status')} — selection disabled"
+                    f"{field.get('status')} — "
+                    f"{field.get('mapping_reason', 'mapping not verified')}"
                 )
                 return
 
@@ -5190,7 +5711,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             if current_ids == items:
                 return
 
-            widget.set_options(
+            widget.clear_options()
+            widget.add_options(
                 [
                     Option(
                         f"{index + 1}. "
@@ -5289,7 +5811,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 select_id=target,
             )
         def build_query(self) -> dict:
-            profile = QUERY_PROFILES[self.code]
+            profile = cube_profile(self.code, self.cube_type)
 
             selections = {
                 axis: list(self.chosen[axis])
@@ -5341,6 +5863,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             config = {
                 "schema_version": SCHEMA_VERSION,
                 "code": self.code,
+                "cube_type": self.cube_type,
                 "cube": profile["cube"],
                 "catalog": profile["catalog"],
                 "x": [
@@ -5388,7 +5911,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     "#designer_preview",
                     Static,
                 ).update(
-                    f"CODE: {query['code']} / {query['cube']}\n"
+                    f"CODE: {query['code']} / {query.get('cube_type', 'FY')} / {query['cube']}\n"
                     f"X ROWS (Axis1): {len(query['x'])}   "
                     f"Y COLUMNS (Axis0): {len(query['y'])}   "
                     f"VALUES: {len(query['measures'])}\n"
@@ -5406,60 +5929,94 @@ def launch_terminal_ui(args, return_app: bool = False):
         def show_error(self, message: str) -> None:
             self.query_one("#designer_preview", Static).update("VALIDATION: " + message[:450])
 
-        def apply_selection(self) -> None:
+        def cancel_duplicate(self) -> None:
+            self.pending_duplicate = None
+            self.query_one("#duplicate_confirm", Button).display = False
+            self.query_one("#duplicate_cancel", Button).display = False
+
+        def apply_selection(self, force_duplicate: bool = False) -> None:
             try:
+                from oic_parallel_collector import build_selected_task_plan
                 config = self.build_query()
+                fingerprint = applied_query_identity(config)
+                selection = self.selection_path
 
-                envelope = {
-                    "revision": uuid.uuid4().hex,
-                    "query": config,
-                }
-
-                self.selection_path.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                temp = self.selection_path.with_suffix(".tmp")
-
-                temp.write_text(
-                    json.dumps(
-                        envelope,
-                        ensure_ascii=False,
-                        indent=2,
-                    ),
-                    encoding="utf-8",
-                )
-
-                temp.replace(self.selection_path)
-
-                saved = json.loads(
-                    self.selection_path.read_text(
-                        encoding="utf-8",
-                    )
-                )
-
-                if saved["revision"] != envelope["revision"]:
-                    raise RuntimeError(
-                        "Saved selection revision mismatch"
+                if force_duplicate and self.pending_duplicate != fingerprint:
+                    self.cancel_duplicate()
+                    raise ValueError(
+                        "Query changed after duplicate warning; press APPLY again"
                     )
 
-                validate_query(saved["query"])
+                with applied_list_write_lock(selection):
+                    envelope, legacy = read_applied_queries(selection)
+                    entries = envelope["queries"]
 
-                self.exit()
+                    duplicate = next(
+                        (item for item in entries
+                         if applied_query_identity(item["query"]) == fingerprint),
+                        None,
+                    )
+                    if duplicate and not force_duplicate:
+                        self.pending_duplicate = fingerprint
+                        self.query_one("#duplicate_confirm", Button).display = True
+                        self.query_one("#duplicate_cancel", Button).display = True
+                        self.show_error(
+                            f"DUPLICATE: matches {duplicate['query_id']} "
+                            "(same category, cube, X, Y, VALUES, Filters). "
+                            "Press ADD ANYWAY or CANCEL DUPLICATE."
+                        )
+                        return
 
+                    # Stable, monotonic IDs: never reuse removed Query IDs.
+                    sequence = int(envelope["next_query_sequence"])
+                    existing_ids = {item["query_id"] for item in entries}
+                    query_id = f"Q{sequence:03d}"
+                    while query_id in existing_ids:
+                        sequence += 1
+                        query_id = f"Q{sequence:03d}"
+                    config["query_id"] = query_id
+                    plan = build_selected_task_plan(config)
+                    entries.append({
+                        "query_id": query_id,
+                        "query": config,
+                        "task_plan": plan,
+                        "applied_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    envelope["next_query_sequence"] = sequence + 1
+                    save_applied_queries(
+                        selection, envelope, backup_legacy=legacy,
+                    )
+
+                self.cancel_duplicate()
+                self.query_one("#designer_preview", Static).update(
+                    f"APPLIED {query_id} / {config['code']}/"
+                    f"{config.get('cube_type', 'FY')} / {config['cube']}\n"
+                    f"Prepared {len(plan['assignments'])} worker allocations. "
+                    "Task count is DYNAMIC until member discovery.\n"
+                    f"APPLIED QUERIES: {len(entries)}. "
+                    "Designer remains open."
+                )
             except Exception as exc:
                 self.show_error(
                     f"APPLY FAILED: {type(exc).__name__}: {exc}"
                 )
 
-        def catalog_refreshed(self, code: str, catalog: dict | None, error: str | None):
+        def catalog_refreshed(self, code: str, cube_type: str,
+                              catalog: dict | None, error: str | None):
             if error:
-                self.show_error("Catalog refresh failed; existing cache kept: " + error)
-            elif code == self.code:
-                previous = {k: list(v) for k, v in self.chosen.items()}
-                self.by_category[code] = previous
-                self.update_catalog(code)
+                self.show_error("Catalog refresh failed; cache kept: " + error)
+                return
+            if code == self.code and cube_type == self.cube_type:
+                self.by_category[(code, cube_type)] = {
+                    axis: list(v) for axis, v in self.chosen.items()
+                }
+                self._changing_cube = True
+                control = self.query_one("#designer_cube", Select)
+                control.set_options([(f"{kind} / {status}", kind)
+                                     for kind, status in cube_options(code)])
+                control.value = cube_type
+                self._changing_cube = False
+                self.update_catalog(code, cube_type)
 
         def action_cancel(self) -> None:
             self.exit()
@@ -5494,6 +6051,8 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             elif operation == "reload_designer_catalog":
                 self.refresh_catalog_worker()
+            elif operation == "verify_designer_field":
+                self.verify_selected_field()
 
             elif operation == "designer_preview_button":
                 self.preview_query()
@@ -5501,6 +6060,10 @@ def launch_terminal_ui(args, return_app: bool = False):
             elif operation == "designer_apply":
                 self.apply_selection()
 
+            elif operation == "duplicate_confirm":
+                self.apply_selection(force_duplicate=True)
+            elif operation == "duplicate_cancel":
+                self.cancel_duplicate()
             elif operation == "designer_cancel":
                 self.action_cancel()
 
@@ -5530,7 +6093,7 @@ def main() -> int:
 
     parser.add_argument("--designer", action="store_true",
                         help="Open the dedicated Textual query designer")
-    parser.add_argument("--selection-file", type=str, default="output/query_selection.json")
+    parser.add_argument("--selection-file", type=str, default="output/applied_queries.json")
     parser.add_argument("--category", choices=list(PROFILES), default="MV")
 
     parser.add_argument(

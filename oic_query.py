@@ -44,6 +44,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +59,8 @@ from xml.etree import ElementTree as ET
 ROOT = Path(__file__).resolve().parent
 
 CATALOG_DIR = ROOT / "output" / "catalog"
+BUNDLED_CATALOG_DIR = ROOT / "catalog"
+VERIFICATION_DIR = ROOT / "output" / "field_verification"
 
 BASE_URL = "https://onlinewebibs.oic.or.th"
 
@@ -137,6 +140,8 @@ KNOWN_MEASURE_NAMES = {
 KNOWN_DIMENSION_NAMES = {
     "YEAR": "ปีบัญชี",
     "FY YEAR": "ปีบัญชี",
+    "UY YEAR": "ปีรับประกัน",
+    "AY YEAR": "ปีอุบัติเหตุ",
     "MAIN NAME TH": "ประเภทงานหลัก",
     "SUB NAME TH": "ประเภทงานย่อย",
     "SUBCLASS DESC TH": "ประเภทกรมธรรม์",
@@ -244,6 +249,127 @@ PROFILES = {
 }
 
 
+# Every non-FY cube must be proven by GetStructure before it is selectable.
+CUBE_TYPES = ("FY", "UY", "AY")
+CUBE_INDEX = CATALOG_DIR / "cube_types.json"
+KNOWN_CUBE_EVIDENCE = {
+    ("MI", "UY"): ("MI_AGGREGATE_UY", "[VW PV MI AGGREGATE UY].[UY YEAR]"),
+    ("AH", "AY"): ("AH_AGGREGATE_AY", "[VW PV AH AGGREGATE AY].[AY YEAR]"),
+}
+
+def _read_catalog_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _catalog_time(data: dict) -> str:
+    return str(data.get("report_updated_at") or data.get("updated_at")
+               or data.get("finished_at") or data.get("refreshed_at") or "")
+
+
+def _cube_index() -> dict:
+    result = {}
+    for path in (BUNDLED_CATALOG_DIR / "cube_types.json", CUBE_INDEX):
+        for code, entries in (_read_catalog_json(path) or {}).items():
+            if code not in PROFILES or not isinstance(entries, dict):
+                continue
+            for kind, entry in entries.items():
+                if kind not in CUBE_TYPES or not isinstance(entry, dict):
+                    continue
+                old = result.setdefault(code, {}).get(kind, {})
+                if entry.get("status") not in ("AVAILABLE", "NOT_AVAILABLE", "UNKNOWN"):
+                    continue
+                if old.get("status") == "AVAILABLE" and entry.get("status") == "UNKNOWN":
+                    continue
+                if str(entry.get("checked_at") or "") < str(old.get("checked_at") or ""):
+                    continue
+                result[code][kind] = entry
+    return result
+
+
+def _year_from_fields(fields: list[dict], kind: str) -> str | None:
+    names = {"FY": ("YEAR", "FY YEAR"), "UY": ("UY YEAR",), "AY": ("AY YEAR",)}[kind]
+    for f in fields:
+        mdx = f.get("mdx")
+        if (f.get("type") == "DIMENSION" and f.get("status") in ("MAPPED", "VERIFIED")
+                and isinstance(mdx, str) and IDENTIFIER.fullmatch(mdx)
+                and mdx.upper().rsplit(".[", 1)[-1].rstrip("]") in names):
+            return mdx
+    return None
+
+
+def cube_status(code: str, cube_type: str) -> dict:
+    if code not in PROFILES or cube_type not in CUBE_TYPES:
+        raise ValueError("Unknown insurance category / cube type")
+    if cube_type == "FY":
+        p = PROFILES[code]
+        return {"status": "AVAILABLE", "cube": p["cube"], "year": p["year"], "source": "PROFILE"}
+    found = _cube_index().get(code, {}).get(cube_type)
+    report = load_verification_report(code, cube_type)
+    if report and (not found or found.get("status") == "UNKNOWN"
+                   or _catalog_time(report) >= str(found.get("checked_at") or "")):
+        return {"status": "AVAILABLE", "cube": report["cube"],
+                "year": _year_from_fields(report["fields"], cube_type),
+                "source": "VERIFICATION_REPORT", "checked_at": _catalog_time(report)}
+    if isinstance(found, dict):
+        return found
+    bundled = load_bundled_catalog(code, cube_type)
+    if bundled:
+        return {"status": "AVAILABLE", "cube": bundled["cube"],
+                "year": _year_from_fields(bundled["fields"], cube_type), "source": "BUNDLED_CATALOG"}
+    example = KNOWN_CUBE_EVIDENCE.get((code, cube_type))
+    if example:
+        return {"status": "AVAILABLE", "cube": example[0], "year": example[1], "source": "OIC_EXAMPLE"}
+    return {"status": "UNKNOWN", "cube": None, "year": None, "source": "NOT_DISCOVERED"}
+
+
+def cube_profile(code: str, cube_type: str = "FY",
+                 *, discovery: bool = False) -> dict:
+    entry = cube_status(code, cube_type)
+    if cube_type != "FY" and entry["status"] != "AVAILABLE" and not discovery:
+        raise ValueError(f"{code}/{cube_type}: {entry['status']} - discover this cube first")
+    profile = dict(PROFILES[code])
+    profile["cube_type"] = cube_type
+    if cube_type != "FY":
+        # Candidate below is only a GetStructure probe, not executable MDX.
+        profile["cube"] = entry.get("cube") or f"{code}_AGGREGATE_{cube_type}"
+        profile["year"] = entry.get("year")
+        profile["row1"] = None
+        profile["row2"] = None
+        profile["measures"] = []
+    return profile
+
+def save_cube_status(code: str, cube_type: str, status: str,
+                     cube: str | None = None, year: str | None = None) -> None:
+    if cube_type == "FY":
+        return
+    if status not in ("AVAILABLE", "NOT_AVAILABLE", "UNKNOWN"):
+        raise ValueError("Invalid cube status")
+    data = _read_catalog_json(CUBE_INDEX) or {}
+    data.setdefault(code, {})[cube_type] = {
+        "status": status,
+        "cube": cube if status == "AVAILABLE" else None,
+        "year": year if status == "AVAILABLE" else None,
+        "source": "LIVE_DISCOVERY",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+    temp = CUBE_INDEX.with_name(
+        CUBE_INDEX.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        _replace_catalog_file(temp, CUBE_INDEX)
+    finally:
+        temp.unlink(missing_ok=True)
+
+def cube_options(code: str) -> list[tuple[str, str]]:
+    return [(kind, cube_status(code, kind)["status"]) for kind in CUBE_TYPES]
+
+
 # ============================================================
 # UTILITIES
 # ============================================================
@@ -309,15 +435,16 @@ def field_id(code: str, record: dict) -> str:
 # CATALOG STORAGE
 # ============================================================
 
-def cache_path(code: str) -> Path:
-    return CATALOG_DIR / f"{code}.json"
+def cache_path(code: str, cube_type: str = "FY") -> Path:
+    suffix = "" if cube_type == "FY" else "_" + cube_type
+    return CATALOG_DIR / f"{code}{suffix}.json"
 
 
-def seeded_catalog(code: str) -> dict:
+def seeded_catalog(code: str, cube_type: str = "FY") -> dict:
     if code not in PROFILES:
         raise ValueError("Unknown insurance category")
 
-    profile = PROFILES[code]
+    profile = cube_profile(code, cube_type, discovery=True)
     fields = []
 
     dimensions = filter(
@@ -333,7 +460,7 @@ def seeded_catalog(code: str) -> dict:
         caption = name.rsplit("[", 1)[-1].rstrip("]")
 
         fields.append({
-            "id": f"profile-d-{index}-{code}",
+            "id": f"profile-d-{index}-{code}-{cube_type}",
             "mdx": name,
             "display": caption,
             "caption": caption,
@@ -350,7 +477,7 @@ def seeded_catalog(code: str) -> dict:
         mdx = f"[Measures].[{name}]"
 
         fields.append({
-            "id": f"profile-m-{index}-{code}",
+            "id": f"profile-m-{index}-{code}-{cube_type}",
             "mdx": mdx,
             "display": name,
             "caption": name,
@@ -366,6 +493,7 @@ def seeded_catalog(code: str) -> dict:
     return {
         "code": code,
         "web_class": profile["cls"],
+        "cube_type": cube_type,
         "catalog": profile["catalog"],
         "cube": profile["cube"],
         "source": "PROFILE",
@@ -383,68 +511,236 @@ def seeded_catalog(code: str) -> dict:
     }
 
 
-def load_catalog(code: str) -> dict:
-    if code not in PROFILES:
-        raise ValueError("Unknown insurance category")
+def _catalog_matches(data: dict, code: str, kind: str, *, report: bool = False) -> bool:
+    cube = PROFILES[code]["cube"] if kind == "FY" else f"{code}_AGGREGATE_{kind}"
+    return (data.get("insurance_code" if report else "code") == code
+            and data.get("cube_type", "FY") == kind
+            and data.get("catalog") == PROFILES[code]["catalog"]
+            and data.get("cube") == cube
+            and isinstance(data.get("fields"), list) and bool(data["fields"])
+            and all(isinstance(f, dict) and f.get("type") in ("DIMENSION", "MEASURE")
+                    and f.get("id") for f in data["fields"]))
 
-    fallback = seeded_catalog(code)
 
-    try:
-        cached = json.loads(
-            cache_path(code).read_text(
-                encoding="utf-8"
-            )
-        )
+def load_verification_report(code: str, cube_type: str = "FY") -> dict | None:
+    path = VERIFICATION_DIR / f"{code}_{cube_type}.json"
+    reports = []
+    for candidate in [path, *VERIFICATION_DIR.glob(f"{path.stem}.recovery.*.json")]:
+        data = _read_catalog_json(candidate)
+        if data and data.get("status") == "AVAILABLE" and _catalog_matches(data, code, cube_type, report=True):
+            try:
+                reports.append((_catalog_time(data), candidate.stat().st_mtime_ns, data))
+            except OSError:
+                pass
+    return max(reports, key=lambda item: item[:2])[2] if reports else None
 
-        if not isinstance(cached, dict):
-            return fallback
 
-        if cached.get("code") != code:
-            return fallback
+def load_bundled_catalog(code: str, cube_type: str = "FY") -> dict | None:
+    data = _read_catalog_json(BUNDLED_CATALOG_DIR / cache_path(code, cube_type).name)
+    return data if data and _catalog_matches(data, code, cube_type) else None
 
-        if cached.get("cube") != fallback["cube"]:
-            return fallback
 
-        fields = cached.get("fields")
+def _field_identity(code: str, kind: str, field: dict) -> str:
+    details = field.get("details") or {}
+    if field.get("source") == "GETSTRUCTURE" and isinstance(details, dict) and details.get("CAPTION") is not None:
+        return field_id(code + "_" + kind, details)
+    if field.get("source") == "XMLA_DISCOVER" and field.get("mdx"):
+        return "xmla-" + hashlib.sha256(
+            json.dumps([code, kind, field["type"], field["mdx"]], ensure_ascii=False).encode("utf-8")
+        ).hexdigest()[:24]
+    return str(field["id"])
 
-        if not isinstance(fields, list):
-            return fallback
 
-        fields = [
-            field
-            for field in fields
-            if isinstance(field, dict)
-            and field.get("type") in (
-                "DIMENSION",
-                "MEASURE",
-            )
-            and field.get("id")
-        ]
+def _normalize_report_field(code: str, kind: str, field: dict) -> dict:
+    raw = field.get("details") or {}
+    raw = raw if isinstance(raw, dict) else {}
+    details = {k: raw[k] for k in FIELD_COLUMNS if k in raw
+               and isinstance(raw[k], (str, int, float, bool, type(None)))}
+    for key, name in (("DATATABLE", "data_table"), ("DATAFIELD", "data_field")):
+        if key not in details and isinstance(field.get(name), str):
+            details[key] = field[name]
+    caption = str(field.get("caption") or field.get("display") or "")
+    typ = field["type"]
+    status = field.get("status", "UNVERIFIED")
+    if status not in ("VERIFIED", "MAPPED", "UNVERIFIED", "UNSUPPORTED"):
+        status = "UNVERIFIED"
+    reported = status
+    mdx = field.get("mdx")
+    pattern = MEASURE_IDENTIFIER if typ == "MEASURE" else IDENTIFIER
+    if not isinstance(mdx, str) or not pattern.fullmatch(mdx) or (typ == "DIMENSION" and mdx.startswith("[Measures].")):
+        mdx = None
+        if status in ("VERIFIED", "MAPPED"):
+            status = "UNVERIFIED"
+    reason = str(field.get("mapping_reason") or "")
+    # Preserve the report status separately from execution eligibility.
+    # A base-measure Execute is not proof of a calculated UI value.
+    calculated = typ == "MEASURE" and (
+        str(details.get("DATAFIELD") or "").upper() == "CALCULATE"
+        or str(details.get("CALCULATE") or "").strip().lower() not in ("", "0", "false", "none", "null")
+        or str(details.get("SUMMARYTYPE") or "").strip().lower() not in ("", "sum"))
+    if calculated and status in ("MAPPED", "VERIFIED"):
+        status = "UNSUPPORTED"
+        reason = "Reported VERIFIED; calculation semantics not confirmed"
+    if status in ("UNVERIFIED", "UNSUPPORTED"):
+        mdx = None
+    return {
+        "id": _field_identity(code, kind, field),
+        "type": typ, "caption": caption, "display": caption,
+        "group_dimension": str(field.get("group_dimension") or details.get("GROUP_DIMENSION") or
+                               ("ข้อมูล" if typ == "MEASURE" else "มุมมอง")),
+        "dimension": str(field.get("dimension") or field.get("folder") or details.get("DIMENSION") or ""),
+        "source": str(field.get("source") or "VERIFICATION_REPORT"),
+        "mdx": mdx, "status": status, "mapping_status": status,
+        "reported_status": reported, "mapping_reason": reason,
+        "seq": details.get("SEQ", field.get("seq")), "details": details,
+        "verification_method": str(field.get("verification_method") or ""),
+        "verified_at": field.get("verified_at"),
+    }
 
-        if not fields:
-            return fallback
 
-        cached["fields"] = fields
-        cached["source"] = "CACHE"
+def _merge_catalog_fields(base: dict, incoming: dict, *, report: bool = False) -> dict:
+    code, kind = incoming["code"], incoming.get("cube_type", "FY")
+    old = {_field_identity(code, kind, f): f for f in base.get("fields", [])
+           if f.get("source") != "PROFILE"}
+    result = {}
+    for f in incoming["fields"]:
+        key = _field_identity(code, kind, f)
+        if key in result:
+            prev = result[key]
+            if (prev.get("mdx"), prev.get("status")) != (f.get("mdx"), f.get("status")):
+                result[key] = dict(prev, mdx=None, status="UNVERIFIED", mapping_status="UNVERIFIED",
+                                   mapping_reason="Conflicting duplicate field identity")
+            continue
+        previous = old.get(key)
+        item = dict(f)
+        if previous:
+            item["id"] = previous["id"]
+            if (previous.get("status") == "VERIFIED" and previous.get("mdx")
+                    and item.get("mdx") == previous.get("mdx")
+                    and item.get("status") in ("MAPPED", "VERIFIED")):
+                item.update(status="VERIFIED", mapping_status="VERIFIED")
+                if str(previous.get("verified_at") or "") > str(item.get("verified_at") or ""):
+                    for name in ("verified_at", "verification_method", "mapping_reason"):
+                        if name in previous:
+                            item[name] = previous[name]
+            if not report and previous.get("reported_status") and item.get("mdx") == previous.get("mdx"):
+                item["reported_status"] = previous["reported_status"]
+        result[key] = item
+    if not report:
+        for key, f in old.items():
+            if key not in result and f.get("source") == "XMLA_DISCOVER":
+                result[key] = f
+    merged = dict(incoming, fields=list(result.values()))
+    if not report and base.get("verification_report_counts") and not merged.get("verification_report_counts"):
+        for name in ("verification_report_counts", "report_updated_at"):
+            if name in base:
+                merged[name] = base[name]
+    merged["view_count"] = sum(f["type"] == "DIMENSION" for f in merged["fields"])
+    merged["data_count"] = sum(f["type"] == "MEASURE" for f in merged["fields"])
+    return merged
 
-        return cached
 
-    except (
-        OSError,
-        UnicodeError,
-        ValueError,
-        TypeError,
-    ):
-        return fallback
+def merge_verification_catalog(catalog: dict, report: dict) -> dict:
+    code, kind = report["insurance_code"], report["cube_type"]
+    if not _catalog_matches(report, code, kind, report=True):
+        raise ValueError("Verification report does not match cube")
+    counts = {status: 0 for status in ("VERIFIED", "MAPPED", "UNVERIFIED", "UNSUPPORTED")}
+    fields = []
+    for raw in report["fields"]:
+        field = _normalize_report_field(code, kind, raw)
+        counts[field["reported_status"]] += 1
+        fields.append(field)
+    incoming = {"code": code, "web_class": PROFILES[code]["cls"], "cube_type": kind,
+                "catalog": report["catalog"], "cube": report["cube"], "fields": fields,
+                "source": "VERIFICATION_REPORT", "refreshed_at": _catalog_time(report) or None,
+                "report_updated_at": _catalog_time(report),
+                "verification_report_counts": counts, "errors": []}
+    return _merge_catalog_fields(catalog, incoming, report=True)
+
+
+def catalog_verification_summary(catalog: dict) -> dict:
+    counts = catalog.get("verification_report_counts")
+    if not isinstance(counts, dict):
+        counts = {status: 0 for status in ("VERIFIED", "MAPPED", "UNVERIFIED", "UNSUPPORTED")}
+        for f in catalog["fields"]:
+            status = f.get("status")
+            counts[status if status in counts else "UNVERIFIED"] += 1
+    result = {k.lower(): int(counts.get(k, 0)) for k in
+              ("VERIFIED", "MAPPED", "UNVERIFIED", "UNSUPPORTED")}
+    result["total"] = sum(result.values())
+    result["coverage"] = 100 * result["verified"] / result["total"] if result["total"] else 0.0
+    result["selectable"] = sum(f.get("status") in ("VERIFIED", "MAPPED") and bool(f.get("mdx"))
+                               for f in catalog["fields"])
+    result["reported"] = "verification_report_counts" in catalog
+    return result
+
+
+def load_catalog(code: str, cube_type: str = "FY") -> dict:
+    if code not in PROFILES or cube_type not in CUBE_TYPES:
+        raise ValueError("Unknown insurance category / cube type")
+    bundled = load_bundled_catalog(code, cube_type)
+    local = _read_catalog_json(cache_path(code, cube_type))
+    if local and not _catalog_matches(local, code, cube_type):
+        local = None
+    catalog = dict(bundled, source="BUNDLED_CATALOG") if bundled else (local or seeded_catalog(code, cube_type))
+    if local and (not bundled or _catalog_time(local) >= _catalog_time(bundled)):
+        catalog = dict(_merge_catalog_fields(catalog, local), source="CACHE")
+    report = load_verification_report(code, cube_type)
+    if report and (not catalog.get("verification_report_counts")
+                   or _catalog_time(report) > str(catalog.get("report_updated_at") or "")):
+        catalog = merge_verification_catalog(catalog, report)
+    return catalog
+
+
+def _replace_catalog_file(temporary: Path, destination: Path) -> None:
+    for attempt in range(6):
+        try:
+            temporary.replace(destination)
+            return
+        except PermissionError:
+            if attempt == 5:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+
+
+def export_verified_catalogs() -> dict:
+    # All reports must be present before generating the distributable catalog.
+    prepared, index = {}, {}
+    for code in PROFILES:
+        for kind in CUBE_TYPES:
+            report = load_verification_report(code, kind)
+            if report is None:
+                raise ValueError(f"Missing valid AVAILABLE report: {code}/{kind}")
+            catalog = merge_verification_catalog(load_catalog(code, kind), report)
+            catalog["source"] = "BUNDLED_CATALOG"
+            prepared[cache_path(code, kind).name] = catalog
+            index.setdefault(code, {})[kind] = {
+                "status": "AVAILABLE", "cube": catalog["cube"],
+                "year": _year_from_fields(catalog["fields"], kind),
+                "checked_at": _catalog_time(report), "source": "VERIFICATION_REPORT",
+            }
+    BUNDLED_CATALOG_DIR.mkdir(parents=True, exist_ok=True)
+    for name, data in [*prepared.items(), ("cube_types.json", index)]:
+        path = BUNDLED_CATALOG_DIR / name
+        temp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        try:
+            temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            _replace_catalog_file(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
+    return {"cubes": len(prepared), "fields": sum(catalog_verification_summary(c)["total"]
+                                                  for c in prepared.values()),
+            "directory": str(BUNDLED_CATALOG_DIR)}
 
 
 def save_catalog(catalog: dict) -> None:
     code = catalog.get("code")
+    cube_type = catalog.get("cube_type", "FY")
 
     if code not in PROFILES:
         raise ValueError("Invalid catalog category")
 
-    if catalog.get("cube") != PROFILES[code]["cube"]:
+    if catalog.get("cube") != cube_profile(code, cube_type, discovery=True)["cube"]:
         raise ValueError("Invalid catalog cube")
 
     fields = catalog.get("fields")
@@ -459,8 +755,9 @@ def save_catalog(catalog: dict) -> None:
         exist_ok=True,
     )
 
-    destination = cache_path(code)
-    temporary = destination.with_suffix(".tmp")
+    destination = cache_path(code, cube_type)
+    temporary = destination.with_name(
+        destination.name + "." + uuid.uuid4().hex + ".tmp")
 
     try:
         temporary.write_text(
@@ -473,7 +770,7 @@ def save_catalog(catalog: dict) -> None:
             encoding="utf-8",
         )
 
-        temporary.replace(destination)
+        _replace_catalog_file(temporary, destination)
 
     finally:
         temporary.unlink(missing_ok=True)
@@ -593,6 +890,9 @@ def create_webform_session(
 
     return session
 
+# FILE: oic_query.py
+# ตำแหน่งที่ 1: บรรทัด ~677
+# แทนที่ฟังก์ชัน discover_webform_authorizations() ทั้งฟังก์ชัน
 
 def discover_webform_authorizations(
     session,
@@ -665,10 +965,6 @@ def discover_webform_authorizations(
         if values
     ):
         return auth
-
-    # Only inspect same-origin JavaScript referenced by the page.
-    # Inline page scripts are preferred; external scripts are
-    # fetched only if required Authorization values are missing.
 
     script_pattern = re.compile(
         r"""<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["']""",
@@ -865,6 +1161,7 @@ def post_webform_method(
     referer: str,
     *,
     timeout: int = 30,
+    profile: dict | None = None,
 ) -> list:
     """
     Send the original ASP.NET WebMethod request.
@@ -945,6 +1242,7 @@ def normalize_template_records(
     code: str,
     menu_records: list,
     binding_records: list,
+    profile: dict | None = None,
 ) -> list[dict]:
     """
     GET_MENUTEMPLATE_LIST:
@@ -957,7 +1255,7 @@ def normalize_template_records(
     Combine both formats without inventing MDX mappings.
     """
 
-    profile = PROFILES[code]
+    profile = profile or PROFILES[code]
 
     result = []
 
@@ -1046,6 +1344,7 @@ def normalize_getstructure(
     *,
     templates: list | None = None,
     xmla: list | None = None,
+    profile: dict | None = None,
 ) -> dict:
     """
     CAPTION is preserved exactly as returned by OIC.
@@ -1069,7 +1368,7 @@ def normalize_getstructure(
             "GetStructure must return a nonempty array"
         )
 
-    profile = PROFILES[code]
+    profile = profile or PROFILES[code]
 
     template_index: dict[
         tuple,
@@ -1174,6 +1473,7 @@ def normalize_getstructure(
             set(),
         ).add(mdx)
 
+    discovered = {(item.get("type"), item.get("mdx")) for item in xmla or []}
     fields = []
 
     for index, row in enumerate(raw):
@@ -1228,6 +1528,17 @@ def normalize_getstructure(
                         set(),
                     )
                 )
+
+        if not candidates:
+            # Match SQL source names only against actual XMLA Discover results.
+            table = str(row.get("DATATABLE") or "").replace("_", " ").upper()
+            column = str(row.get("DATAFIELD") or "").replace("_", " ").upper()
+            direct = {mdx for discovered_type, mdx in discovered
+                      if discovered_type == kind and isinstance(mdx, str)
+                      and (mdx.upper() == f"[{table}].[{column}]"
+                           or (kind == "MEASURE" and mdx.upper() == f"[MEASURES].[{column}]"))}
+            if len(direct) == 1:
+                candidates = {(next(iter(direct)), False)}
 
         if not candidates:
             candidates = {
@@ -1286,8 +1597,12 @@ def normalize_getstructure(
             for key in FIELD_COLUMNS
         }
 
+        reason = ("Exact MDX mapping from OIC metadata" if status == "MAPPED"
+                  else "Calculated/derived field" if derived
+                  else "No unique MDX mapping found" if not mapped_names
+                  else "Ambiguous MDX mappings")
         fields.append({
-            "id": field_id(code, row),
+            "id": field_id(code + "_" + profile.get("cube_type", "FY"), row),
             "mdx": mdx,
             "display": caption,
             "caption": caption,
@@ -1297,6 +1612,7 @@ def normalize_getstructure(
             "source": "GETSTRUCTURE",
             "status": status,
             "mapping_status": status,
+            "mapping_reason": reason,
             "seq": row.get("SEQ"),
             "details": retained,
         })
@@ -1309,6 +1625,7 @@ def normalize_getstructure(
     return {
         "code": code,
         "web_class": profile["cls"],
+        "cube_type": profile.get("cube_type", "FY"),
         "cube": profile["cube"],
         "catalog": profile["catalog"],
         "source": "LIVE",
@@ -1335,6 +1652,7 @@ def normalize_getstructure(
 def make_discover_request(
     code: str,
     request_type: str,
+    profile: dict | None = None,
 ) -> bytes:
     supported = {
         "MDSCHEMA_DIMENSIONS",
@@ -1354,7 +1672,7 @@ def make_discover_request(
             "Unknown insurance category"
         )
 
-    profile = PROFILES[code]
+    profile = profile or PROFILES[code]
 
     envelope = ET.Element(
         f"{{{SOAP_NS}}}Envelope"
@@ -1428,8 +1746,11 @@ def discover_xmla_metadata(
     referer: str,
     *,
     timeout: int = 30,
+    profile: dict | None = None,
 ) -> tuple[list[dict], list[str]]:
     import requests
+
+    profile = profile or PROFILES[code]
 
     fields = []
     errors = []
@@ -1458,6 +1779,7 @@ def discover_xmla_metadata(
                 data=make_discover_request(
                     code,
                     kind,
+                    profile=profile,
                 ),
                 headers=headers,
                 timeout=(10, timeout),
@@ -1535,12 +1857,17 @@ def discover_xmla_metadata(
 # LIVE FIVE-CUBE FIELD DISCOVERY
 # ============================================================
 
+# FILE: oic_query.py
+# ตำแหน่งที่ 2: บรรทัด ~1641
+# แทนที่ฟังก์ชัน discover_fields() ทั้งฟังก์ชัน
+
 def discover_fields(
     code: str,
     token: str,
     cookie: str,
     *,
     timeout: int = 30,
+    cube_type: str = "FY",
 ) -> dict:
     """
     Discover the complete field catalog for one OIC cube.
@@ -1572,7 +1899,11 @@ def discover_fields(
             f"{code}: OIC_COOKIE is missing"
         )
 
-    profile = PROFILES[code]
+    profile = cube_profile(
+        code,
+        cube_type,
+        discovery=True,
+    )
 
     referer = (
         f"{WEBFORM}?Class={profile['cls']}"
@@ -1581,20 +1912,14 @@ def discover_fields(
     errors = []
 
     with create_webform_session(cookie) as session:
-        # Authentication values must come from the
-        # current WebForm page, not an unrelated JWT.
 
-        authorizations = (
-            discover_webform_authorizations(
-                session,
-                code,
-                timeout=timeout,
-            )
+        authorizations = discover_webform_authorizations(
+            session,
+            code,
+            timeout=timeout,
         )
 
-        # ----------------------------------------------------
-        # MANDATORY: GETSTRUCTURE
-        # ----------------------------------------------------
+        # GETSTRUCTURE
 
         structure = post_webform_method(
             session=session,
@@ -1611,13 +1936,9 @@ def discover_fields(
         )
 
         if not structure:
-            raise ValueError(
-                f"{code}: GetStructure returned zero fields"
-            )
+            raise ValueError(f"{code}/{cube_type}: empty GetStructure; saved catalog kept")
 
-        # ----------------------------------------------------
-        # OPTIONAL: TEMPLATE MENU
-        # ----------------------------------------------------
+        # TEMPLATE MENU
 
         menu_records = []
 
@@ -1640,9 +1961,7 @@ def discover_fields(
                 f"GET_MENUTEMPLATE_LIST: {exc}"
             )
 
-        # ----------------------------------------------------
-        # OPTIONAL: EXISTING PIVOT MAPPINGS
-        # ----------------------------------------------------
+        # EXISTING PIVOT MAPPINGS
 
         binding_records = []
 
@@ -1670,43 +1989,128 @@ def discover_fields(
             code,
             menu_records,
             binding_records,
+            profile=profile,
         )
 
-        # ----------------------------------------------------
-        # OPTIONAL: XMLA METADATA
-        # ----------------------------------------------------
+        # XMLA METADATA
 
-        xmla_fields, xmla_errors = (
-            discover_xmla_metadata(
-                session,
-                code,
-                token,
-                referer,
-                timeout=timeout,
-            )
+        xmla_fields, xmla_errors = discover_xmla_metadata(
+            session,
+            code,
+            token,
+            referer,
+            timeout=timeout,
+            profile=profile,
         )
 
         errors.extend(xmla_errors)
 
-    # --------------------------------------------------------
     # NORMALIZE CATALOG
-    # --------------------------------------------------------
 
     catalog = normalize_getstructure(
         code,
         structure,
         templates=templates,
         xmla=xmla_fields,
+        profile=profile,
     )
 
+    if xmla_errors or not xmla_fields:
+        raise ValueError(f"{code}/{cube_type}: incomplete XMLA metadata; saved catalog kept")
     catalog["errors"] = errors
     catalog["source"] = "LIVE"
+    existing = load_catalog(code, cube_type)
+    catalog = _merge_catalog_fields(existing, catalog)
+    # Retain a confirmed mapping only when its identifier still exists in live XMLA.
+    previous = {_field_identity(code, cube_type, f): f for f in existing["fields"]}
+    identifiers = {f.get("mdx") for f in xmla_fields}
+    for field in catalog["fields"]:
+        old = previous.get(_field_identity(code, cube_type, field))
+        if (old and old.get("status") == "VERIFIED" and old.get("mdx") in identifiers
+                and field.get("status") == "UNVERIFIED" and not field.get("mdx")
+                and field.get("mapping_reason") == "No unique MDX mapping found"):
+            for key in ("mdx", "status", "mapping_status", "verified_at", "verification_method", "mapping_reason", "reported_status"):
+                if key in old:
+                    field[key] = old[key]
 
-    # Never save secrets or partial invalid catalogs.
+    year = next(
+        (
+            field["mdx"]
+            for field in catalog["fields"]
+            if field.get("mdx")
+            and field["mdx"].upper().endswith(
+                f".[{cube_type} YEAR]"
+            )
+        ),
+        None,
+    )
+
+    if cube_type != "FY":
+        save_cube_status(
+            code,
+            cube_type,
+            "AVAILABLE",
+            profile["cube"],
+            year,
+        )
 
     save_catalog(catalog)
 
     return catalog
+
+def verify_field(code: str, cube_type: str, field_id_value: str,
+                 token: str, cookie: str, *, timeout: int = 30) -> dict:
+    """Small real XMLA Execute. Only mapped identifiers can be verified."""
+    import requests
+    catalog = load_catalog(code, cube_type)
+    selected = next((f for f in catalog["fields"]
+                     if f.get("id") == field_id_value), None)
+    if not selected or selected.get("status") not in ("MAPPED", "VERIFIED"):
+        raise ValueError("A unique MAPPED field is required for XMLA verification")
+    dimensions = [f["mdx"] for f in catalog["fields"]
+                  if f["type"] == "DIMENSION" and f.get("mdx")
+                  and f.get("status") in ("MAPPED", "VERIFIED")]
+    measures = [f["mdx"] for f in catalog["fields"]
+                if f["type"] == "MEASURE" and f.get("mdx")
+                and f.get("status") in ("MAPPED", "VERIFIED")]
+    if selected["type"] == "DIMENSION":
+        dimensions.insert(0, selected["mdx"])
+    else:
+        measures.insert(0, selected["mdx"])
+    if not dimensions or not measures:
+        raise ValueError("Verification needs one mapped Dimension and one mapped Measure")
+    profile = cube_profile(code, cube_type)
+    mdx = (f"SELECT {{{measures[0]}}} ON COLUMNS, "
+           f"Subset({dimensions[0]}.AllMembers,0,1) ON ROWS "
+           f"FROM [{profile['cube']}] CELL PROPERTIES VALUE")
+    envelope = ET.Element(f"{{{SOAP_NS}}}Envelope")
+    body = ET.SubElement(envelope, f"{{{SOAP_NS}}}Body")
+    execute = ET.SubElement(body, f"{{{XMLA_NS}}}Execute")
+    command = ET.SubElement(execute, f"{{{XMLA_NS}}}Command")
+    ET.SubElement(command, f"{{{XMLA_NS}}}Statement").text = mdx
+    properties = ET.SubElement(ET.SubElement(
+        execute, f"{{{XMLA_NS}}}Properties"), f"{{{XMLA_NS}}}PropertyList")
+    ET.SubElement(properties, f"{{{XMLA_NS}}}Catalog").text = profile["catalog"]
+    ET.SubElement(properties, f"{{{XMLA_NS}}}ShowHiddenCubes").text = "True"
+    with create_webform_session(cookie) as session:
+        response = session.post(PROXY_URL, data=ET.tostring(envelope, encoding="utf-8"),
+            headers={"Authorization": "Bearer " + normalize_token(token),
+                     "Content-Type": "text/xml",
+                     "Origin": BASE_URL,
+                     "Referer": WEBFORM + "?Class=" + profile["cls"]},
+            timeout=(10, timeout), allow_redirects=False)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        if any(local_name(node.tag) == "Fault" for node in root.iter()):
+            raise ValueError("XMLA SOAP Fault (field not verified)")
+        if not any(local_name(node.tag) == "Axes" for node in root.iter()):
+            raise ValueError("XMLA response is missing Axes")
+    selected["status"] = "VERIFIED"
+    selected["mapping_status"] = "VERIFIED"
+    selected["mapping_reason"] = "XMLA Execute returned valid dataset"
+    selected["verified_at"] = datetime.now(timezone.utc).isoformat()
+    save_catalog(catalog)
+    return selected
 
 
 # ============================================================
@@ -1724,7 +2128,7 @@ def validate_query(
             "Select AH/FI/MR/MI/MV"
         )
 
-    profile = PROFILES[code]
+    profile = cube_profile(code, config.get("cube_type", "FY"))
 
     if (
         config.get("catalog") != profile["catalog"]
@@ -2067,9 +2471,7 @@ def build_mdx(
         columns = x
         rows = f"CrossJoin({y},{measures})"
 
-    cube = PROFILES[
-        config["code"]
-    ]["cube"]
+    cube = cube_profile(config["code"], config.get("cube_type", "FY"))["cube"]
 
     return (
         f"SELECT {columns} "
@@ -2166,6 +2568,7 @@ def query_hash(config: dict) -> str:
             "run_id",
             "created_at",
             "output",
+            "output_root",
         )
     }
 
@@ -2382,3 +2785,17 @@ def excel_records(
                     "last_data_update"
                 ],
             }
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="OIC verified catalog export")
+    parser.add_argument("--export-verified-catalog", action="store_true")
+    args = parser.parse_args()
+    if args.export_verified_catalog:
+        try:
+            print(json.dumps(export_verified_catalogs(), ensure_ascii=False, indent=2))
+        except (OSError, ValueError) as exc:
+            parser.exit(1, f"Catalog export failed: {exc}\n")
+    else:
+        parser.print_help()

@@ -96,6 +96,7 @@ class PrepareMonitor:
         self.plan={"index":0,"total":0,"primary":0,"recovery":0,"current_primary":0,"current_recovery":0}
         self.stats={"ok":0,"failed":0,"retries":0,"bytes":0,"http":0,"duration":0.0}
         self.summary={}
+        self.discovery={}
         self.live=None
         self.handler=None
 
@@ -171,6 +172,9 @@ class PrepareMonitor:
                         status="INVENTORY READY" if done==total else "INCOMPLETE")
                 for cube in self.summary.get("unavailable_cubes",[]):
                     self.cubes[cube]["status"]="UNAVAILABLE"
+            elif event=="discovery":
+                self.discovery=dict(data)
+                message=data.get("message")
             elif event=="activity":
                 message=data["message"]
         if message:
@@ -244,6 +248,7 @@ class PrepareMonitor:
             stats=dict(self.stats)
             profile_count=len(self.profiles)
             summary=self.summary
+            discovery=dict(self.discovery)
         now=time.monotonic()
         elapsed=int(now-self.started)
         total_fields=sum(v["fields"] for v in catalogs.values())
@@ -264,6 +269,8 @@ class PrepareMonitor:
         current_total=current.get("total") or 0
         progress=Text(f"Current hierarchy coverage: {current.get('done',0)}/{current_total}" if current_total else "Current hierarchy coverage: pending")
         header=[overview,progress]
+        if discovery and phase in ("CARDINALITY","MEMBER_DISCOVERY"):
+            header.append(Text(discovery.get("message",""),no_wrap=True,overflow="ellipsis",style="cyan"))
         if current_total and not compact:
             header.append(ProgressBar(total=current_total,completed=current.get("done",0),width=40))
         parts=[Panel(Group(*header),title="OIC ALL DIMENSION V2 / PREPARE",border_style="cyan")]
@@ -410,22 +417,72 @@ def retry_after(value):
 
 
 class CollectionError(RuntimeError):
-    def __init__(self,kind,message="",delay=0):
+    def __init__(self,kind,message="",delay=0,*,endpoint=None,http_status=None):
         super().__init__(f"{kind}: {message}" if message else kind)
         self.kind=kind
         self.delay=delay
+        self.endpoint=endpoint
+        self.http_status=http_status
 
 
-def classify_http(status,headers):
+def extract_error_details(body):
+    """Classify bounded error content; never return arbitrary server text."""
+    text=body[:65536].decode("utf-8",errors="replace")
+    lower=text.casefold()
+    if "session_expired" in lower or "session expired" in lower:
+        return "AUTH_COOKIE_EXPIRED"
+    if "token expired" in lower or "expired token" in lower:
+        return "AUTH_TOKEN_EXPIRED"
+    try:
+        root=ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    faults=[e for e in root.iter() if local(e.tag) in ("Fault","Error")]
+    if not faults:
+        return None
+    # Interpret known phrases only inside a structured XMLA fault.
+    if any(v in lower for v in ("not supported","not implemented","unsupported rowset","invalid restriction")):
+        return "DISCOVER_NOT_SUPPORTED"
+    if any(v in lower for v in ("resource limit","query too complex","maximum number of cells",
+                                 "memory limit","response too large","query timeout","query timed out")):
+        return "QUERY_SCOPE_ERROR"
+    if any(v in lower for v in ("access denied","permission denied","not authorized")):
+        return "ACCESS_DENIED"
+    if any(v in lower for v in ("syntax error","cannot be found","not found in the cube",
+                                 "unknown member","invalid member","invalid measure")):
+        return "QUERY_FAULT"
+    return "XMLA_FAULT_UNKNOWN"
+
+
+def bounded_error_body(response):
+    result=bytearray()
+    for chunk in response.iter_content():
+        remaining=65536-len(result)
+        result.extend(chunk[:remaining])
+        if len(result)>=65536:
+            break
+    return bytes(result)
+
+
+def classify_http(status,headers,endpoint="XMLA",body=b""):
+    delay=max(5,retry_after(headers.get("Retry-After")))
+    diagnostic=extract_error_details(body)
     if status==401:
-        return CollectionError("AUTH_TOKEN_EXPIRED","HTTP 401")
-    if status==403:
-        return CollectionError("ACCESS_DENIED","HTTP 403")
-    if status==429:
-        return CollectionError("RATE_LIMITED","HTTP 429",max(5,retry_after(headers.get("Retry-After"))))
-    if status in (408,425,500,502,503,504):
-        return CollectionError("SERVER_UNAVAILABLE",f"HTTP {status}",max(5,retry_after(headers.get("Retry-After"))))
-    return CollectionError("INVALID_QUERY",f"HTTP {status}")
+        kind="AUTH_COOKIE_EXPIRED" if endpoint=="GEN_TOKEN" else "AUTH_TOKEN_EXPIRED"
+    elif status==403:
+        kind="ACCESS_DENIED"
+    elif status==429:
+        kind="RATE_LIMITED"
+    elif status in (408,425,502,503,504):
+        kind="SERVER_UNAVAILABLE"
+    elif endpoint=="GEN_TOKEN":
+        kind=diagnostic if diagnostic in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","ACCESS_DENIED") else "AUTH_ENDPOINT_ERROR"
+    elif status==500:
+        kind=diagnostic if diagnostic not in (None,"XMLA_FAULT_UNKNOWN") else "HTTP_500_UNKNOWN"
+    else:
+        kind=diagnostic or "INVALID_QUERY"
+    return CollectionError(kind,f"{endpoint} HTTP {status}"+(f" | {diagnostic}" if diagnostic else ""),
+                           delay,endpoint=endpoint,http_status=status)
 
 
 def classify_network(exc):
@@ -445,6 +502,8 @@ class OICClient:
         self.token=""
         self.web_class=None
         self.env_signature=None
+        self.env_token=""
+        self.token_scope=None
         self.reload_credentials(force=True)
 
     def observe(self,stage,**data):
@@ -461,13 +520,16 @@ class OICClient:
         cookie=env.get("OIC_COOKIE","").removeprefix("Cookie:").strip()
         token=env.get("OIC_BEARER_TOKEN","").removeprefix("Bearer ").strip()
         changed=cookie!=self.cookie
-        self.cookie=cookie
-        self.token=token
+        token_changed=token!=self.env_token
         self.env_signature=signature
+        self.cookie=cookie
+        self.env_token=token
+        if changed or token_changed or force:
+            self.token=token
+            self.token_scope=env.get("OIC_CLASS") or None
         if changed or self.session is None:
             self.reconnect()
-        self.web_class=None
-        return True
+        return changed or token_changed or force
 
     def reconnect(self):
         if self.session is not None:
@@ -482,10 +544,9 @@ class OICClient:
         cls=profile.get("cls") or profile.get("web_class")
         if not cls:
             raise CollectionError("INVALID_QUERY","Missing Web Class")
-        if self.web_class!=cls:
-            # Token scope may depend on the selected WebForm class.
-            self.web_class=cls
-            self.token=""
+        self.web_class=cls
+        # Keep a usable scoped token; unscoped .env tokens cannot prove class compatibility.
+        # Refresh once on the first class, or when the known class changes.
 
     def referer(self):
         return BASE_URL+PAGE_PATH+"?Class="+self.web_class
@@ -502,24 +563,36 @@ class OICClient:
                          "Origin":BASE_URL,"Referer":self.referer(),"Cookie":self.cookie},
                 timeout=(15,45),allow_redirects=False)
         except RequestException as exc:
-            raise classify_network(exc) from None
+            error=classify_network(exc)
+            raise CollectionError("AUTH_ENDPOINT_ERROR",f"GEN_TOKEN | {error.kind}",5,endpoint="GEN_TOKEN") from None
         if response.status_code!=200:
             if response.status_code==401:
                 raise CollectionError("AUTH_COOKIE_EXPIRED","GenToken rejected session")
-            raise classify_http(response.status_code,response.headers)
+            raise classify_http(response.status_code,response.headers,"GEN_TOKEN",response.content[:65536])
         try:
             token=response.json().get("d","")
         except (ValueError,AttributeError):
-            raise CollectionError("AUTH_COOKIE_EXPIRED","GenToken did not return usable JSON") from None
-        if not isinstance(token,str) or token=="SESSION_EXPIRED":
-            raise CollectionError("AUTH_COOKIE_EXPIRED","Update OIC_COOKIE in .env")
+            raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken did not return usable JSON",5,endpoint="GEN_TOKEN") from None
+        if token=="SESSION_EXPIRED":
+            raise CollectionError("AUTH_COOKIE_EXPIRED","Update OIC_COOKIE in .env",endpoint="GEN_TOKEN")
+        if not isinstance(token,str):
+            raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken returned unexpected token type",5,endpoint="GEN_TOKEN")
         if jwt_exp(token)<=time.time()+30:
-            raise CollectionError("AUTH_COOKIE_EXPIRED","GenToken returned unusable JWT")
+            raise CollectionError("AUTH_ENDPOINT_ERROR","GenToken returned unusable JWT",5,endpoint="GEN_TOKEN")
         self.token=token.removeprefix("Bearer ").strip()
+        self.token_scope=self.web_class
 
     def ensure_token(self):
-        if jwt_exp(self.token)<=time.time()+60:
+        if self.token_scope==self.web_class and jwt_exp(self.token)>time.time()+60:
+            return
+        try:
             self.refresh_token()
+        except CollectionError as exc:
+            if (exc.kind=="AUTH_ENDPOINT_ERROR" and self.token_scope==self.web_class
+                    and jwt_exp(self.token)>time.time()+10):
+                self.observe("REUSING VALID TOKEN")
+                return
+            raise
 
     def execute_once(self,profile,payload,timeout,destination=None):
         self.reload_credentials()
@@ -539,10 +612,12 @@ class OICClient:
                     timeout=(15,timeout),allow_redirects=False) as response:
                     headers_at=time.monotonic()
                     self.observe("HEADERS RECEIVED",http_status=response.status_code)
-                    if response.status_code in (401,403) and attempt==0:
-                        retry_auth=True
-                    elif response.status_code!=200:
-                        raise classify_http(response.status_code,response.headers)
+                    if response.status_code!=200:
+                        error=classify_http(response.status_code,response.headers,"XMLA",bounded_error_body(response))
+                        if error.kind=="AUTH_TOKEN_EXPIRED" and attempt==0:
+                            retry_auth=True
+                        else:
+                            raise error
                     else:
                         retry_auth=False
                         size=0
@@ -818,11 +893,11 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
         db.fail(r,message,"RETRY")
     elif kind=="AUTH_COOKIE_EXPIRED":
         db.fail(r,message,"RETRY",5)
-    elif kind in ("RATE_LIMITED","SERVER_UNAVAILABLE"):
+    elif kind in ("RATE_LIMITED","SERVER_UNAVAILABLE","HTTP_500_UNKNOWN","AUTH_ENDPOINT_ERROR"):
         delay=max(5,exc.delay,2**r["attempts"])
         db.pressure(rid,delay)
         db.fail(r,message,"RETRY" if r["attempts"]<MAX_ATTEMPTS else "FAILED",delay)
-    elif kind in ("RESPONSE_TOO_LARGE","SOAP_FAULT","RESPONSE_TIMEOUT","INVALID_QUERY"):
+    elif kind in ("RESPONSE_TOO_LARGE","SOAP_FAULT","QUERY_FAULT","QUERY_SCOPE_ERROR","RESPONSE_TIMEOUT","INVALID_QUERY"):
         if kind=="RESPONSE_TIMEOUT" and r["attempts"]<2:
             db.pressure(rid,10)
             db.fail(r,message,"RETRY",10)
@@ -847,7 +922,7 @@ def execute_resilient(db,client,r,rid=None,owner=None,probe=False):
         return {"ok":True,**metrics}
     except (CollectionError,sqlite3.Error,OSError,ValueError) as exc:
         handle_request_failure(db,client,r,exc,rid,probe)
-        return {"ok":False,"pressure":getattr(exc,"kind","") in ("RATE_LIMITED","SERVER_UNAVAILABLE","RESPONSE_TIMEOUT"),
+        return {"ok":False,"pressure":getattr(exc,"kind","") in ("RATE_LIMITED","SERVER_UNAVAILABLE","HTTP_500_UNKNOWN","AUTH_ENDPOINT_ERROR","RESPONSE_TIMEOUT"),
                 "error":getattr(exc,"kind",type(exc).__name__),"delay":getattr(exc,"delay",0)}
 
 
@@ -1069,32 +1144,85 @@ def run_prepare(db):
         if not client.cookie:
             raise RuntimeError("Set OIC_COOKIE in local .env")
 
-        def transport(profile,payload,timeout):
-            phase,detail=monitor.context()
+        health_checks={}
+        unknown_streak=0
+
+        def monitored_call(profile,payload,timeout,phase,detail,attempt):
             cube=f"{profile['code']}/{profile['cube_type']}"
-            for attempt in range(MAX_ATTEMPTS):
-                key=uuid.uuid4().hex
-                monitor.request_started(key,cube,detail,timeout,attempt+1,phase)
-                client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
+            key=uuid.uuid4().hex
+            monitor.request_started(key,cube,detail,timeout,attempt,phase)
+            client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
+            try:
+                data,metrics=client.execute_once(profile,payload,timeout)
+                # HTTP 200 can still carry a SOAP fault or session error.
+                if phase!="HEALTH_CHECK":
+                    diagnostic=extract_error_details(data)
+                    if diagnostic:
+                        raise CollectionError(diagnostic,"XMLA error response",5,endpoint="XMLA",http_status=200)
+                monitor.request_finished(key,True,metrics)
+                return data
+            except BaseException as exc:
+                monitor.request_finished(key,False,error=str(exc) if isinstance(exc,CollectionError) else type(exc).__name__)
+                raise
+            finally:
+                client.observer=None
+
+        def cooldown(profile,delay,reason):
+            cube=f"{profile['code']}/{profile['cube_type']}"
+            key=uuid.uuid4().hex
+            monitor.request_started(key,cube,reason,delay,kind="RECOVERY")
+            monitor.retry(key,delay)
+            try:
+                wait_seconds(delay)
+            finally:
+                monitor.request_finished(key,False,error="Cooldown completed")
+
+        def check_cube_health(profile):
+            from oic_all_dim_prepare import build_discover_request,parse_discover_rows
+            cube=f"{profile['code']}/{profile['cube_type']}"
+            last=health_checks.get(cube)
+            if last is not None and time.monotonic()-last<60:
+                return True
+            try:
+                data=monitored_call(profile,build_discover_request(profile,"MDSCHEMA_HIERARCHIES"),
+                                    30,"HEALTH_CHECK","Small hierarchy metadata request",1)
+                if not parse_discover_rows(data):
+                    raise ValueError("Empty health response")
+            except (RuntimeError,ValueError) as exc:
+                raise CollectionError("SERVER_UNAVAILABLE","XMLA health check failed",5,endpoint="XMLA") from exc
+            health_checks[cube]=time.monotonic()
+            return True
+
+        def transport(profile,payload,timeout):
+            nonlocal unknown_streak
+            phase,detail=monitor.context()
+            for attempt in range(1,MAX_ATTEMPTS+1):
                 try:
-                    data,metrics=client.execute_once(profile,payload,timeout)
-                    monitor.request_finished(key,True,metrics)
+                    data=monitored_call(profile,payload,timeout,phase,detail,attempt)
+                    unknown_streak=0
                     return data
                 except CollectionError as exc:
-                    if exc.kind not in ("RATE_LIMITED","SERVER_UNAVAILABLE","NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","RESPONSE_TIMEOUT") or attempt==MAX_ATTEMPTS-1:
-                        monitor.request_finished(key,False,error=exc.kind)
+                    kind=exc.kind
+                    if kind in ("QUERY_SCOPE_ERROR","QUERY_FAULT","DISCOVER_NOT_SUPPORTED","RESPONSE_TOO_LARGE"):
                         raise
-                    delay=max(2**attempt,exc.delay,5)
-                    monitor.retry(key,delay)
-                    try:
-                        wait_seconds(delay)
-                    finally:
-                        monitor.request_finished(key,False,error=exc.kind)
-                except BaseException as exc:
-                    monitor.request_finished(key,False,error=type(exc).__name__)
-                    raise
-                finally:
-                    client.observer=None
+                    if kind in ("HTTP_500_UNKNOWN","RESPONSE_TIMEOUT","XMLA_FAULT_UNKNOWN") and exc.endpoint!="GEN_TOKEN":
+                        # Do not repeat the same large request three times.
+                        # A responsive small query permits a bounded local fallback,
+                        # but is not proof the original error was size-related.
+                        unknown_streak+=1
+                        cooldown(profile,max(5,exc.delay),"Unclassified XMLA failure; checking endpoint")
+                        if unknown_streak>3:
+                            raise CollectionError("SERVER_UNAVAILABLE","Repeated unexplained XMLA failures; stopping",5) from exc
+                        check_cube_health(profile)
+                        raise CollectionError("DISCOVERY_SCOPE_UNCONFIRMED",
+                                              f"{kind}; small metadata request succeeded",5,endpoint="XMLA",
+                                              http_status=exc.http_status) from exc
+                    if kind not in ("RATE_LIMITED","SERVER_UNAVAILABLE","NETWORK_ERROR","DNS_ERROR",
+                                    "CONNECTION_RESET","AUTH_ENDPOINT_ERROR","AUTH_TOKEN_EXPIRED") or attempt>=MAX_ATTEMPTS:
+                        raise
+                    if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
+                        client.reconnect()
+                    cooldown(profile,max(2**attempt,exc.delay,5),str(exc))
             raise RuntimeError("Discovery retry budget exhausted")
 
         def probe(req,profile,parallel=False):
@@ -1122,7 +1250,7 @@ def run_prepare(db):
                     monitor.retry(key,delay)
                     wait_seconds(delay)
                 monitor.request_finished(key,result.get("ok",False),result,error=result.get("error"))
-                if result.get("error") in ("AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR","DISK_FULL","SOURCE_VERSION_CHANGED"):
+                if result.get("error") in ("AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR","DISK_FULL","SOURCE_VERSION_CHANGED","AUTH_ENDPOINT_ERROR"):
                     raise CollectionError(result["error"],"Preparation probe stopped")
                 return result
             except BaseException as exc:

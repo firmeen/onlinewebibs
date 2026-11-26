@@ -199,7 +199,8 @@ class PrepareMonitor:
                 row["stage_at"]=time.monotonic()
             row.update(data)
         if stage not in ("RECEIVING",):
-            log(f"{key[:12]} | {stage}")
+            suffix=f" | HTTP {data['http_status']}" if "http_status" in data else ""
+            log(f"{key[:12]} | {stage}{suffix}")
 
     def request_finished(self,key,ok,metrics=None,error=None):
         metrics=metrics or {}
@@ -212,8 +213,11 @@ class PrepareMonitor:
                 self.stats["http"]+=1
                 self.stats["bytes"]+=metrics.get("response_bytes",0)
                 self.stats["duration"]+=metrics.get("duration",0)
+        timing=f" | {metrics['response_bytes']:,} bytes" if "response_bytes" in metrics else ""
+        if "response_wait_estimate" in metrics:
+            timing+=f" | response wait estimate {metrics['response_wait_estimate']:.2f}s"
         log(f"{row['cube']} | {row['kind']} | {'OK' if ok else 'FAILED'} | "
-            f"{time.monotonic()-row['started']:.2f}s | {error or ''}")
+            f"{time.monotonic()-row['started']:.2f}s{timing} | {error or ''}")
 
     def retry(self,key,seconds):
         with self.lock:
@@ -253,7 +257,16 @@ class PrepareMonitor:
         overview.append(f"Catalogs {len(catalogs)}/15  |  Fields {total_fields:,}  |  Source {source}\n")
         overview.append(f"Inventories ready {ready}/15  |  Validated hierarchies {done:,}  |  Members {members:,}\n")
         overview.append(detail,style="yellow")
-        parts=[Panel(overview,title="OIC ALL DIMENSION V2 / PREPARE",border_style="cyan")]
+        height=self.console.height
+        compact=height<40
+        overview.no_wrap=True
+        overview.overflow="ellipsis"
+        current_total=current.get("total") or 0
+        progress=Text(f"Current hierarchy coverage: {current.get('done',0)}/{current_total}" if current_total else "Current hierarchy coverage: pending")
+        header=[overview,progress]
+        if current_total and not compact:
+            header.append(ProgressBar(total=current_total,completed=current.get("done",0),width=40))
+        parts=[Panel(Group(*header),title="OIC ALL DIMENSION V2 / PREPARE",border_style="cyan")]
         grid=Table(expand=True,show_edge=False,box=None,padding=(0,1))
         for h in ("Category","FY","UY","AY"):
             grid.add_column(h)
@@ -266,32 +279,36 @@ class PrepareMonitor:
                 color="green" if status=="INVENTORY READY" else "red" if status=="INCOMPLETE" else "yellow" if status=="DISCOVERING" else "dim"
                 cells.append(Text(value,style=color))
             grid.add_row(c,*cells)
-        parts.append(Panel(grid,title="01 / CUBE INVENTORY COVERAGE"))
+        coverage_panel=Panel(grid,title="CUBE INVENTORY COVERAGE")
         requests=[]
         for row in active:
             age=now-row["stage_at"]
             stage=row["stage"]
             line=Text(f"{row['cube']} | {row['kind']} | attempt {row['attempt']} | {stage}",style="bold yellow")
             requests.append(line)
-            requests.append(Text(row["detail"],overflow="fold"))
+            if not compact or len(active)==1:
+                requests.append(Text(row["detail"],overflow="ellipsis",no_wrap=True))
             if stage=="COOLDOWN":
                 requests.append(Text(f"Retry in {max(0,row.get('deadline',now)-now):.1f}s",style="yellow"))
             elif stage in ("REQUEST IN FLIGHT","AUTH REFRESH"):
                 limit=row.get("stage_timeout",row["timeout"])
                 requests.append(Text(f"{age:.1f}s elapsed / {limit}s configured timeout (client wait, not server progress)"))
-                requests.append(ProgressBar(total=max(1,limit),completed=min(age,limit),width=40))
+                if not compact or len(active)==1:
+                    requests.append(ProgressBar(total=max(1,limit),completed=min(age,limit),width=40))
             else:
                 requests.append(Text(f"{now-row['started']:.1f}s operation | {row['bytes']:,} bytes received"))
         if not requests:
             requests=[Text("No HTTP operation active — see current preparation stage.",style="dim")]
-        parts.append(Panel(Group(*requests),title=f"02 / ACTIVE OPERATIONS ({len(active)})",border_style="yellow" if active else "blue"))
+        parts.append(Panel(Group(*requests),title=f"ACTIVE OPERATIONS ({len(active)})",border_style="yellow" if active else "blue"))
         avg=f"{stats['duration']/stats['http']:.2f}s" if stats["http"] else "-"
         status=Text(f"Operations OK {stats['ok']} | Failed {stats['failed']} | Retries {stats['retries']}\n"
                     f"HTTP 200 recorded {stats['http']} | Avg {avg} | Received {stats['bytes']/1048576:.2f} MiB\n"
                     f"Profiles {profile_count} | Job {plan['index']}/{plan['total']} | "
                     f"Primary planned {plan['primary']+plan['current_primary']:,} | Recovery {plan['recovery']+plan['current_recovery']:,}")
-        parts.append(Panel(status,title="03 / STATISTICS & PLAN"))
-        if phase in ("ADAPTIVE","CONCURRENCY"):
+        parts.append(Panel(status,title="STATISTICS & PLAN"))
+        if not compact:
+            parts.append(coverage_panel)
+        if phase in ("ADAPTIVE","CONCURRENCY") and (height>=40 or not active):
             bench=Table(expand=True,box=None)
             for h in ("Cube","X/Y/M","Time","Coverage/s","Useful/s","Result"):
                 bench.add_column(h)
@@ -307,7 +324,9 @@ class PrepareMonitor:
                 lines.append(Text(f"Concurrency {v['concurrency']} | {v['seconds']:.1f}s | {v['covered_per_second']:.1f} cells/s | {'OK' if v['ok'] else 'FAILED'}"))
             parts.append(Panel(Group(*lines),title="04 / ADAPTIVE PROFILING"))
         # Prioritize active request visibility on short terminal windows.
-        if self.console.height>=35:
+        if compact and not active and phase not in ("ADAPTIVE","CONCURRENCY"):
+            parts.append(coverage_panel)
+        if height>=48:
             lines=[Text(f"{stamp} | {message}",overflow="ellipsis",no_wrap=True) for stamp,message in events[-(6 if self.console.height>=48 else 3):]]
             parts.append(Panel(Group(*(lines or [Text("No activity yet",style="dim")])),title="RECENT ACTIVITY"))
         parts.append(Text("Ctrl+C to stop | Checkpoints retained | prepare.log",style="dim"))
@@ -586,7 +605,7 @@ class OICClient:
         raise CollectionError("ACCESS_DENIED","Authentication retry exhausted")
 
     def discover(self,profile,payload,timeout):
-        data,metrics=self.execute_once(profile,payload,timeout)
+        data,_=self.execute_once(profile,payload,timeout)
         return data
 
     def close(self):

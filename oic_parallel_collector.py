@@ -103,6 +103,13 @@ rich
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure local project modules take priority.
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 import argparse
 import csv
 import base64

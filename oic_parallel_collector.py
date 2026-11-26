@@ -6,12 +6,12 @@ OIC PARALLEL COLLECTOR
 ======================
 
 XMLA / MDX / OLAP Aggregate Collector
-Rich Terminal Monitor + PowerShell background workers
+Rich Terminal Monitor + Windows Terminal worker tabs
 4 Parallel Workers + Raw XML + Excel + Resume
 
 INSTALL
 -------
-python -m pip install requests openpyxl rich
+python -m pip install curl_cffi openpyxl rich
 
 COMMANDS
 --------
@@ -24,8 +24,7 @@ Start a PowerShell worker supervisor:
 Or:
     python oic_parallel_collector.py --launch
 
-The original PowerShell displays a LIVE RICH MONITOR.
-Workers are background Python processes; monitor uses PowerShell.
+Workers run in visible Windows Terminal tabs. Each has its own Python process.
 
 Test one job:
     python oic_parallel_collector.py --worker-id 1 --max-jobs 1 --max-years 1
@@ -91,9 +90,9 @@ output/oic_parallel/MV/
 REQUIREMENTS
 ------------
 Windows 10/11
-Windows PowerShell (no Windows Terminal required)
+Windows Terminal (wt.exe) and PowerShell
 Python 3.10+
-requests
+curl_cffi
 openpyxl
 rich
 
@@ -125,7 +124,8 @@ from typing import Any
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
-import requests
+from curl_cffi import requests as curl_requests
+from curl_cffi.requests.exceptions import RequestException as CurlRequestError
 
 from rich.align import Align
 from rich.console import Console, Group
@@ -246,6 +246,7 @@ USER_AGENT = (
 from oic_query import PROFILES as QUERY_PROFILES, validate_query, build_soap as query_soap, parse_xmla as query_parse, excel_records as query_excel_records, query_hash
 
 console = Console(highlight=False)
+_selected_log_path: Path | None = None
 
 
 # ============================================================
@@ -283,11 +284,18 @@ def log(
 
     color = colors.get(level, "white")
 
-    console.print(
-        f"[dim]{local_time()}[/dim] "
-        f"[bold]{prefix}[/bold] "
-        f"[{color}]{message}[/{color}]"
-    )
+    stamp = local_time()
+    line = Text()
+    line.append(stamp + " ", style="dim")
+    line.append(prefix + " ", style="bold")
+    line.append(str(message), style=color)
+    console.print(line)
+    if _selected_log_path is not None:
+        try:
+            with _selected_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{stamp} {prefix} {level} {message}\n")
+        except OSError:
+            console.print("Worker log file could not be written.", style="yellow")
 
 
 def read_json(
@@ -329,7 +337,14 @@ def write_json(
             json.dumps(data, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        temporary.replace(path)
+        for attempt in range(5):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1149,7 +1164,7 @@ class OICClient:
             max_response_mb * 1024 * 1024
         )
 
-        self.session = requests.Session()
+        self.session = curl_requests.Session(verify=True)
 
         self.session.headers.update({
             "User-Agent": USER_AGENT,
@@ -1298,12 +1313,12 @@ class OICClient:
                 ),
             }
 
-            with self.session.post(
+            with self.session.stream(
+                "POST",
                 XMLA_URL,
                 data=request_body,
                 headers=headers,
                 timeout=(15, self.timeout),
-                stream=True,
                 allow_redirects=False,
             ) as response:
 
@@ -1312,6 +1327,7 @@ class OICClient:
                     and attempt == 0
                 ):
 
+                    response.close()
                     self.refresh_token()
                     continue
 
@@ -1325,9 +1341,7 @@ class OICClient:
 
                     with temporary.open("wb") as file:
 
-                        for chunk in response.iter_content(
-                            chunk_size=256 * 1024
-                        ):
+                        for chunk in response.iter_content():
 
                             if not chunk:
                                 continue
@@ -2203,7 +2217,7 @@ def run_job(
                         )
 
                 except (
-                    requests.RequestException,
+                    CurlRequestError,
                     RuntimeError,
                     OSError,
                     ET.ParseError,
@@ -3289,51 +3303,46 @@ def launch_terminal_window(
     title: str,
     cwd: Path,
     tab_titles: list[str] | None = None,
-    keep_open: bool = True,
+    keep_open: bool | list[bool] = True,
     maximized: bool = False,
+    window_id: str | None = None,
 ) -> str:
-    """Open PowerShell directly without a terminal multiplexer."""
+    """Launch independent visible tabs in one named Windows Terminal window."""
     if os.name != "nt":
-        raise RuntimeError("PowerShell launcher requires Windows")
+        raise RuntimeError("Windows Terminal launcher requires Windows")
+    wt = shutil.which("wt.exe")
+    if not wt:
+        raise RuntimeError("Windows Terminal (wt.exe) is required; no hidden-worker fallback")
     if not commands or any(not cmd for cmd in commands):
         raise ValueError("No terminal command")
     workdir = Path(cwd).resolve()
     if not workdir.is_dir():
         raise FileNotFoundError(str(workdir))
+    titles = tab_titles if tab_titles is not None else [title] * len(commands)
+    stay = [keep_open] * len(commands) if isinstance(keep_open, bool) else keep_open
+    if len(titles) != len(commands) or len(stay) != len(commands):
+        raise ValueError("One title and keep-open setting per terminal command required")
     shell = find_powershell()
-    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-    if len(commands) == 1:
-        command = "& " + " ".join(powershell_quote(str(a)) for a in commands[0])
-        args = [shell, "-NoLogo", "-NoProfile"]
-        if keep_open:
-            args.append("-NoExit")
-        args += ["-Command", "$Host.UI.RawUI.WindowTitle = " +
-                 powershell_quote(title) + "; " + command]
-    else:
-        # The multi-command legacy diagnostic opens one PowerShell console,
-        # but starts its workers as hidden child processes.
-        instructions = ["$ErrorActionPreference='Stop'",
-                        "$Host.UI.RawUI.WindowTitle = " + powershell_quote(title)]
-        for cmd in commands:
-            arguments = subprocess.list2cmdline([str(v) for v in cmd[1:]])
-            instructions.append(
-                "Start-Process -WindowStyle Hidden -FilePath " +
-                powershell_quote(str(cmd[0])) +
-                " -ArgumentList " + powershell_quote(arguments) +
-                " -WorkingDirectory " + powershell_quote(str(workdir)))
-        args = [shell, "-NoLogo", "-NoProfile"]
-        if keep_open:
-            args.append("-NoExit")
-        args += ["-Command", "; ".join(instructions)]
-    startupinfo = None
+    args = [wt, "-w", window_id or ("OIC-" + uuid.uuid4().hex)]
     if maximized:
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 3  # SW_MAXIMIZE
-    subprocess.Popen(args, cwd=str(workdir), creationflags=flags,
-                     startupinfo=startupinfo, close_fds=True)
-    return "POWERSHELL"
-
+        args.append("--maximized")
+    for index, (command, tab_title, keep) in enumerate(zip(commands, titles, stay)):
+        if index:
+            args.append(";")
+        # Encode the shell command so paths and semicolons are not parsed by WT.
+        statement = "& " + " ".join(powershell_quote(str(v)) for v in command)
+        if not keep:
+            # The worker's real outcome is in state.json and its Python exit code.
+            # Exit the shell cleanly so the default WT profile closes the tab.
+            statement += "; exit 0"
+        encoded = base64.b64encode(statement.encode("utf-16-le")).decode("ascii")
+        args += ["new-tab", "--startingDirectory", str(workdir), "--title", tab_title,
+                 "--suppressApplicationTitle", shell, "-NoLogo", "-NoProfile"]
+        if keep:
+            args.append("-NoExit")
+        args += ["-EncodedCommand", encoded]
+    subprocess.Popen(args, cwd=str(workdir), close_fds=True)
+    return "WINDOWS TERMINAL"
 
 def worker_powershell_command(
     args: argparse.Namespace,
@@ -3454,7 +3463,7 @@ def launch_worker_tabs(
         title="OIC | Parallel Workers",
         cwd=HERE,
         tab_titles=titles,
-        keep_open=True,
+        keep_open=False,
     )
 
     log(
@@ -3912,6 +3921,79 @@ def selected_paths(config_path: Path):
     return config, run_dir
 
 
+def _process_creation(kernel, handle) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    times = [wintypes.FILETIME() for _ in range(4)]
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.GetProcessTimes.restype = wintypes.BOOL
+    if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+
+
+def _current_process_creation() -> int | None:
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    return _process_creation(kernel, kernel.GetCurrentProcess())
+
+
+class _WorkerProcess:
+    """Hold a real Windows process handle, avoiding PID reuse on force-stop."""
+
+    def __init__(self, pid: int, created: int | None, *, can_terminate: bool = False):
+        import ctypes
+        from ctypes import wintypes
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        k = self.kernel
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k.TerminateProcess.restype = wintypes.BOOL
+        k.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k.GetExitCodeProcess.restype = wintypes.BOOL
+        self.handle = k.OpenProcess(0x100000 | 0x1000 | (1 if can_terminate else 0), False, pid)
+        if not self.handle:
+            if ctypes.get_last_error() == 87:  # process no longer exists
+                return
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if created is not None and _process_creation(k, self.handle) != created:
+                self.close()
+        except BaseException:
+            self.close()
+            raise
+
+    def running(self) -> bool:
+        return bool(self.handle and self.kernel.WaitForSingleObject(self.handle, 0) == 258)
+
+    def exit_code(self) -> int | None:
+        import ctypes
+        from ctypes import wintypes
+        code = wintypes.DWORD()
+        if self.handle and self.kernel.GetExitCodeProcess(self.handle, ctypes.byref(code)):
+            return int(code.value)
+        return None
+
+    def terminate(self) -> None:
+        if self.running() and not self.kernel.TerminateProcess(self.handle, 1) and self.running():
+            import ctypes
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self) -> None:
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
 def selected_worker(args) -> int:
     config, run_dir = selected_paths(args.query_config)
     code, worker_id = config["code"], args.worker_id
@@ -3924,6 +4006,15 @@ def selected_worker(args) -> int:
     manifest_path = directory / "manifest.json"
     state_path = directory / "state.json"
     heartbeat_path = directory / "heartbeat.json"
+    attempt_id = getattr(args, "attempt_id", None)
+    cancel_file = directory / f"cancel-{attempt_id}.flag" if attempt_id else None
+    if attempt_id:
+        initial = read_json(state_path, {}) or {}
+        if (initial.get("attempt_id") != attempt_id or initial.get("status") != "STARTING"
+                or initial.get("pid") or cancel_file.exists()):
+            return 1
+    global _selected_log_path
+    _selected_log_path = directory / "worker.log"
     existing = read_json(manifest_path, {})
     manifest = existing if existing.get("run_id") == config["run_id"] and existing.get("query_hash") == query_hash(config) else {}
     manifest.setdefault("chunks", {})
@@ -3934,7 +4025,8 @@ def selected_worker(args) -> int:
     stop_file = run_dir / "stop.flag"
     batch_stop = run_dir.parent / "stop.flag"
     def stop_requested():
-        return stop_file.exists() or batch_stop.exists()
+        return (stop_file.exists() or batch_stop.exists()
+                or bool(cancel_file and cancel_file.exists()))
     shared_cooldown = run_dir.parent / "cooldown.json"
     def wait_for_server():
         while not stop_requested():
@@ -3965,15 +4057,19 @@ def selected_worker(args) -> int:
         raise RuntimeError("Worker was not assigned in task plan")
     heartbeat_stop = threading.Event()
     state = dict(run_id=config["run_id"], worker_id=worker_id, pid=os.getpid(),
+                 attempt_id=attempt_id, process_created=_current_process_creation(),
                  status="STARTING", current_request=None, request_started_at=None,
-                 last_http=None, last_message="Initializing", updated_at=utc_now())
+                 last_http=None, last_message="Initializing", updated_at=utc_now(),
+                 started_at=utc_now(), http_engine="curl_cffi",
+                 requests_total=0, request_time_total_ms=0.0, last_request_ms=None)
     def save_state():
         state["updated_at"] = utc_now()
         write_json(state_path, state)
     def heartbeat():
         while not heartbeat_stop.is_set():
             write_json(heartbeat_path, dict(run_id=config["run_id"], worker_id=worker_id,
-                                            pid=os.getpid(), updated_at=utc_now()))
+                                            pid=os.getpid(), attempt_id=attempt_id,
+                                            updated_at=utc_now()))
             heartbeat_stop.wait(2)
     save_state()
     thread = threading.Thread(target=heartbeat, daemon=True)
@@ -3983,6 +4079,15 @@ def selected_worker(args) -> int:
     errors = 0
     completed = False
     try:
+        console.print(Panel(
+            Text(f"OIC PARALLEL COLLECTOR\nWORKER {worker_id:02d} / {worker_count:02d}\n"
+                 f"{config.get('query_id', 'Q001')} | {code}/{config.get('cube_type', 'FY')} | CURL_CFFI\n"
+                 f"X start={allocation['x_offset_start']} stride={allocation['x_offset_stride']}",
+                 justify="center"), border_style="cyan"))
+        log("Task plan loaded", worker_id, "OK")
+        if stop_requested():
+            state["status"] = "STOPPED"
+            return 0
         env = read_env()
         cookie = env.get("OIC_COOKIE", "").strip()
         if not cookie:
@@ -3991,7 +4096,9 @@ def selected_worker(args) -> int:
                            timeout=int(config.get("timeout", 60)),
                            max_response_mb=100, worker_id=worker_id, code=code)
         state["status"] = "RUNNING"
+        state["last_message"] = "HTTP session ready"
         save_state()
+        log("HTTP session initialized | curl_cffi", worker_id, "OK")
         # Deterministic X paging: a given X page belongs to exactly one worker.
         x_offset = int(allocation["x_offset_start"])
         while not stop_requested():
@@ -4027,8 +4134,23 @@ def selected_worker(args) -> int:
                     http = None
                     for attempt in range(2):
                         try:
-                            http = client.execute(req_path.read_bytes(), resp_path)
-                            state["last_http"] = http["http_status"]
+                            http = None
+                            request_started = time.monotonic()
+                            state.update(status="RUNNING", request_started_at=utc_now(),
+                                         requests_total=state["requests_total"] + 1)
+                            save_state()
+                            try:
+                                http = client.execute(req_path.read_bytes(), resp_path)
+                            finally:
+                                duration = (time.monotonic() - request_started) * 1000
+                                state["last_request_ms"] = round(duration, 2)
+                                state["request_time_total_ms"] += duration
+                                if http is not None:
+                                    state["last_http"] = http["http_status"]
+                                save_state()
+                            log(f"HTTP {http['http_status']} | {duration:.0f} ms | "
+                                f"{http['response_bytes']:,} bytes", worker_id,
+                                "OK" if http["http_status"] == 200 else "WARN")
                             if http["http_status"] == 200:
                                 data = query_parse(resp_path.read_bytes())
                                 break
@@ -4042,15 +4164,18 @@ def selected_worker(args) -> int:
                             if stop_requested():
                                 break
                             state["status"] = "RUNNING"; save_state()
-                            state["status"] = "RUNNING"; save_state()
-                        except (requests.RequestException, ValueError, ET.ParseError, RuntimeError) as exc:
+                        except (CurlRequestError, ValueError, ET.ParseError, RuntimeError) as exc:
                             if attempt == 1 or (http and http.get("http_status") not in
                                                        (408, 425, 429, 500, 502, 503, 504)):
                                 raise
+                            state.update(status="RETRYING", last_message=f"Retry: {exc}"[:200])
+                            save_state()
                             log(f"Transient error: {exc}", worker_id, "WARN")
                             if stop_requested():
                                 break
                             time.sleep(min(30, 2 ** (attempt + 1) + worker_id))
+                    if stop_requested():
+                        break
                     if data is None:
                         raise RuntimeError("Empty XMLA dataset after attempts")
                     record = dict(status="OK", x_offset=x_offset, y_offset=y_offset,
@@ -4114,10 +4239,14 @@ def selected_worker(args) -> int:
         thread.join(timeout=3)
         state["current_request"] = None
         state["request_started_at"] = None
-        save_state()
         manifest["status"] = state["status"]
         manifest["updated_at"] = utc_now()
         write_json(manifest_path, manifest)
+        state["exit_code"] = 1 if errors else 0
+        state["last_message"] = f"{state['status']}: {state.get('last_message', '')}"[:200]
+        save_state()
+        log(state["last_message"], worker_id,
+            "OK" if state["status"] == "COMPLETED" else "WARN")
     return 1 if errors else 0
 
 

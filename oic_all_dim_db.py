@@ -121,6 +121,7 @@ class OICDatabase:
             grain TEXT NOT NULL, is_total INTEGER NOT NULL,
             last_data_update TEXT, retrieved_at REAL NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS observation_version ON oic_observations(prep,cube,last_data_update);
         CREATE TABLE IF NOT EXISTS oic_coordinates(
             observation TEXT NOT NULL REFERENCES oic_observations(id),
             hierarchy TEXT NOT NULL, member TEXT NOT NULL,
@@ -318,27 +319,34 @@ class OICDatabase:
                               (str(path),sha,canonical(metrics),r["id"]))
 
     def commit_request(self,r,records,metrics):
-        count=0
+        observations, coordinates, values = {}, [], []
         now=time.time()
+        for record in records:
+            coords=sorted(record["coordinates"])
+            oid=digest([r["prep"],r["cube"],record["grain"],coords])
+            if oid not in observations:
+                observations[oid]=(oid,r["prep"],r["cube"],record["grain"],int(record["is_total"]),record.get("last_data_update"),now)
+                coordinates.extend((oid,h,m) for h,m in coords)
+            values.append((oid,record["measure"],record.get("raw"),record.get("numeric"),
+                           record.get("formatted"),record["state"],r["id"]))
         with self.transaction():
             self._fence(r)
-            for record in records:
-                coords=sorted(record["coordinates"])
-                oid=digest([r["prep"],r["cube"],record["grain"],coords])
-                self.conn.execute("INSERT OR IGNORE INTO oic_observations VALUES(?,?,?,?,?,?,?)",
-                    (oid,r["prep"],r["cube"],record["grain"],int(record["is_total"]),record.get("last_data_update"),now))
-                self.conn.executemany("INSERT OR IGNORE INTO oic_coordinates VALUES(?,?,?)",
-                                      [(oid,h,m) for h,m in coords])
-                self.conn.execute("""INSERT INTO oic_values VALUES(?,?,?,?,?,?,?)
-                    ON CONFLICT(observation,measure) DO UPDATE SET
-                    value_raw=excluded.value_raw,value_numeric=excluded.value_numeric,
-                    value_formatted=excluded.value_formatted,value_state=excluded.value_state,request=excluded.request""",
-                    (oid,record["measure"],record.get("raw"),record.get("numeric"),record.get("formatted"),record["state"],r["id"]))
-                count+=1
+            version=metrics.get("source_update")
+            if version:
+                prior=self.conn.execute("SELECT last_data_update FROM oic_observations WHERE prep=? AND cube=? AND last_data_update IS NOT NULL LIMIT 1",
+                                        (r["prep"],r["cube"])).fetchone()
+                if prior and prior[0]!=version:
+                    raise ValueError("SOURCE_VERSION_CHANGED")
+            self.conn.executemany("INSERT OR IGNORE INTO oic_observations VALUES(?,?,?,?,?,?,?)",observations.values())
+            self.conn.executemany("INSERT OR IGNORE INTO oic_coordinates VALUES(?,?,?)",coordinates)
+            self.conn.executemany("""INSERT INTO oic_values VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(observation,measure) DO UPDATE SET
+                value_raw=excluded.value_raw,value_numeric=excluded.value_numeric,
+                value_formatted=excluded.value_formatted,value_state=excluded.value_state,request=excluded.request""",values)
             self.conn.execute("""UPDATE oic_requests SET status=?,metrics_json=?,committed_at=?,
                 owner=NULL,lease=NULL,expires=NULL,error=NULL WHERE id=?""",
-                ("COMMITTED" if count else "EMPTY",canonical(metrics),now,r["id"]))
-        return count
+                ("COMMITTED" if metrics.get("useful_cells") else "EMPTY",canonical(metrics),now,r["id"]))
+        return len(values)
 
     def fail(self,r,error,status="FAILED",delay=0):
         with self.transaction():
@@ -384,6 +392,38 @@ class OICDatabase:
     def pressure(self,rid,seconds):
         self.conn.execute("UPDATE oic_runs SET cooldown=max(cooldown,?),allowed=max(1,allowed-1) WHERE id=?",
                           (time.time()+seconds,rid))
+
+    def reprepare_request(self, parent, children):
+        with self.transaction():
+            row=self.get_request(parent["id"])
+            if not row or row["status"]!="NEEDS_REPREPARE":
+                raise RuntimeError("Request is not eligible for reprepare")
+            for r in children:
+                self.conn.execute("""INSERT INTO oic_requests
+                    (id,prep,job,cube,parent,scope_json,mdx,payload,payload_hash,timeout,potential_cells,status)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,'PENDING')
+                    ON CONFLICT(id) DO UPDATE SET status='PENDING'
+                    WHERE oic_requests.status='STANDBY'""",
+                    (r["id"],r["prep"],r["job"],r["cube"],r["parent"],canonical(r["scope"]),
+                     r["mdx"],r["payload"],digest(r["payload"]),r["timeout"],r["potential_cells"]))
+            self.conn.execute("UPDATE oic_requests SET status='REPLACED' WHERE id=?",(parent["id"],))
+
+    def retry_failed(self,prep):
+        with self.transaction():
+            for prefix in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","AUTH_TOKEN_EXPIRED",
+                           "INVALID_XML","DATABASE_BUSY","DATABASE_WRITE_ERROR","STORAGE_ERROR",
+                           "DISK_FULL","RATE_LIMITED","SERVER_UNAVAILABLE"):
+                self.conn.execute("""UPDATE oic_requests SET status='RETRY',attempts=0,available_at=0
+                    WHERE prep=? AND status='FAILED' AND error LIKE ?""",(prep,prefix+"%"))
+
+    def coverage(self,prep):
+        # Replaced parents and standby children are alternative representations,
+        # never additional logical coordinates. Successful probes are disjoint.
+        total=self.conn.execute("""SELECT coalesce(sum(potential_cells),0) FROM oic_requests
+            WHERE prep=? AND status NOT IN ('STANDBY','REPLACED','PROBE','PROBE_FAILED')""",(prep,)).fetchone()[0]
+        done=self.conn.execute("""SELECT coalesce(sum(potential_cells),0) FROM oic_requests
+            WHERE prep=? AND status IN ('COMMITTED','EMPTY')""",(prep,)).fetchone()[0]
+        return {"covered":done,"planned":total,"percent":round(100*done/total,2) if total else 0}
 
     def progress(self,prep):
         rows=self.conn.execute("""SELECT status,count(*) n,sum(potential_cells) cells

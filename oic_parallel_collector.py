@@ -4190,6 +4190,8 @@ def selected_worker(args) -> int:
                                 state["recent_requests"].append(sample)
                                 del state["recent_requests"][:-100]
                                 set_phase("IDLE", f"HTTP {chunk_http if chunk_http is not None else 'ERROR'} | {duration:.0f} ms")
+                                if http is None and duration >= 5000:
+                                    log(f"SLOW | Execute error after {duration:.0f} ms", worker_id, "WARN")
                             if duration >= 5000:
                                 wait_ms = timing.get("header_wait_ms")
                                 receive_ms = timing.get("receive_ms")
@@ -4824,7 +4826,7 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
         alerts.append(f"WORKER ERROR {totals['workers_failed']}")
     if cool:
         alerts.append(f"COOLDOWN {cool}s")
-    metrics = Group(
+    metric_lines = [
         Text(f"Chunks OK {totals.get('chunks_ok', 0):,} | Failed {totals.get('chunks_failed', 0):,}"
              f" | Cells {totals.get('cells', 0):,}"),
         Text(f"Data {totals.get('data_chunks', 0):,} | Empty {totals.get('empty_pages', 0):,}"
@@ -4842,7 +4844,17 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
              f" | Cooldown {str(cool) + 's' if cool else 'NONE'}"),
         Text(f"Excel: {entry.get('export_status', 'PENDING')} | Rows {entry.get('rows', '—')}"),
         Text(" | ".join(alerts) if alerts else "No performance alerts",
-             style="yellow" if alerts else "dim"))
+             style="yellow" if alerts else "dim")]
+    # On very wide consoles use two metric columns to leave room for worker bars.
+    if terminal_width >= 180:
+        metric_grid = Table.grid(expand=True, padding=(0, 1))
+        metric_grid.add_column(ratio=1)
+        metric_grid.add_column(ratio=1)
+        for pos in range(0, len(metric_lines), 2):
+            metric_grid.add_row(metric_lines[pos], metric_lines[pos + 1] if pos + 1 < len(metric_lines) else Text(""))
+        metrics = metric_grid
+    else:
+        metrics = Group(*metric_lines)
     # Measure actual rendered heights so adjacent panels have equal borders.
     def paired_panels(left, right, left_title, right_title):
         available = max(12, terminal_width // 2)
@@ -4864,8 +4876,9 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
 
     # Budget vertical space using Rich's actual line count, not a fixed worker count.
     top_lines = sum(len(console.render_lines(value, pad=False)) for value in [header, *sections])
-    available_rows = max(1, terminal_height - top_lines - 13)
-    normal = terminal_width >= 72 and available_rows >= 5 * len(workers) + 4
+    available_rows = max(1, terminal_height - top_lines - 11)
+    normal = terminal_width >= 72 and available_rows >= 3 * len(workers) + 4
+    extra_detail = normal and available_rows >= 5 * len(workers) + 4
     limit = len(workers) if normal else max(1, available_rows - 4)
     shown = workers[:limit]
     worker_rows = []
@@ -4883,15 +4896,21 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
         result = f"{w.get('chunks_ok', 0):,} chunks | {w.get('chunks_failed', 0):,} failed"
         bar = Bar(1.0, 0.0, ratio, color=color, bgcolor="grey23")
         if normal:
-            worker_rows.extend([
-                pair(Text.assemble((wid, "bold"), "  ", styled(state)),
-                     Text.assemble(("LAST ", "dim"), latency(last_ms))),
-                bar,
-                pair(Text(f"Offset {offset(w)}"), Text(result)),
-                pair(Text(f"HTTP {http} | {phase}"),
-                     Text.assemble("Current ", latency(inflight), f" | HB {heartbeat_text}")),
-                Text(""),
-            ])
+            left = Text.assemble((wid, "bold"), "  ", styled(state))
+            right = Text.assemble(("LAST ", "dim"), latency(last_ms))
+            detail = Text(f"Offset {offset(w)}")
+            if not extra_detail:
+                left.append(f" | {phase}", style="dim")
+                right.append(" | NOW ")
+                right.append_text(latency(inflight))
+                detail.append(f" | HTTP {http} | HB {heartbeat_text}", style="dim")
+            worker_rows.extend([pair(left, right), bar, pair(detail, Text(result))])
+            if extra_detail:
+                worker_rows.extend([
+                    pair(Text(f"HTTP {http} | {phase}"),
+                         Text.assemble("Current ", latency(inflight), f" | HB {heartbeat_text}")),
+                    Text(""),
+                ])
         else:
             grid = Table.grid(expand=True, padding=(0, 1))
             grid.add_column(no_wrap=True, overflow="ellipsis")

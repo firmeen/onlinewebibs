@@ -68,7 +68,7 @@ import shutil
 from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog, discover_fields,
                        validate_query, build_mdx as selected_mdx, query_hash,
                         cube_status, cube_profile, cube_options, CUBE_TYPES,
-                        verify_field)
+                        verify_field, catalog_verification_summary)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2621,7 +2621,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         #applied_actions { height: 3; }
         #applied_actions Button { min-width: 12; margin-right: 1; }
         #selected_query_summary { height: 2; padding: 0 1; color: #9fb0ba; }
-        #catalog_status { height: 3; margin-top: 1; padding: 0 2;
+        #catalog_status { height: auto; min-height: 3; margin-top: 1; padding: 0 2;
                            border: solid #293c49; color: #9fb0ba; }
         #activity_panel { height: 1fr; min-height: 8; }
         #designer_area { height: 1fr; min-height: 12; }
@@ -4677,36 +4677,56 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
 
         def update_catalog_summary(self) -> None:
-            status = "  |  ".join(
-                f"{code}/{kind}: {self.catalog_statuses.get(f'{code}/{kind}', 'UNKNOWN')}"
-                for code in QUERY_PROFILES for kind in CUBE_TYPES
-            )
+            totals = dict(total=0, verified=0, mapped=0, unverified=0,
+                          unsupported=0, selectable=0)
+            available = 0
+            lines = []
+            for code in QUERY_PROFILES:
+                values = []
+                for kind in CUBE_TYPES:
+                    catalog = load_catalog(code, kind)
+                    summary = catalog_verification_summary(catalog)
+                    status = cube_status(code, kind)["status"]
+                    available += status == "AVAILABLE"
+                    if catalog.get("source") == "PROFILE":
+                        values.append(f"{kind}: {status} / NO SAVED CATALOG")
+                        continue
+                    for key in totals:
+                        totals[key] += summary[key]
+                    values.append(f"{kind}: {summary['verified']}/{summary['total']}"
+                                  f" ({status})")
+                lines.append(f"{code}  " + "  |  ".join(values))
+            coverage = 100 * totals["verified"] / totals["total"] if totals["total"] else 0
             self.query_one("#catalog_status", Static).update(
-                "FY / UY / AY CUBE CATALOGS\n" + status)
+                "FIELD CATALOG | REPORTED VERIFICATION\n"
+                f"FIELDS: {totals['total']:,} | VERIFIED: {totals['verified']:,} "
+                f"({coverage:.2f}%) | MAPPED: {totals['mapped']:,} | "
+                f"UNVERIFIED: {totals['unverified']:,} | UNSUPPORTED: {totals['unsupported']:,}\n"
+                f"SELECTABLE: {totals['selectable']:,} | CUBES AVAILABLE: "
+                f"{available}/{len(QUERY_PROFILES) * len(CUBE_TYPES)}\n"
+                + "\n".join(lines))
 
         @work(thread=True, group="five-cube-discovery", exclusive=True)
         def discover_all_catalogs(self, force: bool = False) -> None:
-            if self.catalog_running or self.cookie_state != "VALID":
+            if self.catalog_running:
                 return
             self.catalog_running = True
-            self.catalog_started = True
             sequence = self.auth_sequence
             cookie, token = self.cookie_value(), self.token_value()
             try:
+                if self.cookie_state != "VALID":
+                    if force:
+                        self.call_from_thread(self.info, "Saved catalogs loaded; live refresh requires a valid session.", "warning")
+                    return
+                self.catalog_started = True
                 for code in QUERY_PROFILES:
                     for cube_type in CUBE_TYPES:
                         if sequence != self.auth_sequence:
                             return
                         existing = load_catalog(code, cube_type)
-                        if not force and existing.get("source") == "CACHE" and existing.get("refreshed_at"):
-                            try:
-                                updated = datetime.fromisoformat(existing["refreshed_at"])
-                                if (datetime.now(timezone.utc) - updated).total_seconds() < 86400:
-                                    self.call_from_thread(self.catalog_discovery_event,
-                                                          code, cube_type, existing, None)
-                                    continue
-                            except (TypeError, ValueError):
-                                pass
+                        # Saved verification is not invalidated by age.
+                        if not force and existing.get("source") != "PROFILE":
+                            continue
                         try:
                             result = discover_fields(code, token, cookie, cube_type=cube_type)
                             self.call_from_thread(self.catalog_discovery_event,
@@ -4715,23 +4735,22 @@ def launch_terminal_ui(args, return_app: bool = False):
                             error = str(exc)[:150]
                             self.call_from_thread(self.catalog_discovery_event,
                                                   code, cube_type, None, error)
-                            if any(x in error.upper() for x in ("SESSION_EXPIRED", "HTTP 401", "HTTP 403")):
+                            if any(x in error.upper() for x in ("SESSION_EXPIRED", "SESSION EXPIRED", "HTTP 401", "HTTP 403")):
                                 return
             finally:
                 self.catalog_running = False
+                self.call_from_thread(self.update_catalog_summary)
 
         def catalog_discovery_event(self, code: str, cube_type: str,
                                     catalog: dict | None, error: str | None) -> None:
             key = f"{code}/{cube_type}"
+            self.catalog_statuses[key] = cube_status(code, cube_type)["status"]
             if error:
-                self.catalog_statuses[key] = cube_status(code, cube_type)["status"]
-                if "NOT_AVAILABLE" not in error:
-                    self.info(f"{key} metadata: {error}", "warning")
-            else:
-                self.catalog_statuses[key] = (
-                    f"AVAILABLE {catalog['view_count']}+{catalog['data_count']}"
-                )
-                self.info(f"{key}: {len(catalog['fields'])} fields cached.", "success")
+                self.info(f"{key} refresh failed; saved catalog kept: {error}", "warning")
+            elif catalog:
+                summary = catalog_verification_summary(catalog)
+                self.info(f"{key}: VERIFIED {summary['verified']}/{summary['total']}; "
+                          f"{summary['selectable']} selectable.", "success")
             self.update_catalog_summary()
 
         # ====================================================
@@ -5371,11 +5390,13 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.refresh_tree()
             self.refresh_layout()
             availability = cube_status(code, self.cube_type)["status"]
+            summary = catalog_verification_summary(self.catalog)
             self.query_one("#designer_status", Static).update(
-                f"CATALOG {code}/{self.cube_type}: {availability} | "
-                f"{self.catalog.get('view_count', 0)} views / "
-                f"{self.catalog.get('data_count', 0)} measures "
-                f"({self.catalog['source']})")
+                f"CATALOG {code}/{self.cube_type}: {availability} | {self.catalog['source']} | "
+                f"VERIFIED {summary['verified']}/{summary['total']} "
+                f"({summary['coverage']:.2f}%) | MAPPED {summary['mapped']} | "
+                f"UNVERIFIED {summary['unverified']} | UNSUPPORTED {summary['unsupported']} | "
+                f"SELECTABLE {summary['selectable']}")
 
         def on_select_changed(self, event: Select.Changed) -> None:
             if self._changing_cube:
@@ -5516,12 +5537,11 @@ def launch_terminal_ui(args, return_app: bool = False):
 
                 status = field.get("status")
 
-                if status == "UNSUPPORTED":
-                    suffix = "  [UNSUPPORTED]"
-                elif status not in ("MAPPED", "VERIFIED"):
-                    suffix = "  [UNVERIFIED]"
-                else:
-                    suffix = ""
+                reported = field.get("reported_status")
+                label = status if status in ("VERIFIED", "MAPPED", "UNSUPPORTED") else "UNVERIFIED"
+                suffix = f"  [{label}]"
+                if reported == "VERIFIED" and status != "VERIFIED":
+                    suffix += " [REPORTED VERIFIED]"
 
                 parent.add_leaf(
                     caption + suffix,
@@ -6003,9 +6023,6 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         def catalog_refreshed(self, code: str, cube_type: str,
                               catalog: dict | None, error: str | None):
-            if error:
-                self.show_error("Catalog refresh failed; cache kept: " + error)
-                return
             if code == self.code and cube_type == self.cube_type:
                 self.by_category[(code, cube_type)] = {
                     axis: list(v) for axis, v in self.chosen.items()
@@ -6017,6 +6034,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                 control.value = cube_type
                 self._changing_cube = False
                 self.update_catalog(code, cube_type)
+            if error:
+                self.show_error("Live refresh failed; saved catalog loaded: " + error)
 
         def action_cancel(self) -> None:
             self.exit()

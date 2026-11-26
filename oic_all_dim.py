@@ -307,7 +307,8 @@ def parse_xmla(data,scope):
     try:
         root=checked_root(data)
     except (ET.ParseError,ValueError) as exc:
-        raise CollectionError("INVALID_XML" if isinstance(exc,ET.ParseError) else "SOAP_FAULT",str(exc)) from None
+        kind="SOAP_FAULT" if "fault/error" in str(exc).lower() else "INVALID_XML"
+        raise CollectionError(kind,"Invalid XMLA dataset or server fault") from None
     dataset=root.find(f".//{{{MD_NS}}}root")
     if dataset is None:
         raise CollectionError("INVALID_XML","Missing multidimensional dataset")
@@ -386,19 +387,29 @@ def raw_path(r):
 
 
 def replay_raw_response(r):
-    if not r.get("response_path") or not r.get("response_hash"):
-        return None
-    path=Path(r["response_path"])
-    if not path.resolve().is_relative_to(OUTPUT.resolve()) or not path.is_file() or path.stat().st_size>MAX_RESPONSE_BYTES:
-        return None
-    data=path.read_bytes()
-    if digest(data)!=r["response_hash"]:
-        return None
-    try:
-        parsed=parse_xmla(data,json.loads(r["scope_json"]))
-    except CollectionError:
-        return None
-    return path,parsed
+    candidates=[]
+    if r.get("response_path") and r.get("response_hash"):
+        candidates.append((Path(r["response_path"]),r["response_hash"]))
+    # Recover a fully renamed response if the previous worker died after the
+    # atomic file write but before registering it in the database.
+    folder=raw_path(r).parent
+    if folder.is_dir():
+        candidates.extend((p,None) for p in sorted(folder.glob(r["payload_hash"]+".*.xml")))
+    for path,expected_hash in candidates:
+        if not path.resolve().is_relative_to(OUTPUT.resolve()) or not path.is_file() or path.stat().st_size>MAX_RESPONSE_BYTES:
+            continue
+        if not path.name.startswith(r["payload_hash"]+"."):
+            continue
+        data=path.read_bytes()
+        sha=digest(data)
+        if expected_hash and sha!=expected_hash:
+            continue
+        try:
+            parsed=parse_xmla(data,json.loads(r["scope_json"]))
+        except CollectionError:
+            continue
+        return path,parsed,sha
+    return None
 
 
 def stopped(db,rid):
@@ -422,9 +433,10 @@ def process_request(db,client,r,rid=None,owner=None):
     started=time.monotonic()
     replay=replay_raw_response(r)
     if replay:
-        path,parsed=replay
+        path,parsed,sha=replay
         metrics=json.loads(r.get("metrics_json") or "{}")
         metrics["replayed"]=True
+        db.register_response(r,path,sha,metrics)
     else:
         path=raw_path(r)
         if rid:
@@ -461,6 +473,10 @@ def process_request(db,client,r,rid=None,owner=None):
         try:
             count=db.commit_request(r,iter_database_records(parsed,scope,all_members),metrics)
             break
+        except ValueError as exc:
+            if str(exc)=="SOURCE_VERSION_CHANGED":
+                raise CollectionError("SOURCE_VERSION_CHANGED","Cube update marker changed; reprepare required") from None
+            raise
         except sqlite3.OperationalError as exc:
             if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
                 raise CollectionError("DATABASE_WRITE_ERROR",type(exc).__name__) from None
@@ -469,6 +485,11 @@ def process_request(db,client,r,rid=None,owner=None):
             time.sleep(1+attempt)
     metrics["db_commit_seconds"]=time.monotonic()-t
     metrics["wall_seconds"]=time.monotonic()-started
+    try:
+        db.conn.execute("UPDATE oic_requests SET metrics_json=? WHERE id=? AND status IN ('COMMITTED','EMPTY')",
+                        (json.dumps(metrics,ensure_ascii=False),r["id"]))
+    except sqlite3.Error:
+        pass  # Completion is already committed; diagnostics are best effort.
     log(f"{r['cube']} | {r['id'][:12]} | COMMITTED {count:,} coordinates | useful={metrics['useful_cells']:,} | HTTP={metrics.get('duration','N/A')}s")
     return metrics
 
@@ -514,7 +535,7 @@ def execute_resilient(db,client,r,rid=None,owner=None,probe=False):
     except (CollectionError,sqlite3.Error,OSError,ValueError) as exc:
         handle_request_failure(db,client,r,exc,rid,probe)
         return {"ok":False,"pressure":getattr(exc,"kind","") in ("RATE_LIMITED","SERVER_UNAVAILABLE","RESPONSE_TIMEOUT"),
-                "error":getattr(exc,"kind",type(exc).__name__)}
+                "error":getattr(exc,"kind",type(exc).__name__),"delay":getattr(exc,"delay",0)}
 
 
 def process_alive(pid,created):
@@ -659,7 +680,6 @@ def supervise_workers(db,rid,count):
             if process_alive(w["pid"],w["created"]):
                 continue
             db.recover_worker(w["owner"])
-            rows.pop(number,None) if False else None
             if not db.all_work_finished(run["prep"]):
                 if replacements[number]>=2:
                     raise RuntimeError(f"W{number:02} replacement budget exhausted")
@@ -672,7 +692,7 @@ def supervise_workers(db,rid,count):
             elif time.monotonic()>deadline:
                 raise RuntimeError(f"W{number:02} replacement failed to start")
         if time.monotonic()>=next_log:
-            log(f"PROGRESS | {db.progress(run['prep'])}")
+            log(f"PROGRESS | coverage={db.coverage(run['prep'])} | {db.progress(run['prep'])}")
             next_log=time.monotonic()+10
         if db.all_work_finished(run["prep"]):
             return
@@ -741,17 +761,28 @@ def run_prepare(db):
                     wait_seconds(max(2**attempt,exc.delay,5))
             raise RuntimeError("Discovery retry budget exhausted")
 
-        def probe(req,profile):
-            existing=db.get_request(req["id"])
-            if existing["status"] in ("COMMITTED","EMPTY"):
-                return {"ok":True,**json.loads(existing["metrics_json"] or "{}")}
-            if existing["status"]=="PROBE_FAILED":
-                return {"ok":False}
-            claimed=db.claim_probe(req["id"])
-            result=execute_resilient(db,client,claimed,probe=True)
-            if result.get("pressure"):
-                wait_seconds(10)
-            return result
+        def probe(req,profile,parallel=False):
+            # Concurrent preparation probes own their database and CURL
+            # connection. Extraction workers remain separate visible processes.
+            probe_db=OICDatabase(DB_PATH) if parallel else db
+            probe_client=OICClient() if parallel else client
+            try:
+                existing=probe_db.get_request(req["id"])
+                if existing["status"] in ("COMMITTED","EMPTY"):
+                    return {"ok":True,**json.loads(existing["metrics_json"] or "{}")}
+                if existing["status"]=="PROBE_FAILED":
+                    return {"ok":False}
+                claimed=probe_db.claim_probe(req["id"])
+                result=execute_resilient(probe_db,probe_client,claimed,probe=True)
+                if result.get("pressure"):
+                    wait_seconds(max(10,result.get("delay",0)))
+                if result.get("error") in ("AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR","DISK_FULL","SOURCE_VERSION_CHANGED"):
+                    raise CollectionError(result["error"],"Preparation probe stopped")
+                return result
+            finally:
+                if parallel:
+                    probe_client.close()
+                    probe_db.close()
 
         return 0 if prepare_all(db,transport,probe,OUTPUT,log) else 1
     finally:
@@ -824,7 +855,7 @@ def main():
             else:
                 log(f"PREPARATION {prep['status']} | {prep['id']}")
                 print(json.dumps(json.loads(prep["summary_json"]),ensure_ascii=False,indent=2))
-                print(json.dumps(db.progress(prep["id"]),ensure_ascii=False,indent=2))
+                print(json.dumps({"requests":db.progress(prep["id"]),"coverage":db.coverage(prep["id"])},ensure_ascii=False,indent=2))
             return 0
         finally:
             db.close()

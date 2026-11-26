@@ -19,6 +19,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -51,13 +52,16 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
 LOGGER = logging.getLogger("oic-all-dim")
 
 
-def configure_log(path=None):
-    LOGGER.handlers.clear()
+def configure_log(path=None, console_output=True):
+    for handler in LOGGER.handlers[:]:
+        LOGGER.removeHandler(handler)
+        handler.close()
     LOGGER.setLevel(logging.INFO)
     fmt=logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s",datefmt="%H:%M:%S")
     console=logging.StreamHandler(sys.stdout)
     console.setFormatter(fmt)
-    LOGGER.addHandler(console)
+    if console_output:
+        LOGGER.addHandler(console)
     if path:
         path.parent.mkdir(parents=True,exist_ok=True)
         handler=logging.FileHandler(path,encoding="utf-8")
@@ -67,6 +71,284 @@ def configure_log(path=None):
 
 def log(message):
     LOGGER.info(message)
+
+
+class PrepareMonitor:
+    """Read-only observation of preparation; the Live refresh owns no DB connection."""
+    def __init__(self):
+        from rich.console import Console
+        self.console=Console()
+        self.interactive=self.console.is_terminal
+        self.lock=threading.RLock()
+        self.started=time.monotonic()
+        self.phase="INITIALIZING"
+        self.cube="-"
+        self.detail="Opening preparation"
+        self.catalogs={}
+        self.cubes={f"{c}/{y}":{"status":"PENDING","done":0,"total":None,"members":0}
+                    for c in ("AH","FI","MR","MI","MV") for y in ("FY","UY","AY")}
+        self.active={}
+        self.events=deque(maxlen=8)
+        self.samples=deque(maxlen=4)
+        self.concurrency_samples=deque(maxlen=3)
+        self.profiles={}
+        self.selected=None
+        self.plan={"index":0,"total":0,"primary":0,"recovery":0,"current_primary":0,"current_recovery":0}
+        self.stats={"ok":0,"failed":0,"retries":0,"bytes":0,"http":0,"duration":0.0}
+        self.summary={}
+        self.live=None
+        self.handler=None
+
+    def start(self):
+        from rich.live import Live
+        configure_log(OUTPUT/"prepare.log",console_output=not self.interactive)
+        if self.interactive:
+            monitor=self
+            class ActivityHandler(logging.Handler):
+                def emit(self,record):
+                    monitor.add_event(record.getMessage())
+            self.handler=ActivityHandler()
+            LOGGER.addHandler(self.handler)
+            # Rich's independent refresh thread calls render during blocking CURL I/O.
+            self.live=Live(get_renderable=self.render,console=self.console,refresh_per_second=3,
+                           transient=True,redirect_stdout=False,redirect_stderr=False,
+                           vertical_overflow="ellipsis")
+            self.live.start(refresh=True)
+
+    def add_event(self,message):
+        with self.lock:
+            self.events.append((time.strftime("%H:%M:%S"),str(message)[:240]))
+
+    def emit(self,event,**data):
+        message=None
+        with self.lock:
+            if event=="phase":
+                self.phase=data["phase"]
+                self.cube=data.get("cube",self.cube)
+                self.detail=data.get("detail","")
+                message=f"{self.phase} | {self.cube} | {self.detail}"
+            elif event=="catalog":
+                self.catalogs[data["cube"]]=dict(data)
+                message=f"{data['cube']} | catalog {data['source']} | {data['fields']} fields"
+            elif event=="cube":
+                cube=data["cube"]
+                self.cubes[cube].update({k:v for k,v in data.items() if k in ("status","total","done","members")})
+                if "phase" in data:
+                    self.phase=data["phase"]
+                    self.cube=cube
+                    self.detail=data.get("detail","")
+                if "status" in data:
+                    message=f"{cube} | {data['status']}"
+            elif event=="sample":
+                self.samples.append(dict(data["sample"],cube=data["cube"]))
+                v=data["sample"]
+                message=f"{data['cube']} | probe X={v['x']} Y={v['y']} M={v['m']} | {v['seconds']:.2f}s | {'OK' if v['ok'] else 'FAILED'}"
+            elif event=="concurrency_sample":
+                self.concurrency_samples.append(dict(data["sample"]))
+                v=data["sample"]
+                message=f"Concurrency {v['concurrency']} | {v['covered_per_second']:.1f} cells/s | {'OK' if v['ok'] else 'FAILED'}"
+            elif event=="profile":
+                key=(data["cube"],data["key"])
+                self.profiles[key]=dict(data["profile"])
+                self.selected=(data["cube"],dict(data["profile"]))
+            elif event=="plan_job":
+                self.phase="REQUEST_GENERATION"
+                self.cube=data["cube"]
+                self.detail=data["detail"]
+                self.plan.update(index=data["index"],total=data["total"],current_primary=0,current_recovery=0)
+            elif event=="plan_batch":
+                self.plan.update(current_primary=data["primary"],current_recovery=data["recovery"])
+            elif event=="plan_done":
+                self.plan["primary"]+=self.plan["current_primary"]
+                self.plan["recovery"]+=self.plan["current_recovery"]
+                self.plan.update(current_primary=0,current_recovery=0)
+            elif event=="summary":
+                self.summary=dict(data["summary"])
+                for cube,info in self.summary.get("cube_details",{}).items():
+                    total=info["dimensions"]
+                    done=info["inventories_complete"]
+                    self.cubes[cube].update(total=total,done=done,members=info["members"],
+                        status="INVENTORY READY" if done==total else "INCOMPLETE")
+                for cube in self.summary.get("unavailable_cubes",[]):
+                    self.cubes[cube]["status"]="UNAVAILABLE"
+            elif event=="activity":
+                message=data["message"]
+        if message:
+            # Logging handler acquires the monitor lock only after it is released.
+            # File logging remains independent of the live renderer.
+            log(message)
+
+    def context(self):
+        with self.lock:
+            return self.phase,self.detail
+
+    def request_started(self,key,cube,detail,timeout,attempt=1,kind="DISCOVERY"):
+        now=time.monotonic()
+        with self.lock:
+            self.active[key]={"cube":cube,"detail":detail,"kind":kind,"timeout":timeout,
+                "attempt":attempt,"started":now,"stage_at":now,"stage":"INITIALIZING","bytes":0}
+        log(f"{cube} | {kind} | {detail} | attempt {attempt} | START")
+
+    def request_updated(self,key,stage,**data):
+        with self.lock:
+            row=self.active.get(key)
+            if row is None:
+                return
+            if row["stage"]!=stage:
+                row["stage"]=stage
+                row["stage_at"]=time.monotonic()
+            row.update(data)
+        if stage not in ("RECEIVING",):
+            log(f"{key[:12]} | {stage}")
+
+    def request_finished(self,key,ok,metrics=None,error=None):
+        metrics=metrics or {}
+        with self.lock:
+            row=self.active.pop(key,None)
+            if row is None:
+                return
+            self.stats["ok" if ok else "failed"]+=1
+            if metrics.get("http_status")==200 and not metrics.get("replayed"):
+                self.stats["http"]+=1
+                self.stats["bytes"]+=metrics.get("response_bytes",0)
+                self.stats["duration"]+=metrics.get("duration",0)
+        log(f"{row['cube']} | {row['kind']} | {'OK' if ok else 'FAILED'} | "
+            f"{time.monotonic()-row['started']:.2f}s | {error or ''}")
+
+    def retry(self,key,seconds):
+        with self.lock:
+            self.stats["retries"]+=1
+        self.request_updated(key,"COOLDOWN",deadline=time.monotonic()+seconds)
+
+    def render(self):
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        from rich.progress_bar import ProgressBar
+        # Copy only the bounded presentation state, not catalogs or payloads.
+        with self.lock:
+            phase,cube,detail=self.phase,self.cube,self.detail
+            cubes={k:dict(v) for k,v in self.cubes.items()}
+            catalogs={k:dict(v) for k,v in self.catalogs.items()}
+            active=[dict(v) for v in self.active.values()]
+            events=list(self.events)
+            samples=list(self.samples)
+            concurrency=list(self.concurrency_samples)
+            selected=self.selected
+            plan=dict(self.plan)
+            stats=dict(self.stats)
+            profile_count=len(self.profiles)
+            summary=self.summary
+        now=time.monotonic()
+        elapsed=int(now-self.started)
+        total_fields=sum(v["fields"] for v in catalogs.values())
+        ready=sum(v["status"]=="INVENTORY READY" for v in cubes.values())
+        done=sum(v["done"] for v in cubes.values())
+        members=sum(v["members"] for v in cubes.values())
+        current=cubes.get(cube,{})
+        source=catalogs.get(cube,{}).get("source","-")
+        overview=Text()
+        overview.append(f"{phase}  |  {cube}  |  {elapsed//3600:02}:{elapsed//60%60:02}:{elapsed%60:02}\n",style="bold cyan")
+        overview.append(f"Catalogs {len(catalogs)}/15  |  Fields {total_fields:,}  |  Source {source}\n")
+        overview.append(f"Inventories ready {ready}/15  |  Validated hierarchies {done:,}  |  Members {members:,}\n")
+        overview.append(detail,style="yellow")
+        parts=[Panel(overview,title="OIC ALL DIMENSION V2 / PREPARE",border_style="cyan")]
+        grid=Table(expand=True,show_edge=False,box=None,padding=(0,1))
+        for h in ("Category","FY","UY","AY"):
+            grid.add_column(h)
+        for c in ("AH","FI","MR","MI","MV"):
+            cells=[]
+            for y in ("FY","UY","AY"):
+                v=cubes[f"{c}/{y}"]
+                status=v["status"]
+                value=f"{v['done']}/{v['total']}" if status=="DISCOVERING" and v["total"] is not None else status
+                color="green" if status=="INVENTORY READY" else "red" if status=="INCOMPLETE" else "yellow" if status=="DISCOVERING" else "dim"
+                cells.append(Text(value,style=color))
+            grid.add_row(c,*cells)
+        parts.append(Panel(grid,title="01 / CUBE INVENTORY COVERAGE"))
+        requests=[]
+        for row in active:
+            age=now-row["stage_at"]
+            stage=row["stage"]
+            line=Text(f"{row['cube']} | {row['kind']} | attempt {row['attempt']} | {stage}",style="bold yellow")
+            requests.append(line)
+            requests.append(Text(row["detail"],overflow="fold"))
+            if stage=="COOLDOWN":
+                requests.append(Text(f"Retry in {max(0,row.get('deadline',now)-now):.1f}s",style="yellow"))
+            elif stage in ("REQUEST IN FLIGHT","AUTH REFRESH"):
+                limit=row.get("stage_timeout",row["timeout"])
+                requests.append(Text(f"{age:.1f}s elapsed / {limit}s configured timeout (client wait, not server progress)"))
+                requests.append(ProgressBar(total=max(1,limit),completed=min(age,limit),width=40))
+            else:
+                requests.append(Text(f"{now-row['started']:.1f}s operation | {row['bytes']:,} bytes received"))
+        if not requests:
+            requests=[Text("No HTTP operation active — see current preparation stage.",style="dim")]
+        parts.append(Panel(Group(*requests),title=f"02 / ACTIVE OPERATIONS ({len(active)})",border_style="yellow" if active else "blue"))
+        avg=f"{stats['duration']/stats['http']:.2f}s" if stats["http"] else "-"
+        status=Text(f"Operations OK {stats['ok']} | Failed {stats['failed']} | Retries {stats['retries']}\n"
+                    f"HTTP 200 recorded {stats['http']} | Avg {avg} | Received {stats['bytes']/1048576:.2f} MiB\n"
+                    f"Profiles {profile_count} | Job {plan['index']}/{plan['total']} | "
+                    f"Primary planned {plan['primary']+plan['current_primary']:,} | Recovery {plan['recovery']+plan['current_recovery']:,}")
+        parts.append(Panel(status,title="03 / STATISTICS & PLAN"))
+        if phase in ("ADAPTIVE","CONCURRENCY"):
+            bench=Table(expand=True,box=None)
+            for h in ("Cube","X/Y/M","Time","Coverage/s","Useful/s","Result"):
+                bench.add_column(h)
+            for v in samples:
+                bench.add_row(v["cube"],f"{v['x']}/{v['y']}/{v['m']}",f"{v['seconds']:.1f}s",
+                              f"{v['covered_per_second']:.1f}",f"{v['useful_cells']/max(.001,v['seconds']):.1f}",
+                              "OK" if v["ok"] else "FAILED")
+            lines=[bench]
+            if selected:
+                c,v=selected
+                lines.append(Text(f"Selected {c}: X={v['x']} Y={v['y']} M={v['m']} | {v['timeout']}s | {v['source']} / {v['confidence']}",style="green"))
+            for v in concurrency:
+                lines.append(Text(f"Concurrency {v['concurrency']} | {v['seconds']:.1f}s | {v['covered_per_second']:.1f} cells/s | {'OK' if v['ok'] else 'FAILED'}"))
+            parts.append(Panel(Group(*lines),title="04 / ADAPTIVE PROFILING"))
+        # Prioritize active request visibility on short terminal windows.
+        if self.console.height>=35:
+            lines=[Text(f"{stamp} | {message}",overflow="ellipsis",no_wrap=True) for stamp,message in events[-(6 if self.console.height>=48 else 3):]]
+            parts.append(Panel(Group(*(lines or [Text("No activity yet",style="dim")])),title="RECENT ACTIVITY"))
+        parts.append(Text("Ctrl+C to stop | Checkpoints retained | prepare.log",style="dim"))
+        return Group(*parts)
+
+    def stop(self,status):
+        from rich.table import Table
+        with self.lock:
+            self.phase=status
+            summary=dict(self.summary)
+            stats=dict(self.stats)
+        if self.live is not None:
+            self.live.stop()
+        if self.handler is not None:
+            LOGGER.removeHandler(self.handler)
+            self.handler.close()
+        configure_log(OUTPUT/"prepare.log")
+        table=Table(title=f"PREPARATION {status}",show_header=False)
+        table.add_column("Metric")
+        table.add_column("Value")
+        table.add_row("Elapsed",f"{time.monotonic()-self.started:.1f}s")
+        for label,key in (("Catalog fields","catalog_fields"),("Available cubes","available_cubes"),
+                          ("Discovered members","discovered_members"),("Logical jobs","jobs"),
+                          ("Unresolved fields","unresolved_fields")):
+            if key in summary:
+                table.add_row(label,str(summary[key]))
+        for name,info in summary.get("requests",{}).items():
+            table.add_row(name,str(info["requests"]))
+        if "coverage" in summary:
+            table.add_row("Coverage",str(summary["coverage"]))
+        table.add_row("Operations OK / failed",f"{stats['ok']} / {stats['failed']}")
+        table.add_row("Database",str(DB_PATH))
+        self.console.print(table)
+        if status=="READY":
+            log("READY FOR EXTRACTION | python oic_all_dim.py")
+        else:
+            log(f"PREPARE {status} | rerun --prepare to resume")
+        for message in summary.get("errors",[])[:8]:
+            log(f"UNRESOLVED | {message}")
+        if len(summary.get("errors",[]))>8:
+            log("See preparation_summary.json for remaining errors")
 
 
 def read_env():
@@ -139,11 +421,16 @@ def classify_network(exc):
 class OICClient:
     def __init__(self):
         self.session=None
+        self.observer=None
         self.cookie=""
         self.token=""
         self.web_class=None
         self.env_signature=None
         self.reload_credentials(force=True)
+
+    def observe(self,stage,**data):
+        if self.observer is not None:
+            self.observer(stage,**data)
 
     def reload_credentials(self,force=False):
         path=PROJECT_ROOT/".env"
@@ -185,6 +472,7 @@ class OICClient:
         return BASE_URL+PAGE_PATH+"?Class="+self.web_class
 
     def refresh_token(self):
+        self.observe("AUTH REFRESH",stage_timeout=45)
         if not self.cookie:
             raise CollectionError("AUTH_COOKIE_EXPIRED","Set OIC_COOKIE in .env")
         try:
@@ -223,6 +511,7 @@ class OICClient:
         auth_seconds=time.monotonic()-token_start
         for attempt in range(2):
             started=time.monotonic()
+            self.observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0)
             try:
                 with self.session.stream("POST",XMLA_URL,data=payload,
                     headers={"Accept":"text/plain, */*; q=0.01","Content-Type":"text/xml",
@@ -230,6 +519,7 @@ class OICClient:
                              "Authorization":"Bearer "+self.token,"Cookie":self.cookie},
                     timeout=(15,timeout),allow_redirects=False) as response:
                     headers_at=time.monotonic()
+                    self.observe("HEADERS RECEIVED",http_status=response.status_code)
                     if response.status_code in (401,403) and attempt==0:
                         retry_auth=True
                     elif response.status_code!=200:
@@ -250,6 +540,7 @@ class OICClient:
                                 if not chunk:
                                     continue
                                 size+=len(chunk)
+                                self.observe("RECEIVING",bytes=size)
                                 if size>MAX_RESPONSE_BYTES:
                                     raise CollectionError("RESPONSE_TOO_LARGE","100 MiB limit")
                                 if stream:
@@ -295,7 +586,7 @@ class OICClient:
         raise CollectionError("ACCESS_DENIED","Authentication retry exhausted")
 
     def discover(self,profile,payload,timeout):
-        data,_=self.execute_once(profile,payload,timeout)
+        data,metrics=self.execute_once(profile,payload,timeout)
         return data
 
     def close(self):
@@ -431,6 +722,7 @@ def process_request(db,client,r,rid=None,owner=None):
     if digest(r["payload"])!=r["payload_hash"]:
         raise CollectionError("INVALID_QUERY","Prepared payload hash mismatch")
     started=time.monotonic()
+    client.observe("CHECKING RAW RESPONSE")
     replay=replay_raw_response(r)
     if replay:
         path,parsed,sha=replay
@@ -450,6 +742,7 @@ def process_request(db,client,r,rid=None,owner=None):
         finally:
             if rid:
                 db.release_slot(owner)
+        client.observe("PARSING")
         data=path.read_bytes()
         db.register_response(r,path,digest(data),metrics)
         t=time.monotonic()
@@ -468,6 +761,7 @@ def process_request(db,client,r,rid=None,owner=None):
     metrics["useful_cells"]=sum(v[0] is not None for v in parsed[2].values())
     metrics["source_update"]=updated
     t=time.monotonic()
+    client.observe("COMMITTING")
     # A busy write must not result in another HTTP request.
     for attempt in range(3):
         try:
@@ -747,46 +1041,94 @@ def supervisor_lock():
 
 
 def run_prepare(db):
-    client=OICClient()
+    monitor=PrepareMonitor()
+    client=None
+    status="FAILED"
     try:
+        monitor.start()
+        client=OICClient()
         if not client.cookie:
             raise RuntimeError("Set OIC_COOKIE in local .env")
+
         def transport(profile,payload,timeout):
+            phase,detail=monitor.context()
+            cube=f"{profile['code']}/{profile['cube_type']}"
             for attempt in range(MAX_ATTEMPTS):
+                key=uuid.uuid4().hex
+                monitor.request_started(key,cube,detail,timeout,attempt+1,phase)
+                client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
                 try:
-                    return client.discover(profile,payload,timeout)
+                    data,metrics=client.execute_once(profile,payload,timeout)
+                    monitor.request_finished(key,True,metrics)
+                    return data
                 except CollectionError as exc:
                     if exc.kind not in ("RATE_LIMITED","SERVER_UNAVAILABLE","NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","RESPONSE_TIMEOUT") or attempt==MAX_ATTEMPTS-1:
+                        monitor.request_finished(key,False,error=exc.kind)
                         raise
-                    wait_seconds(max(2**attempt,exc.delay,5))
+                    delay=max(2**attempt,exc.delay,5)
+                    monitor.retry(key,delay)
+                    try:
+                        wait_seconds(delay)
+                    finally:
+                        monitor.request_finished(key,False,error=exc.kind)
+                except BaseException as exc:
+                    monitor.request_finished(key,False,error=type(exc).__name__)
+                    raise
+                finally:
+                    client.observer=None
             raise RuntimeError("Discovery retry budget exhausted")
 
         def probe(req,profile,parallel=False):
             # Concurrent preparation probes own their database and CURL
             # connection. Extraction workers remain separate visible processes.
             probe_db=OICDatabase(DB_PATH) if parallel else db
-            probe_client=OICClient() if parallel else client
+            probe_client=None
+            key=req["id"]
             try:
-                existing=probe_db.get_request(req["id"])
+                probe_client=OICClient() if parallel else client
+                existing=probe_db.get_request(key)
+                scope=req["scope"]
+                detail=f"{scope['hierarchy'] or 'YEAR ONLY'} | X={len(scope['members'])} Y={len(scope['years'])} M={len(scope['measures'])}"
                 if existing["status"] in ("COMMITTED","EMPTY"):
+                    monitor.emit("activity",message=f"{req['cube']} | Reusing committed probe {key[:12]}")
                     return {"ok":True,**json.loads(existing["metrics_json"] or "{}")}
                 if existing["status"]=="PROBE_FAILED":
                     return {"ok":False}
-                claimed=probe_db.claim_probe(req["id"])
+                monitor.request_started(key,req["cube"],detail,req["timeout"],kind="CONCURRENCY PROBE" if parallel else "SHAPE PROBE")
+                probe_client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
+                claimed=probe_db.claim_probe(key)
                 result=execute_resilient(probe_db,probe_client,claimed,probe=True)
                 if result.get("pressure"):
-                    wait_seconds(max(10,result.get("delay",0)))
+                    delay=max(10,result.get("delay",0))
+                    monitor.retry(key,delay)
+                    wait_seconds(delay)
+                monitor.request_finished(key,result.get("ok",False),result,error=result.get("error"))
                 if result.get("error") in ("AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR","DISK_FULL","SOURCE_VERSION_CHANGED"):
                     raise CollectionError(result["error"],"Preparation probe stopped")
                 return result
+            except BaseException as exc:
+                monitor.request_finished(key,False,error=getattr(exc,"kind",type(exc).__name__))
+                raise
             finally:
+                if probe_client is not None:
+                    probe_client.observer=None
                 if parallel:
-                    probe_client.close()
+                    if probe_client is not None:
+                        probe_client.close()
                     probe_db.close()
 
-        return 0 if prepare_all(db,transport,probe,OUTPUT,log) else 1
+        ready=prepare_all(db,transport,probe,OUTPUT,log,emit=monitor.emit)
+        status="READY" if ready else "INCOMPLETE"
+        return 0 if ready else 1
+    except KeyboardInterrupt:
+        status="STOPPED"
+        raise
     finally:
-        client.close()
+        try:
+            if client is not None:
+                client.close()
+        finally:
+            monitor.stop(status)
 
 
 def run_extraction(db,workers):

@@ -1301,6 +1301,9 @@ class OICClient:
             self.refresh_token()
 
         for attempt in range(2):
+            if attempt:
+                # The previous streaming response has already been closed.
+                self.refresh_token()
 
             headers = {
                 "Accept": "text/plain, */*; q=0.01",
@@ -1327,8 +1330,6 @@ class OICClient:
                     and attempt == 0
                 ):
 
-                    response.close()
-                    self.refresh_token()
                     continue
 
                 temporary = destination.with_name(
@@ -4061,7 +4062,8 @@ def selected_worker(args) -> int:
                  status="STARTING", current_request=None, request_started_at=None,
                  last_http=None, last_message="Initializing", updated_at=utc_now(),
                  started_at=utc_now(), http_engine="curl_cffi",
-                 requests_total=0, request_time_total_ms=0.0, last_request_ms=None)
+                 requests_total=0, requests_finished=0,
+                 request_time_total_ms=0.0, last_request_ms=None)
     def save_state():
         state["updated_at"] = utc_now()
         write_json(state_path, state)
@@ -4137,7 +4139,7 @@ def selected_worker(args) -> int:
                             http = None
                             request_started = time.monotonic()
                             state.update(status="RUNNING", request_started_at=utc_now(),
-                                         requests_total=state["requests_total"] + 1)
+                                         last_http=None, requests_total=state["requests_total"] + 1)
                             save_state()
                             try:
                                 http = client.execute(req_path.read_bytes(), resp_path)
@@ -4145,6 +4147,7 @@ def selected_worker(args) -> int:
                                 duration = (time.monotonic() - request_started) * 1000
                                 state["last_request_ms"] = round(duration, 2)
                                 state["request_time_total_ms"] += duration
+                                state["requests_finished"] += 1
                                 if http is not None:
                                     state["last_http"] = http["http_status"]
                                 save_state()
@@ -4250,35 +4253,52 @@ def selected_worker(args) -> int:
     return 1 if errors else 0
 
 
+WORKER_TERMINAL = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED"}
+
+
 def selected_summary(config: dict, run_dir: Path):
     workers = []
-    totals = dict(chunks_ok=0, chunks_failed=0, cells=0, bytes=0)
-    terminal = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED"}
+    totals = dict(chunks_ok=0, chunks_failed=0, cells=0, bytes=0,
+                  requests_total=0, requests_finished=0, request_time_total_ms=0.0)
     for wid in range(1, int(config["workers"]) + 1):
         directory = run_dir / f"worker_{wid:02d}"
         state = read_json(directory / "state.json", {}) or {}
         heartbeat = read_json(directory / "heartbeat.json", {}) or {}
         if state.get("run_id") != config["run_id"]:
             state = dict(status="STARTING", worker_id=wid, run_id=config["run_id"])
-        elif state.get("status") not in terminal:
+        if (heartbeat.get("run_id") == config["run_id"]
+                and heartbeat.get("attempt_id") == state.get("attempt_id")
+                and heartbeat.get("pid") == state.get("pid")):
             last = parse_time(heartbeat.get("updated_at"))
-            if not last or (datetime.now(timezone.utc) - last).total_seconds() > 10:
+        else:
+            last = None
+        state["heartbeat_age"] = elapsed_seconds(last.isoformat()) if last else None
+        if state.get("status") not in WORKER_TERMINAL and state.get("pid"):
+            if (last and state["heartbeat_age"] > 10) or (
+                    not last and elapsed_seconds(state.get("started_at")) > 10):
                 state["status"] = "STALE"
+        state.update(chunks_ok=0, chunks_failed=0, cells=0, bytes=0)
         manifest = read_json(directory / "manifest.json", {}) or {}
-        if manifest.get("run_id") == config["run_id"]:
+        if (manifest.get("run_id") == config["run_id"]
+                and manifest.get("query_hash") == query_hash(config)):
             for chunk in manifest.get("chunks", {}).values():
                 if chunk.get("status") == "OK":
-                    totals["chunks_ok"] += 1
-                    totals["cells"] += int(chunk.get("cells") or 0)
-                    totals["bytes"] += int(chunk.get("response_bytes") or 0)
+                    state["chunks_ok"] += 1
+                    state["cells"] += int(chunk.get("cells") or 0)
+                    state["bytes"] += int(chunk.get("response_bytes") or 0)
                 elif chunk.get("status") == "FAILED":
-                    totals["chunks_failed"] += 1
+                    state["chunks_failed"] += 1
+        for name in ("chunks_ok", "chunks_failed", "cells", "bytes",
+                     "requests_total", "requests_finished", "request_time_total_ms"):
+            totals[name] += state.get(name) or 0
         workers.append(state)
-    totals["workers_completed"] = sum(w.get("status") == "COMPLETED" for w in workers)
+    for status in ("RUNNING", "RETRYING", "PAUSED", "STARTING", "STALE", "COMPLETED", "STOPPED"):
+        totals["workers_" + status.lower()] = sum(w.get("status") == status for w in workers)
     totals["workers_failed"] = sum(w.get("status") in {"PARTIAL", "FAILED", "SESSION_EXPIRED"} for w in workers)
-    totals["workers_terminal"] = sum(w.get("status") in terminal for w in workers)
+    totals["workers_terminal"] = sum(w.get("status") in WORKER_TERMINAL for w in workers)
+    totals["average_request_ms"] = (totals["request_time_total_ms"] / totals["requests_finished"]
+                                    if totals["requests_finished"] else None)
     return workers, totals
-
 
 def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
     if Workbook is None:
@@ -4366,160 +4386,174 @@ def selected_export(config: dict, run_dir: Path) -> tuple[str, int]:
     return str(path), row_count
 
 
-def selected_monitor(config: dict, run_dir: Path) -> int:
-    start = utc_now()
-    terminal = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED"}
-    with Live(console=console, refresh_per_second=1, screen=True, transient=False) as live:
-        while True:
-            workers, totals = selected_summary(config, run_dir)
-            table = Table(title=f"OIC SELECTED QUERY | {config['code']} | {config['run_id']}",
-                          box=rich_box.ROUNDED, expand=True)
-            for col in ("Worker", "Status", "Current Chunk", "Last HTTP", "Last Event"):
-                table.add_column(col)
-            for worker in workers:
-                table.add_row(str(worker.get("worker_id", "?")), worker.get("status", "STARTING"),
-                              str(worker.get("current_request") or "—"),
-                              str(worker.get("last_http") or "—"),
-                              str(worker.get("last_message") or "—")[:70])
-            status = (f"X / ROWS: {', '.join(config['x'])}\nY / COLUMNS: {', '.join(config['y'])}\n"
-                      f"Measures: {len(config['measures'])} | Workers: {config['workers']}\n"
-                      f"Chunks OK: {totals['chunks_ok']} | Cells: {totals['cells']:,} | "
-                      f"Bytes: {totals['bytes']:,} | Elapsed: {format_duration(elapsed_seconds(start))}\n"
-                      "Chunk total unknown until exploration finishes; percentages intentionally omitted.")
-            live.update(Group(Panel(status, title="RUN OVERVIEW"), table), refresh=True)
-            write_json(run_dir / "master_manifest.json",
-                       dict(run_id=config["run_id"], updated_at=utc_now(),
-                            summary=totals, workers=workers))
-            if all(w.get("status") in terminal for w in workers) and elapsed_seconds(start) >= 8:
-                break
-            time.sleep(1)
+def prepare_worker_tabs(config: dict, run_dir: Path, config_path: Path,
+                        attempt_id: str) -> tuple[list[list[str]], list[str]]:
+    """Prepare one independent Python command and fresh state per assigned worker."""
+    commands, titles = [], []
+    python = str(Path(sys.executable).resolve())
+    script = str(Path(__file__).resolve())
+    worker_count = int(config["workers"])
+    # Never start a second copy of a surviving worker after a supervisor crash.
+    for wid in range(1, worker_count + 1):
+        directory = run_dir / f"worker_{wid:02d}"
+        old = read_json(directory / "state.json", {}) or {}
+        if (old.get("run_id") == config["run_id"] and old.get("pid")
+                and old.get("status") not in WORKER_TERMINAL):
+            proc = _WorkerProcess(int(old["pid"]), old.get("process_created"))
+            try:
+                if proc.running():
+                    raise RuntimeError(f"Worker {wid:02d} from a prior attempt is still running")
+            finally:
+                proc.close()
+    for wid in range(1, worker_count + 1):
+        directory = run_dir / f"worker_{wid:02d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "heartbeat.json").unlink(missing_ok=True)
+        write_json(directory / "state.json", dict(
+            run_id=config["run_id"], worker_id=wid, attempt_id=attempt_id,
+            status="STARTING", updated_at=utc_now(), last_message="Launching",
+            http_engine="curl_cffi"))
+        commands.append([python, script, "--query-config", str(config_path),
+                         "--worker-id", str(wid), "--attempt-id", attempt_id])
+        titles.append(f"{config.get('query_id', 'Q001')} | WORKER {wid:02d}")
+    return commands, titles
+
+
+def wait_for_query_workers(config: dict, run_dir: Path, attempt_id: str, *,
+                           control_dir: Path, on_tick=None, on_stopping=None) -> None:
+    """Supervise actual Python process handles, never the wt.exe launcher."""
+    pending = set(range(1, int(config["workers"]) + 1))
+    handles = {}
+    launch_deadline = time.monotonic() + 60
+    stopping_since = None
+    stop = control_dir / "stop.flag"
+    force = control_dir / "force_stop.flag"
+
+    def finish(wid, state, message, *, stopped=False):
+        directory = run_dir / f"worker_{wid:02d}"
+        (directory / f"cancel-{attempt_id}.flag").touch()
+        state.update(run_id=config["run_id"], worker_id=wid, attempt_id=attempt_id,
+                     status="STOPPED" if stopped else "FAILED",
+                     last_message=message, current_request=None, request_started_at=None,
+                     updated_at=utc_now())
+        write_json(directory / "state.json", state)
+        pending.discard(wid)
+
     try:
-        destination, rows = selected_export(config, run_dir)
-        log(f"EXCEL: {destination} ({rows:,} rows)", level="OK")
-    except Exception as exc:
-        log(f"EXCEL ERROR: {exc}", level="ERROR")
+        while pending:
+            stopping = stop.exists() or force.exists()
+            if stopping and stopping_since is None:
+                stopping_since = time.monotonic()
+                (run_dir / "stop.flag").touch()
+                if on_stopping:
+                    on_stopping()
+            killing = force.exists() or (stopping_since is not None and
+                time.monotonic() - stopping_since > max(30, int(config.get("timeout", 60)) + 30))
+            for wid in list(pending):
+                directory = run_dir / f"worker_{wid:02d}"
+                state = read_json(directory / "state.json", {}) or {}
+                if state.get("attempt_id") != attempt_id:
+                    state = {}
+                if wid not in handles and state.get("pid") and state.get("process_created"):
+                    handles[wid] = _WorkerProcess(int(state["pid"]),
+                                                  int(state["process_created"]), can_terminate=True)
+                proc = handles.get(wid)
+                if proc is not None:
+                    if proc.running():
+                        if killing:
+                            proc.terminate()
+                        continue
+                    code = proc.exit_code()
+                    if state.get("status") not in WORKER_TERMINAL:
+                        finish(wid, state, f"Worker exited without final state (exit={code})",
+                               stopped=stopping)
+                    elif code not in (None, 0) and state.get("status") == "COMPLETED":
+                        finish(wid, state, f"Worker exited with code {code}", stopped=stopping)
+                    else:
+                        pending.discard(wid)
+                    proc.close()
+                    del handles[wid]
+                elif state.get("status") in WORKER_TERMINAL:
+                    pending.discard(wid)
+                elif stopping or time.monotonic() >= launch_deadline:
+                    finish(wid, state, "Worker cancelled before startup" if stopping else
+                           "Worker tab did not register within 60s", stopped=stopping)
+            if on_tick:
+                on_tick()
+            if pending:
+                time.sleep(0.5)
+    except BaseException:
+        # Prevent late launches or orphan workers if the supervisor fails.
+        (run_dir / "stop.flag").touch()
+        for wid in pending:
+            directory = run_dir / f"worker_{wid:02d}"
+            (directory / f"cancel-{attempt_id}.flag").touch()
+        for proc in handles.values():
+            proc.terminate()
+        raise
+    finally:
+        for proc in handles.values():
+            proc.close()
+
+
+def selected_monitor(config: dict, run_dir: Path, attempt_id: str | None = None) -> int:
+    start = utc_now()
+    qid = config.get("query_id", "Q001")
+    entry = dict(query_id=qid, code=config["code"], cube_type=config.get("cube_type", "FY"),
+                 workers=config["workers"], status="RUNNING", started_at=start)
+    with Live(console=console, refresh_per_second=1, screen=True, auto_refresh=False) as live:
+        def tick():
+            workers, totals = selected_summary(config, run_dir)
+            live.update(render_batch_monitor(
+                dict(run_id=config["run_id"], status=entry["status"], current_query=qid,
+                     started_at=start, queries=[entry]), config, workers, totals,
+                read_json(run_dir.parent / "cooldown.json", {}) or {}), refresh=True)
+            write_json(run_dir / "master_manifest.json", dict(
+                run_id=config["run_id"], updated_at=utc_now(), summary=totals, workers=workers))
+            return totals
+        if attempt_id:
+            wait_for_query_workers(config, run_dir, attempt_id, control_dir=run_dir, on_tick=tick)
+        else:
+            while tick()["workers_terminal"] < int(config["workers"]):
+                time.sleep(1)
+        _, totals = selected_summary(config, run_dir)
+        entry["status"] = "COMPLETED" if totals["workers_completed"] == config["workers"] else (
+            "STOPPED" if (run_dir / "stop.flag").exists() else "PARTIAL" if totals["chunks_ok"] else "FAILED")
+        entry["finished_at"] = utc_now()
+        try:
+            destination, rows = selected_export(config, run_dir)
+            entry.update(excel_path=destination, rows=rows)
+        except Exception as exc:
+            entry.update(status="PARTIAL" if totals["chunks_ok"] else "FAILED", error=f"EXCEL: {exc}")
+        tick()
+    log(f"{entry['status']} | EXCEL: {entry.get('excel_path', '—')} | rows={entry.get('rows', 0)}",
+        level="OK" if entry["status"] == "COMPLETED" else "WARN")
+    return 0 if entry["status"] == "COMPLETED" else 1
+
+
+def selected_launch(config: dict, run_dir: Path, config_path: Path) -> int:
+    attempt_id = uuid.uuid4().hex
+    commands, titles = prepare_worker_tabs(config, run_dir, config_path, attempt_id)
+    monitor = [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
+               "--query-config", str(config_path), "--monitor-only", "--attempt-id", attempt_id]
+    launch_terminal_window([monitor, *commands], title="OIC | Execution", cwd=HERE,
+                           tab_titles=["LIVE MONITOR", *titles],
+                           keep_open=False, maximized=True)
     return 0
-
-
-def selected_launch(
-    config: dict,
-    run_dir: Path,
-    config_path: Path,
-) -> int:
-    if os.name != "nt":
-        raise RuntimeError(
-            "Selected-query terminal launcher requires Windows"
-        )
-
-    workers = int(config["workers"])
-
-    if workers < 1:
-        raise ValueError("Worker count must be at least 1")
-
-    run_dir = Path(run_dir).resolve()
-    config_path = Path(config_path).resolve()
-
-    python_path = str(Path(sys.executable).resolve())
-    script_path = str(Path(__file__).resolve())
-
-    def command(*extra: str) -> list[str]:
-        return [
-            python_path,
-            script_path,
-            "--query-config",
-            str(config_path),
-            *extra,
-        ]
-
-    # Reset state only for the current run.
-    # Never reuse a terminal status from an earlier attempt.
-
-    for worker_id in range(1, workers + 1):
-        state_file = (
-            run_dir
-            / f"worker_{worker_id:02d}"
-            / "state.json"
-        )
-
-        state_file.parent.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        write_json(
-            state_file,
-            {
-                "run_id": config["run_id"],
-                "worker_id": worker_id,
-                "status": "STARTING",
-                "current_request": None,
-                "request_started_at": None,
-                "last_http": None,
-                "last_message": "Starting this attempt",
-                "updated_at": utc_now(),
-            },
-        )
-
-    worker_commands = [
-        command("--worker-id", str(worker_id))
-        for worker_id in range(1, workers + 1)
-    ]
-
-    worker_titles = [
-        f"OIC | Worker {worker_id:02d}"
-        for worker_id in range(1, workers + 1)
-    ]
-
-    # Worker Window:
-    # PowerShell -> N background processes supervised in one console.
-    # PowerShell fallback -> N processes in one window.
-
-    worker_mode = launch_terminal_window(
-        worker_commands,
-        title="OIC | Parallel Workers",
-        cwd=HERE,
-        tab_titles=worker_titles,
-        keep_open=True,
-    )
-
-    log(
-        f"Workers launched via {worker_mode} "
-        f"({workers} processes)",
-        level="OK",
-    )
-
-    # Monitor Window:
-    # Always separate from Main and Worker windows.
-
-    monitor_mode = launch_terminal_window(
-        [
-            command("--monitor-only")
-        ],
-        title="OIC | Live Monitor",
-        cwd=HERE,
-        tab_titles=["OIC | Live Monitor"],
-        keep_open=True,
-    )
-
-    log(
-        f"Live Monitor launched via {monitor_mode}",
-        level="OK",
-    )
-
-    return 0
-
 
 # ============================================================
-# BATCH SUPERVISOR — one monitor, sequential queries, parallel
-# hidden workers; all state survives application restarts.
+# BATCH SUPERVISOR — one execution window, sequential queries,
+# independent visible parallel worker tabs.
 # ============================================================
 
 BATCH_TERMINAL = {"COMPLETED", "PARTIAL", "FAILED", "STOPPED", "SESSION_EXPIRED", "PENDING"}
 
 def _batch_snapshot(batch_dir: Path, *, status: str, current: str | None,
                     entries: list[dict], error: str = "") -> None:
+    previous = read_json(batch_dir / "batch_manifest.json", {}) or {}
+    started = utc_now() if status == "STARTING" else previous.get("started_at", utc_now())
     write_json(batch_dir / "batch_manifest.json", {
-        "run_id": batch_dir.name, "pid": os.getpid(),
+        "run_id": batch_dir.name, "pid": os.getpid(), "started_at": started,
         "status": status, "current_query": current,
         "queries": entries, "error": error,
         "updated_at": utc_now(),
@@ -4544,37 +4578,124 @@ def _update_history(root: Path, record: dict) -> None:
         writer.writerows(rows)
     temp.replace(path)
 
+def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: dict,
+                         cooldown: dict):
+    entries = manifest.get("queries", [])
+    current = manifest.get("current_query")
+    entry = next((e for e in entries if e.get("query_id") == current), {})
+    if not entry and entries:
+        entry = next((e for e in reversed(entries) if e.get("started_at")), {})
+    status = manifest.get("status", "STARTING")
+    colors = dict(COMPLETED="green", RUNNING="bright_cyan", RETRYING="yellow",
+                  PAUSED="yellow", STALE="yellow", FAILED="red", PARTIAL="yellow",
+                  SESSION_EXPIRED="red", STOPPED="yellow", STOPPING="yellow",
+                  STARTING="cyan", PENDING="dim")
+    def styled(value):
+        return Text(str(value), style=colors.get(str(value), "white"))
+    def panel(value, title, style="cyan"):
+        return Panel(value, title=title, border_style=style, padding=(0, 1))
+    def short(value, length=65):
+        return str(value or "—")[:length]
+    def elapsed(start, end=None):
+        a, b = parse_time(start), parse_time(end)
+        return max(0, int(((b or datetime.now(timezone.utc)) - a).total_seconds())) if a else 0
+    done = sum(e.get("status") == "COMPLETED" for e in entries)
+    failed = sum(e.get("status") in ("FAILED", "PARTIAL", "SESSION_EXPIRED") for e in entries)
+    stopped = sum(e.get("status") == "STOPPED" for e in entries)
+    waiting = sum(e.get("status") == "PENDING" for e in entries)
+    n = len(entries)
+    coverage = done / n if n else 0.0
+    query_elapsed = elapsed(entry.get("started_at"), entry.get("finished_at"))
+    calls = int(totals.get("requests_total") or 0)
+    avg = totals.get("average_request_ms")
+    rate = f"{calls / query_elapsed:.2f}/s" if query_elapsed else "—"
+    cool = max(0, int(float(cooldown.get("until_ts") or 0) - time.time()))
+    bytes_mb = int(totals.get("bytes") or 0) / 1024 ** 2
+    engine = ", ".join(sorted({str(w["http_engine"]) for w in workers if w.get("http_engine")})) or "—"
+    active = sum(totals.get("workers_" + k, 0) for k in ("running", "retrying", "paused"))
+    count = int(config.get("workers") or 0)
+    header = panel(Text("OIC PARALLEL COLLECTOR | LIVE EXTRACTION MONITOR", justify="center",
+                        style="bold bright_cyan"), "XMLA / MDX / EXCEL")
+    overview = Text.assemble(("Run: ", "dim"), short(manifest.get("run_id"), 45),
+        (" | ", "dim"), styled(status),
+        f" | Elapsed {format_duration(elapsed(manifest.get('started_at'), manifest.get('finished_at')))}",
+        f"\nQuery: {entry.get('query_id', '—')} | {config.get('code', '—')}/{config.get('cube_type', '—')}"
+        f" | HTTP: {engine} | Parallel {count}")
+    def captions(axis):
+        values = config.get(axis, [])
+        # Config contains stable MDX; don't guess human-readable captions.
+        return short(", ".join(str(v) for v in values), max(22, console.size.width - 24))
+    configuration = Text(f"X / ROWS: {captions('x')}\nY / COLUMNS: {captions('y')}\n"
+        f"Values: {len(config.get('measures', []))} | X/Y chunk: "
+        f"{config.get('x_chunk', '—')}/{config.get('y_chunk', '—')}")
+    width = 18
+    bar = "█" * int(coverage * width) + "░" * (width - int(coverage * width))
+    progress = Text.assemble((f"{bar} {done}/{n} COMPLETED ({coverage * 100:.1f}%)", "green"),
+        f" | Pending {waiting} | Failed/partial {failed} | Stopped {stopped}")
+    metrics = Text(
+        f"Chunks OK {totals.get('chunks_ok', 0):,} | Failed {totals.get('chunks_failed', 0):,}"
+        f" | Cells {totals.get('cells', 0):,} | {bytes_mb:.2f} MiB\n"
+        f"Active {active}/{count} | Execute calls {calls:,} | Avg "
+        + (f"{avg:.0f} ms" if avg is not None else "—")
+        + f" | Rate {rate} | Cooldown {str(cool) + 's' if cool else 'NONE'}\n"
+        f"Excel: {entry.get('export_status', 'PENDING')} | Rows {entry.get('rows', '—')} "
+        "| Dynamic chunks: total unknown")
+    worker_table = Table(box=rich_box.SIMPLE, expand=True, padding=(0, 1), title="05 / PARALLEL WORKERS")
+    for name in ("ID", "Status", "Current X/Y", "OK", "Fail", "HTTP", "ms", "HB", "Last event"):
+        worker_table.add_column(name, no_wrap=name not in ("Last event",), overflow="ellipsis")
+    for w in workers:
+        current_key = str(w.get("current_request") or "")
+        match = re.search(r"_x(\d+)_y(\d+)$", current_key)
+        xy = f"{int(match[1])}/{int(match[2])}" if match else "—"
+        latency = w.get("last_request_ms")
+        hb = w.get("heartbeat_age")
+        worker_table.add_row(f"W{int(w.get('worker_id') or 0):02d}", styled(w.get("status", "STARTING")),
+            xy, str(w.get("chunks_ok", 0)), str(w.get("chunks_failed", 0)),
+            str(w.get("last_http") or "—"), f"{latency:.0f}" if latency is not None else "—",
+            f"{hb}s" if hb is not None else "—", short(w.get("last_message"), 45))
+    queue = Table(box=rich_box.SIMPLE, expand=True, padding=(0, 1), title="06 / QUERY QUEUE")
+    for name in ("Query", "Class/Cube", "Status", "Workers", "Chunks", "Rows"):
+        queue.add_column(name, overflow="ellipsis", no_wrap=True)
+    # Keep current query visible on shorter terminals.
+    row_limit = max(1, min(len(entries), console.size.height - 25 - len(workers)))
+    index = next((i for i, e in enumerate(entries) if e.get("query_id") == current), len(entries) - 1)
+    first = max(0, min(index - row_limit // 2, len(entries) - row_limit))
+    for e in entries[first:first + row_limit]:
+        running = e.get("query_id") == current
+        queue.add_row(str(e.get("query_id", "—")), f"{e.get('code', '—')}/{e.get('cube_type', '—')}",
+                      styled(e.get("status", "PENDING")),
+                      f"{totals.get('workers_terminal', 0)}/{count} ended" if running else str(e.get("workers", "—")),
+                      str(totals.get("chunks_ok", 0) if running else e.get("chunks_ok", "—")),
+                      str(e.get("rows", "—")))
+    if len(entries) > row_limit:
+        queue.caption = f"Showing {first + 1}–{first + row_limit} of {len(entries)} queries"
+    recent = sorted(workers, key=lambda w: str(w.get("updated_at", "")), reverse=True)[:3]
+    events = Text("\n".join(f"{str(w.get('updated_at', ''))[11:19]} W{int(w.get('worker_id') or 0):02d} "
+                             f"{short(w.get('last_message'), 110)}" for w in recent) or "Waiting for workers")
+    if manifest.get("error") or entry.get("error"):
+        events.append("\n" + short(manifest.get("error") or entry.get("error"), 160), style="red")
+    return Group(header, panel(overview, "01 / RUN OVERVIEW"),
+                 panel(configuration, "02 / QUERY CONFIGURATION"),
+                 panel(progress, "03 / BATCH PROGRESS"), panel(metrics, "04 / EXTRACTION METRICS"),
+                 worker_table, queue, panel(events, "07 / LATEST ACTIVITY"),
+                 Text("Refresh 1s | STOP / FORCE STOP: Main | Ctrl+C: close monitor", style="dim"))
+
+
 def batch_monitor(batch_dir: Path) -> int:
-    with Live(console=console, refresh_per_second=1,
-              screen=True, transient=False) as live:
+    with Live(console=console, refresh_per_second=1, screen=True,
+              auto_refresh=False, transient=False) as live:
         while True:
             manifest = read_json(batch_dir / "batch_manifest.json", {}) or {}
-            rows = manifest.get("queries", [])
-            table = Table(title="OIC | MULTI-QUERY LIVE MONITOR",
-                          box=rich_box.ROUNDED, expand=True)
-            for name in ("Query", "Category", "Cube", "Status", "Workers", "Chunks", "Last Event"):
-                table.add_column(name)
-            for entry in rows:
-                qdir = batch_dir / entry["query_id"]
-                cfg = read_json(qdir / "query_config.json", {}) or {}
-                if cfg and entry.get("status") in ("RUNNING", "STOPPING"):
-                    workers, summary = selected_summary(cfg, qdir)
-                    workers_label = f"{summary['workers_terminal']}/{len(workers)}"
-                    chunks_label = str(summary["chunks_ok"])
-                    last = next((w.get("last_message") for w in reversed(workers)
-                                 if w.get("last_message")), "—")
-                else:
-                    workers_label = str(entry.get("workers", "—"))
-                    chunks_label = str(entry.get("chunks_ok", "—"))
-                    last = str(entry.get("error") or "—")
-                table.add_row(entry["query_id"], str(entry.get("code", "")),
-                              str(entry.get("cube_type", "FY")),
-                              str(entry.get("status", "PENDING")),
-                              workers_label, chunks_label, str(last)[:55])
-            head = (f"Run: {batch_dir.name} | Status: {manifest.get('status','STARTING')}\n"
-                    f"Current: {manifest.get('current_query') or '—'} | "
-                    f"Queries: {len(rows)} | Ctrl+C closes only this monitor")
-            live.update(Group(Panel(head, title="BATCH OVERVIEW"), table), refresh=True)
+            entries = manifest.get("queries", [])
+            current = manifest.get("current_query")
+            if not current:
+                last = next((e for e in reversed(entries) if e.get("started_at")), {})
+                current = last.get("query_id")
+            qdir = batch_dir / current if current else None
+            config = read_json(qdir / "query_config.json", {}) if qdir else {}
+            workers, totals = selected_summary(config, qdir) if config else ([], {})
+            live.update(render_batch_monitor(manifest, config or {}, workers, totals,
+                read_json(batch_dir / "cooldown.json", {}) or {}), refresh=True)
             if manifest.get("status") in ("COMPLETED", "PARTIAL", "FAILED", "STOPPED"):
                 break
             time.sleep(1)
@@ -4600,10 +4721,10 @@ def run_batch(batch_dir: Path) -> int:
     _batch_snapshot(batch_dir, status="STARTING", current=None, entries=entries)
     python = str(Path(sys.executable).resolve())
     script = str(Path(__file__).resolve())
+    window_id = "OIC-Execution-" + uuid.uuid4().hex
+    monitor_command = [python, script, "--batch-monitor", str(batch_dir)]
+    monitor_open = False
     try:
-        launch_terminal_window(
-            [[python, script, "--batch-monitor", str(batch_dir)]],
-            title="OIC | Live Monitor", cwd=HERE, keep_open=False)
         for entry in entries:
             qid = entry["query_id"]
             qdir = batch_dir / qid
@@ -4620,70 +4741,47 @@ def run_batch(batch_dir: Path) -> int:
                     and Path(previous["excel_path"]).is_file()):
                 entry.update(previous)
                 continue
-            if stop.exists():
+            if stop.exists() or force.exists():
                 break
             (qdir / "stop.flag").unlink(missing_ok=True)
             entry.update(status="RUNNING", error="", started_at=utc_now())
             _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
-            processes = []
+            attempt_id = uuid.uuid4().hex
             launch_error = None
-            for worker_id in range(1, int(config["workers"]) + 1):
-                if stop.exists():
-                    break
-                wd = qdir / f"worker_{worker_id:02d}"
-                wd.mkdir(parents=True, exist_ok=True)
-                state_path = wd / "state.json"
-                write_json(state_path, dict(run_id=config["run_id"],
-                           worker_id=worker_id, status="STARTING",
-                           last_message="Launching", updated_at=utc_now()))
-                logfile = (wd / "worker.log").open("a", encoding="utf-8")
-                try:
-                    proc = subprocess.Popen(
-                        [python, script, "--query-config", str(cfg_path),
-                         "--worker-id", str(worker_id)],
-                        cwd=str(HERE), stdout=logfile, stderr=subprocess.STDOUT,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                    processes.append((worker_id, proc, logfile))
-                except Exception as exc:
-                    logfile.close()
-                    launch_error = str(exc)
-                    stop_requested_for_query = True
-                    for _, active_proc, _ in processes:
-                        if active_proc.poll() is None:
-                            active_proc.terminate()
-                    break
-            if launch_error:
-                entry.update(status="FAILED", error="WORKER LAUNCH: " + launch_error[:250])
+            commands, titles = prepare_worker_tabs(config, qdir, cfg_path, attempt_id)
             try:
-                stopping_since = None
-                while any(proc.poll() is None for _, proc, _ in processes):
-                    if stop.exists() and stopping_since is None:
-                        stopping_since = time.monotonic()
-                        entry["status"] = "STOPPING"
-                        _batch_snapshot(batch_dir, status="STOPPING", current=qid, entries=entries)
-                    if force.exists() or (stopping_since is not None and
-                        time.monotonic() - stopping_since >
-                        max(30, int(config.get("timeout", 60)) + 30)):
-                        for _, proc, _ in processes:
-                            if proc.poll() is None:
-                                proc.terminate()
-                    time.sleep(0.5)
-            finally:
-                for wid, proc, logfile in processes:
-                    proc.wait()
-                    logfile.close()
-                    state_path = qdir / f"worker_{wid:02d}" / "state.json"
+                if not monitor_open:
+                    launch_terminal_window([monitor_command, *commands],
+                                           title="OIC | Execution", cwd=HERE,
+                                           tab_titles=["LIVE MONITOR", *titles], keep_open=False,
+                                           maximized=True, window_id=window_id)
+                    monitor_open = True
+                else:
+                    launch_terminal_window(commands, title="OIC | Execution", cwd=HERE,
+                                           tab_titles=titles, keep_open=False, window_id=window_id)
+            except Exception as exc:
+                launch_error = str(exc)
+                for wid in range(1, int(config["workers"]) + 1):
+                    wd = qdir / f"worker_{wid:02d}"
+                    (wd / f"cancel-{attempt_id}.flag").touch()
+                    state_path = wd / "state.json"
                     state = read_json(state_path, {}) or {}
-                    if proc.returncode and state.get("status") not in (
-                        "FAILED", "PARTIAL", "SESSION_EXPIRED", "STOPPED"):
-                        state.update(status="STOPPED" if stop.exists() else "FAILED",
-                                     last_message=f"Worker exited: {proc.returncode}",
-                                     updated_at=utc_now())
-                        write_json(state_path, state)
+                    state.update(status="FAILED", last_message="Terminal launch failed: " + launch_error[:200],
+                                 updated_at=utc_now())
+                    write_json(state_path, state)
+            if launch_error is None:
+                def mark_stopping():
+                    entry["status"] = "STOPPING"
+                    _batch_snapshot(batch_dir, status="STOPPING", current=qid, entries=entries)
+                wait_for_query_workers(config, qdir, attempt_id, control_dir=batch_dir,
+                                       on_stopping=mark_stopping)
+            else:
+                entry["error"] = "WORKER LAUNCH: " + launch_error[:250]
+
             workers, totals = selected_summary(config, qdir)
             entry["chunks_ok"] = totals["chunks_ok"]
             entry["finished_at"] = utc_now()
-            if stop.exists():
+            if stop.exists() or force.exists():
                 entry["status"] = "STOPPED"
             elif launch_error:
                 entry["status"] = "PARTIAL" if totals["chunks_ok"] else "FAILED"
@@ -4692,11 +4790,13 @@ def run_batch(batch_dir: Path) -> int:
             else:
                 entry["status"] = "PARTIAL" if totals["chunks_ok"] else "FAILED"
             try:
+                entry["export_status"] = "EXPORTING"
+                _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
                 output, row_count = selected_export(config, qdir)
-                entry.update(excel_path=output, rows=row_count)
+                entry.update(excel_path=output, rows=row_count, export_status="COMPLETED")
             except Exception as exc:
                 entry.update(status="PARTIAL" if totals["chunks_ok"] else "FAILED",
-                             error=f"EXCEL: {exc}")
+                             export_status="FAILED", error=f"EXCEL: {exc}")
             _update_history(output_root, dict(
                 run_id=batch_dir.name, query_id=qid, code=config["code"],
                 cube_type=config.get("cube_type", "FY"), cube=config["cube"],
@@ -4704,7 +4804,7 @@ def run_batch(batch_dir: Path) -> int:
                 finished_at=entry["finished_at"], rows=entry.get("rows", 0),
                 excel_path=entry.get("excel_path", ""), error=entry.get("error", "")))
             _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)
-        final_status = ("STOPPED" if stop.exists()
+        final_status = ("STOPPED" if stop.exists() or force.exists()
                         else "COMPLETED" if all(e["status"] == "COMPLETED" for e in entries)
                         else "PARTIAL")
         _batch_snapshot(batch_dir, status=final_status, current=None, entries=entries)
@@ -4722,12 +4822,28 @@ def selected_main(argv) -> int:
     parser.add_argument("--worker-id", type=int, default=0)
     parser.add_argument("--monitor-only", action="store_true")
     parser.add_argument("--export-only", action="store_true")
+    parser.add_argument("--attempt-id")
     args = parser.parse_args(argv)
     config, run_dir = selected_paths(args.query_config)
     if args.worker_id:
-        return selected_worker(args)
+        try:
+            return selected_worker(args)
+        except Exception as exc:
+            # Record startup failures as well as failures outside the extraction loop.
+            if args.attempt_id and 1 <= args.worker_id <= int(config["workers"]):
+                path = run_dir / f"worker_{args.worker_id:02d}" / "state.json"
+                state = read_json(path, {}) or {}
+                if (state.get("attempt_id") == args.attempt_id
+                        and state.get("pid") in (None, os.getpid())
+                        and not (path.parent / f"cancel-{args.attempt_id}.flag").exists()):
+                    state.update(status="FAILED", pid=os.getpid(),
+                                 process_created=_current_process_creation(),
+                                 exit_code=1, last_message=str(exc)[:200], updated_at=utc_now())
+                    write_json(path, state)
+            log(str(exc), args.worker_id, "ERROR")
+            return 1
     if args.monitor_only:
-        return selected_monitor(config, run_dir)
+        return selected_monitor(config, run_dir, args.attempt_id)
     if args.export_only:
         path, rows = selected_export(config, run_dir)
         log(f"EXPORTED {rows:,} rows to {path}", level="OK")

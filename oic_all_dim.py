@@ -212,7 +212,8 @@ class PrepareMonitor:
             row=self.active.pop(key,None)
             if row is None:
                 return
-            self.stats["ok" if ok else "failed"]+=1
+            if row["kind"]!="RECOVERY":
+                self.stats["ok" if ok else "failed"]+=1
             if metrics.get("http_status")==200 and not metrics.get("replayed"):
                 self.stats["http"]+=1
                 self.stats["bytes"]+=metrics.get("response_bytes",0)
@@ -429,17 +430,24 @@ def extract_error_details(body):
     """Classify bounded error content; never return arbitrary server text."""
     text=body[:65536].decode("utf-8",errors="replace")
     lower=text.casefold()
-    if "session_expired" in lower or "session expired" in lower:
-        return "AUTH_COOKIE_EXPIRED"
-    if "token expired" in lower or "expired token" in lower:
-        return "AUTH_TOKEN_EXPIRED"
     try:
         root=ET.fromstring(text)
     except ET.ParseError:
+        # Recognize explicit small non-XML auth responses, not arbitrary data.
+        if len(body)<=4096 and not lower.lstrip().startswith("<"):
+            if "session_expired" in lower or "session expired" in lower:
+                return "AUTH_COOKIE_EXPIRED"
+            if "token expired" in lower or "expired token" in lower:
+                return "AUTH_TOKEN_EXPIRED"
         return None
     faults=[e for e in root.iter() if local(e.tag) in ("Fault","Error")]
     if not faults:
         return None
+    lower=" ".join(ET.tostring(e,encoding="unicode").casefold() for e in faults)
+    if "session_expired" in lower or "session expired" in lower:
+        return "AUTH_COOKIE_EXPIRED"
+    if "token expired" in lower or "expired token" in lower:
+        return "AUTH_TOKEN_EXPIRED"
     # Interpret known phrases only inside a structured XMLA fault.
     if any(v in lower for v in ("not supported","not implemented","unsupported rowset","invalid restriction")):
         return "DISCOVER_NOT_SUPPORTED"
@@ -526,7 +534,7 @@ class OICClient:
         self.env_token=token
         if changed or token_changed or force:
             self.token=token
-            self.token_scope=env.get("OIC_CLASS") or None
+            self.token_scope=None
         if changed or self.session is None:
             self.reconnect()
         return changed or token_changed or force
@@ -564,10 +572,10 @@ class OICClient:
                 timeout=(15,45),allow_redirects=False)
         except RequestException as exc:
             error=classify_network(exc)
+            if error.kind=="TLS_ERROR":
+                raise CollectionError("TLS_ERROR","GEN_TOKEN TLS verification failure",endpoint="GEN_TOKEN") from None
             raise CollectionError("AUTH_ENDPOINT_ERROR",f"GEN_TOKEN | {error.kind}",5,endpoint="GEN_TOKEN") from None
         if response.status_code!=200:
-            if response.status_code==401:
-                raise CollectionError("AUTH_COOKIE_EXPIRED","GenToken rejected session")
             raise classify_http(response.status_code,response.headers,"GEN_TOKEN",response.content[:65536])
         try:
             token=response.json().get("d","")
@@ -1155,10 +1163,9 @@ def run_prepare(db):
             try:
                 data,metrics=client.execute_once(profile,payload,timeout)
                 # HTTP 200 can still carry a SOAP fault or session error.
-                if phase!="HEALTH_CHECK":
-                    diagnostic=extract_error_details(data)
-                    if diagnostic:
-                        raise CollectionError(diagnostic,"XMLA error response",5,endpoint="XMLA",http_status=200)
+                diagnostic=extract_error_details(data)
+                if diagnostic:
+                    raise CollectionError(diagnostic,"XMLA error response",5,endpoint="XMLA",http_status=200)
                 monitor.request_finished(key,True,metrics)
                 return data
             except BaseException as exc:
@@ -1175,7 +1182,7 @@ def run_prepare(db):
             try:
                 wait_seconds(delay)
             finally:
-                monitor.request_finished(key,False,error="Cooldown completed")
+                monitor.request_finished(key,True,error="Cooldown ended")
 
         def check_cube_health(profile):
             from oic_all_dim_prepare import build_discover_request,parse_discover_rows
@@ -1189,6 +1196,8 @@ def run_prepare(db):
                 if not parse_discover_rows(data):
                     raise ValueError("Empty health response")
             except (RuntimeError,ValueError) as exc:
+                if getattr(exc,"kind","") in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","ACCESS_DENIED","TLS_ERROR","AUTH_ENDPOINT_ERROR","RATE_LIMITED"):
+                    raise
                 raise CollectionError("SERVER_UNAVAILABLE","XMLA health check failed",5,endpoint="XMLA") from exc
             health_checks[cube]=time.monotonic()
             return True

@@ -819,7 +819,8 @@ class OICClient:
             if self.stop():
                 raise CollectionError("USER_STOP")
             started=time.monotonic()
-            self.observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0)
+            self.observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0,
+                         remaining_seconds=max(0,int(jwt_exp(self.token)-time.time())))
             try:
                 with self.session.stream("POST",XMLA_URL,data=payload,
                     headers={"Accept":"text/plain, */*; q=0.01","Content-Type":"text/xml",
@@ -1368,6 +1369,9 @@ class WorkerMonitor:
             except Exception as exc:
                 self.live=None
                 LOGGER.warning("Rich worker display unavailable: %s",type(exc).__name__)
+                console_handler=logging.StreamHandler(sys.stdout)
+                console_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s",datefmt="%H:%M:%S"))
+                LOGGER.addHandler(console_handler)
 
     def stop(self,final):
         self.observe(final)

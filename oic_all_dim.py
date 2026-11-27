@@ -576,7 +576,7 @@ def run_auto_auth(stop=lambda:False,force=False,expected=None):
     expected=credential_values() if expected is None else expected
     with authentication_lock(stop):
         current=credential_values()
-        if not force and current!=expected and current[0] and jwt_exp(current[1])>time.time()+60:
+        if not force and current!=expected and current[0] and jwt_exp(current[1])>time.time()+60 and auth_status().get("expires")==jwt_exp(current[1]) and auth_status().get("cookie_status")=="VALID":
             return current
         script=PROJECT_ROOT/"oic_auth.py"
         config=read_env()
@@ -1505,7 +1505,7 @@ def process_request(db,client,r,rid=None,owner=None):
         data=path.read_bytes()
         diagnostic=extract_error_details(data)
         if diagnostic in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","ACCESS_DENIED"):
-            raise CollectionError(diagnostic,"XMLA authentication rejected",endpoint="XMLA")
+            raise CollectionError(diagnostic,"XMLA authentication rejected",endpoint="XMLA",http_status=200)
         db.register_response(r,path,digest(data),metrics)
         t=time.monotonic()
         parsed=parse_xmla(data,scope)
@@ -1553,6 +1553,8 @@ def process_request(db,client,r,rid=None,owner=None):
 def handle_request_failure(db,client,r,exc,rid,probe=False,late_reset=False):
     kind=exc.kind if isinstance(exc,CollectionError) else "UNKNOWN_ERROR"
     message=str(exc) if isinstance(exc,CollectionError) else type(exc).__name__
+    if kind in ("AUTH_ENDPOINT_ERROR","ACCESS_DENIED","AUTH_TOKEN_EXPIRED") and auth_status().get("state")=="REFRESHING":
+        auth_event("ERROR",cookie_status="NOT CHECKED",last_error=kind)
     log(f"{r['cube']} | {r['id'][:12]} | {message}")
     if probe:
         db.fail(r,message,"PROBE" if kind=="USER_STOP" else "PROBE_FAILED")
@@ -1562,6 +1564,10 @@ def handle_request_failure(db,client,r,exc,rid,probe=False,late_reset=False):
     elif kind=="AUTH_COOKIE_EXPIRED" and rid:
         db.request_relogin(rid,getattr(client,"auth_generation",0))
         db.auth_retry(r,message)
+    elif kind=="AUTH_TOKEN_EXPIRED" and exc.http_status==200 and r["attempts"]<MAX_ATTEMPTS:
+        # A successful HTTP status can contain an explicit expired-token SOAP fault.
+        client.token=""
+        db.fail(r,message,"RETRY",1)
     elif kind in ("ACCESS_DENIED","AUTH_TOKEN_EXPIRED"):
         # Rejection after GenToken retry does not prove that a browser login is needed.
         db.fail(r,message,"FAILED")

@@ -1338,6 +1338,12 @@ def collection_snapshot(conn,rid):
         (run["created_at"],prep)).fetchone()
     totals["committed_bytes"]=metrics[0] or 0
     totals["run_cells"]=metrics[1] or 0
+    exports=conn.execute("""SELECT coalesce(sum(CASE WHEN json_extract(metrics_json,'$.excel_status')='SAVED' THEN 1 ELSE 0 END),0),
+        coalesce(sum(CASE WHEN json_extract(metrics_json,'$.excel_status')='FAILED' THEN 1 ELSE 0 END),0)
+        FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')""",(prep,)).fetchone()
+    totals["excel_saved"]=exports[0]
+    totals["excel_failed"]=exports[1]
+    totals["excel_pending"]=totals["committed"]-exports[0]-exports[1]
     workers=[dict(row) for row in conn.execute("SELECT * FROM oic_workers WHERE run=? ORDER BY worker",(rid,))]
     return {"run":run,"totals":totals,"cubes":cubes,"workers":workers}
 
@@ -1368,7 +1374,7 @@ class WorkerMonitor:
         self.last_publish=0
         self.state={"owner":owner,"worker":worker,"stage":"STARTING","started":self.started,
                     "stage_at":self.started,"request":{},"stats":{"committed":0,"failed":0,"splits":0,"retries":0,
-                    "cells":0,"bytes":0,"seconds":0.0},"recent":[],"events":[]}
+                    "cells":0,"bytes":0,"seconds":0.0,"excel_saved":0,"excel_failed":0},"recent":[],"events":[]}
         self.live=None
         self.handler=None
 
@@ -1426,7 +1432,10 @@ class WorkerMonitor:
                 "caption":caption,"x":len(scope["members"]) if scope["hierarchy"] else 0,
                 "y":len(scope["years"]),"m":len(scope["measures"]),"cells":r["potential_cells"],
                 "attempt":r["attempts"],"timeout":r["timeout"],"parent":r["parent"],
-                "started":time.time()}
+                "started":time.time(),"job_index":scope.get("job_index",0),
+                "year_offset":scope.get("year_offset",0),"member_offset":scope.get("member_offset",0),
+                "request_index":scope.get("request_index",0),"request_total":scope.get("request_total",0),
+                "total_members":scope.get("total_members",0),"total_years":scope.get("total_years",0)}
             for k in ("http_status","http_started","http_finished","stage_timeout"):
                 self.state.pop(k,None)
             self.state["bytes"]=0
@@ -1443,6 +1452,7 @@ class WorkerMonitor:
                 stats["cells"]+=q["cells"]
                 stats["bytes"]+=0 if result.get("replayed") else int(result.get("response_bytes",0) or 0)
                 stats["seconds"]+=duration
+                stats["excel_saved" if result.get("excel_saved") else "excel_failed"]+=1
             elif status=="REPLACED":
                 stats["splits"]+=1
             elif status=="RETRY":
@@ -1509,8 +1519,8 @@ class WorkerMonitor:
         table=Table.grid(padding=(0,2),expand=True)
         table.add_column(ratio=1);table.add_column(ratio=1)
         table.add_row(Text(f"Cube: {q.get('cube','-')}  |  {q.get('caption','Waiting for work')}"),
-                      Text(f"Request: {q.get('id','-')[:12]}  |  Attempt {q.get('attempt','-')}"))
-        table.add_row(Text(q.get("hierarchy") or "Year totals / idle"),Text("DIMENSION SPLIT" if q.get("parent") else "FULL FIRST"))
+                      Text(f"Job {q.get('job_index',0)} | Page {q.get('request_index',0)}/{q.get('request_total',0)} | Attempt {q.get('attempt','-')}"))
+        table.add_row(Text(q.get("hierarchy") or "Year totals / idle"),Text(f"Year offset {q.get('year_offset',0)} | Member offset {q.get('member_offset',0)}" + (" | SPLIT" if q.get("parent") else "")))
         table.add_row(Text(f"X={q.get('x',0):,}  Y={q.get('y',0):,}  M={q.get('m',0):,}"),
                       Text(f"Expected cells: {q.get('cells',0):,}  |  Timeout {q.get('timeout','-')}s"))
         stage=Text(f"{s['stage']}  |  Stage elapsed {elapsed_label(time.time()-s['stage_at'])}"
@@ -1522,7 +1532,7 @@ class WorkerMonitor:
                 ("Auth",{"AUTH LOCK WAIT","AUTH REFRESH","REUSING VALID TOKEN","REUSING SHARED TOKEN"}),
                 ("HTTP",{"REQUEST IN FLIGHT","HEADERS RECEIVED"}),
                 ("XML",{"RECEIVING","SAVING RAW XML","REPLAYING SAVED XML"}),
-                ("Parse",{"PARSING"}),("Commit",{"COMMITTING"})]
+                ("Parse",{"PARSING"}),("Commit",{"COMMITTING"}),("Excel",{"EXPORTING EXCEL"})]
         flow=Text()
         for label,stages in phases:
             active=s["stage"] in stages
@@ -1544,7 +1554,8 @@ class WorkerMonitor:
         return Group(Panel(header,border_style="cyan"),Panel(table,title="01 / CURRENT REQUEST"),
                      Panel(lifecycle,title="02 / REQUEST LIFECYCLE"),
                      Panel(Text(f"Saved {stats['committed']}  |  Failed {stats['failed']}  |  Splits {stats['splits']}  |  Retries {stats['retries']}\n"
-                                f"Cells {stats['cells']:,}  |  Received {stats['bytes']/1048576:.2f} MiB  |  Avg saved request {avg:.1f}s"),title="03 / WORKER STATISTICS (this process)"),
+                                f"Cells {stats['cells']:,}  |  Received {stats['bytes']/1048576:.2f} MiB  |  Avg saved request {avg:.1f}s\n"
+                                f"Excel saved {stats['excel_saved']} | Excel failed {stats['excel_failed']}"),title="03 / WORKER STATISTICS (this process)"),
                      Panel(recent,title="04 / RECENT REQUESTS"),Panel(activity,title="05 / ACTIVITY"))
 
 
@@ -1572,7 +1583,8 @@ class CollectionMonitor:
         global_panel=Group(Text(f"Jobs {t['jobs_done']}/{t['jobs']}  |  Failed jobs {t['jobs_failed']}  |  Splits {t['splits']}"),
             Text(f"Cells {t['covered']:,}/{t['planned']:,}  |  {pct:.2f}%"),rich_progress(t["covered"],t["planned"]),
             Text(f"Saved requests {t['committed']}  |  Pending {t['pending']}  |  Running {t['running']}  |  Failed {t['failed']}"),
-            Text(f"Request attempts {t['attempts']} (plan lifetime)  |  {t['run_cells']/duration:,.0f} cells/s (this run)  |  Saved XML {t['committed_bytes']/1048576:.2f} MiB"))
+            Text(f"Request attempts {t['attempts']} (plan lifetime)  |  {t['run_cells']/duration:,.0f} cells/s (this run)  |  Saved XML {t['committed_bytes']/1048576:.2f} MiB"),
+            Text(f"Excel saved {t['excel_saved']} | Pending {t['excel_pending']} | Failed {t['excel_failed']}"))
         workers=Table(expand=True)
         for col in ("Worker","Cube / Dimension","Stage","Elapsed","Saved","Cells"):
             workers.add_column(col,overflow="fold")
@@ -1889,8 +1901,7 @@ def supervisor_lock():
 
 
 def execute_discovery_request(collector_client,profile,payload,timeout,observe):
-    """Send the prepared SOAP using the Main Collector's requests.Session/auth."""
-    import requests
+    """Send prepared SOAP using Main Collector curl_cffi session/auth."""
     code=profile["code"]
     started=time.monotonic()
 
@@ -1936,8 +1947,8 @@ def execute_discovery_request(collector_client,profile,payload,timeout,observe):
         retry_auth=False
         cookie_before=collector_client.cookie_header()
         try:
-            with collector_client.session.post(XMLA_URL,data=payload,headers=headers,
-                    timeout=(15,timeout),stream=True,allow_redirects=False) as response:
+            with collector_client.session.stream("POST",XMLA_URL,data=payload,headers=headers,
+                    timeout=(15,timeout),allow_redirects=False) as response:
                 headers_at=time.monotonic()
                 observe("HEADERS RECEIVED",http_status=response.status_code)
                 if response.status_code in (401,403) and attempt==0:
@@ -1975,14 +1986,8 @@ def execute_discovery_request(collector_client,profile,payload,timeout,observe):
             return bytes(body),{"duration":time.monotonic()-started,"http_status":200,
                 "response_bytes":len(body),"token_refresh_seconds":auth_seconds,
                 "header_wait_seconds":headers_at-sent,"receive_seconds":received-headers_at}
-        except requests.exceptions.SSLError:
-            raise CollectionError("TLS_ERROR","XMLA TLS verification failed",endpoint="XMLA") from None
-        except requests.exceptions.Timeout:
-            raise CollectionError("RESPONSE_TIMEOUT","XMLA requests timeout",endpoint="XMLA") from None
-        except requests.exceptions.ConnectionError:
-            raise CollectionError("CONNECTION_RESET","XMLA connection failure",endpoint="XMLA") from None
-        except requests.RequestException:
-            raise CollectionError("NETWORK_ERROR","XMLA requests transport failure",endpoint="XMLA") from None
+        except RequestException as exc:
+            raise classify_network(exc) from None
     raise CollectionError("ACCESS_DENIED","Authentication retry exhausted",endpoint="XMLA")
 
 
@@ -2043,7 +2048,7 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
         health_checks={}
         unknown_streak=0
         log("AUTH | Cookie Jar active | renewal on demand at safe request boundaries",auth=True)
-        log("TRANSPORT | "+("Main Collector requests.Session" if collector_client is not None else "curl_cffi"))
+        log("TRANSPORT | "+"curl_cffi")
         initial_token=collector_client.token if collector_client is not None else client.token
         log(f"AUTH | Initial JWT remaining {max(0,int(jwt_exp(initial_token)-time.time()))}s")
         preflight_complete=False

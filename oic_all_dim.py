@@ -80,10 +80,11 @@ def log(message):
 
 class PrepareMonitor:
     """Read-only observation of preparation; the Live refresh owns no DB connection."""
-    def __init__(self):
+    def __init__(self,on_progress=None):
         from rich.console import Console
         self.console=Console()
-        self.interactive=self.console.is_terminal
+        self.on_progress=on_progress
+        self.interactive=on_progress is None and self.console.is_terminal
         self.lock=threading.RLock()
         self.started=time.monotonic()
         self.phase="INITIALIZING"
@@ -107,14 +108,18 @@ class PrepareMonitor:
 
     def start(self):
         from rich.live import Live
-        configure_log(OUTPUT/"prepare.log",console_output=not self.interactive)
-        if self.interactive:
+        configure_log(OUTPUT/"prepare.log",console_output=not self.interactive and self.on_progress is None)
+        if self.interactive or self.on_progress is not None:
             monitor=self
             class ActivityHandler(logging.Handler):
                 def emit(self,record):
-                    monitor.add_event(record.getMessage())
+                    message=record.getMessage()
+                    monitor.add_event(message)
+                    if monitor.on_progress is not None:
+                        monitor.on_progress("log",message=message)
             self.handler=ActivityHandler()
             LOGGER.addHandler(self.handler)
+        if self.interactive:
             # Rich's independent refresh thread calls render during blocking CURL I/O.
             self.live=Live(get_renderable=self.render,console=self.console,refresh_per_second=3,
                            transient=True,redirect_stdout=False,redirect_stderr=False,
@@ -186,10 +191,18 @@ class PrepareMonitor:
             # Logging handler acquires the monitor lock only after it is released.
             # File logging remains independent of the live renderer.
             log(message)
+        if self.on_progress is not None and event in ("phase","cube","plan_job","summary"):
+            if event=="phase" and "cube" not in data:
+                data=dict(data,cube=self.context_cube())
+            self.on_progress(event,**data)
 
     def context(self):
         with self.lock:
             return self.phase,self.detail
+
+    def context_cube(self):
+        with self.lock:
+            return self.cube
 
     def request_started(self,key,cube,detail,timeout,attempt=1,kind="DISCOVERY"):
         now=time.monotonic()
@@ -358,6 +371,11 @@ class PrepareMonitor:
         if self.handler is not None:
             LOGGER.removeHandler(self.handler)
             self.handler.close()
+        if self.on_progress is not None:
+            log(f"PREPARE {status} | checkpoints retained")
+            self.on_progress("finished",status=status,summary=summary)
+            configure_log(OUTPUT/"prepare.log",console_output=False)
+            return
         configure_log(OUTPUT/"prepare.log")
         table=Table(title=f"PREPARATION {status}",show_header=False)
         table.add_column("Metric")
@@ -767,6 +785,8 @@ class OICClient:
             raise
 
     def execute_once(self,profile,payload,timeout,destination=None):
+        if self.stop():
+            raise CollectionError("USER_STOP")
         self.reload_credentials()
         self.set_cube(profile)
         overall=time.monotonic()
@@ -774,6 +794,8 @@ class OICClient:
         self.ensure_token()
         auth_seconds=time.monotonic()-token_start
         for attempt in range(2):
+            if self.stop():
+                raise CollectionError("USER_STOP")
             started=time.monotonic()
             self.observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0)
             try:
@@ -1060,7 +1082,7 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
     message=str(exc) if isinstance(exc,CollectionError) else type(exc).__name__
     log(f"{r['cube']} | {r['id'][:12]} | {message}")
     if probe:
-        db.fail(r,message,"PROBE_FAILED")
+        db.fail(r,message,"PROBE" if kind=="USER_STOP" else "PROBE_FAILED")
         return
     if kind=="USER_STOP":
         db.fail(r,message,"RETRY")
@@ -1312,29 +1334,166 @@ def supervisor_lock():
                 fcntl.flock(file.fileno(),fcntl.LOCK_UN)
 
 
-def run_prepare(db):
-    monitor=PrepareMonitor()
+def execute_discovery_request(collector_client,profile,payload,timeout,observe,renew=False):
+    """Send the prepared SOAP using the Main Collector's requests.Session/auth."""
+    import requests
+    code=profile["code"]
+    started=time.monotonic()
+
+    def ensure(force=False):
+        if force or jwt_exp(collector_client.token)<=time.time()+120:
+            observe("AUTH REFRESH",stage_timeout=45)
+        else:
+            observe("REUSING VALID TOKEN",remaining_seconds=int(jwt_exp(collector_client.token)-time.time()))
+        try:
+            collector_client.ensure_token(code,force=force)
+        except RuntimeError as exc:
+            # The collector may be running as __main__; don't import a second
+            # copy of its exception classes. Expose only safe error categories.
+            name=type(exc).__name__
+            if name=="OICStopped":
+                raise CollectionError("USER_STOP") from None
+            if name=="OICSessionExpired":
+                raise CollectionError("AUTH_COOKIE_EXPIRED","GenToken session expired",endpoint="GEN_TOKEN") from None
+            match=re.search(r"GenToken HTTP (\d{3})",str(exc))
+            if match:
+                raise classify_http(int(match.group(1)),{},"GEN_TOKEN") from None
+            if "SSLError" in str(exc):
+                raise CollectionError("TLS_ERROR","GenToken TLS verification failed",endpoint="GEN_TOKEN") from None
+            raise CollectionError("AUTH_ENDPOINT_ERROR","Main Collector GenToken failed",5,endpoint="GEN_TOKEN") from None
+
+    def check():
+        if collector_client.stop_event.is_set():
+            raise CollectionError("USER_STOP")
+
+    auth_start=time.monotonic()
+    check()
+    ensure(renew)
+    auth_seconds=time.monotonic()-auth_start
+    for attempt in range(2):
+        check()
+        headers={"Accept":"text/plain, */*; q=0.01","Content-Type":"text/xml",
+                 "Origin":BASE_URL,"Referer":BASE_URL+collector_client.page_path(code),
+                 "X-Requested-With":"XMLHttpRequest","Authorization":"Bearer "+collector_client.token}
+        sent=time.monotonic()
+        observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0)
+        retry_auth=False
+        cookie_before=collector_client.cookie_header()
+        try:
+            with collector_client.session.post(XMLA_URL,data=payload,headers=headers,
+                    timeout=(15,timeout),stream=True,allow_redirects=False) as response:
+                headers_at=time.monotonic()
+                observe("HEADERS RECEIVED",http_status=response.status_code)
+                if response.status_code in (401,403) and attempt==0:
+                    retry_auth=True
+                elif response.status_code in (401,403):
+                    raise CollectionError("ACCESS_DENIED",f"XMLA HTTP {response.status_code} after JWT refresh",endpoint="XMLA",http_status=response.status_code)
+                elif response.status_code!=200:
+                    body=bytearray()
+                    for chunk in response.iter_content(chunk_size=8192):
+                        body.extend(chunk[:65536-len(body)])
+                        if len(body)>=65536:
+                            break
+                    raise classify_http(response.status_code,response.headers,"XMLA",bytes(body))
+                else:
+                    body=bytearray()
+                    for chunk in response.iter_content(chunk_size=256*1024):
+                        check()
+                        if not chunk:
+                            continue
+                        if len(body)+len(chunk)>MAX_RESPONSE_BYTES:
+                            raise CollectionError("RESPONSE_TOO_LARGE","100 MiB limit")
+                        body.extend(chunk)
+                        observe("RECEIVING",bytes=len(body))
+                    received=time.monotonic()
+            if retry_auth:
+                auth_start=time.monotonic()
+                ensure(True)
+                auth_seconds+=time.monotonic()-auth_start
+                continue
+            # Keep cookie rotations from successful XMLA responses available to
+            # the later curl benchmark clients through the existing callback.
+            current_cookie=collector_client.cookie_header()
+            if current_cookie and current_cookie!=cookie_before and collector_client.on_auth:
+                collector_client.on_auth(collector_client.token,current_cookie)
+            return bytes(body),{"duration":time.monotonic()-started,"http_status":200,
+                "response_bytes":len(body),"token_refresh_seconds":auth_seconds,
+                "header_wait_seconds":headers_at-sent,"receive_seconds":received-headers_at}
+        except requests.exceptions.SSLError:
+            raise CollectionError("TLS_ERROR","XMLA TLS verification failed",endpoint="XMLA") from None
+        except requests.exceptions.Timeout:
+            raise CollectionError("RESPONSE_TIMEOUT","XMLA requests timeout",endpoint="XMLA") from None
+        except requests.exceptions.ConnectionError:
+            raise CollectionError("CONNECTION_RESET","XMLA connection failure",endpoint="XMLA") from None
+        except requests.RequestException:
+            raise CollectionError("NETWORK_ERROR","XMLA requests transport failure",endpoint="XMLA") from None
+    raise CollectionError("ACCESS_DENIED","Authentication retry exhausted",endpoint="XMLA")
+
+
+def prepare_from_collector(catalogs,collector_client,on_progress,stop_event):
+    """Use the existing supervisor and DB lifecycle without starting a new UI."""
+    with supervisor_lock():
+        db=OICDatabase(DB_PATH)
+        try:
+            db.initialize_schema()
+            recover_old_runs(db)
+            return run_prepare(db,catalogs=catalogs,collector_client=collector_client,
+                               on_progress=on_progress,stop_event=stop_event)
+        finally:
+            db.close()
+
+
+def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_event=None):
+    monitor=PrepareMonitor(on_progress=on_progress)
     client=None
+    benchmark_client=None
     status="FAILED"
+    check_stop=stop_event.is_set if stop_event is not None else lambda:False
+
+    def ensure_running():
+        if check_stop():
+            raise CollectionError("USER_STOP")
+
+    def emit(event,**data):
+        if event!="summary":
+            ensure_running()
+        monitor.emit(event,**data)
     try:
         monitor.start()
-        client=OICClient(periodic=True)
-        if not client.cookie:
-            raise RuntimeError("Set OIC_COOKIE in local .env")
+        if collector_client is None:
+            client=OICClient(periodic=True,stop=check_stop)
+            if not client.cookie:
+                raise RuntimeError("Set OIC_COOKIE in local .env")
+        elif not collector_client.cookie_header():
+            raise RuntimeError("Set OIC_COOKIE in Main Collector")
 
         health_checks={}
         unknown_streak=0
         log("AUTH | Cookie Jar active | reuse valid JWT | periodic renewal at safe request boundaries")
-        log(f"AUTH | Initial JWT remaining {max(0,int(jwt_exp(client.token)-time.time()))}s")
+        log("TRANSPORT | "+("Main Collector requests.Session" if collector_client is not None else "curl_cffi"))
+        initial_token=collector_client.token if collector_client is not None else client.token
+        log(f"AUTH | Initial JWT remaining {max(0,int(jwt_exp(initial_token)-time.time()))}s")
+        last_auth_check=time.monotonic()
         preflight_complete=False
 
         def monitored_call(profile,payload,timeout,phase,detail,attempt):
+            nonlocal last_auth_check
+            ensure_running()
             cube=f"{profile['code']}/{profile['cube_type']}"
             key=uuid.uuid4().hex
             monitor.request_started(key,cube,detail,timeout,attempt,phase)
-            client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
+            observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
+            if client is not None:
+                client.observer=observer
             try:
-                data,metrics=client.execute_once(profile,payload,timeout)
+                if collector_client is None:
+                    data,metrics=client.execute_once(profile,payload,timeout)
+                else:
+                    token_before=collector_client.token
+                    renew=time.monotonic()-last_auth_check>=SESSION_RECHECK_SECONDS
+                    data,metrics=execute_discovery_request(collector_client,profile,payload,timeout,observer,renew)
+                    if renew or collector_client.token!=token_before:
+                        last_auth_check=time.monotonic()
                 # HTTP 200 can still carry a SOAP fault or session error.
                 diagnostic=extract_error_details(data)
                 if diagnostic:
@@ -1345,7 +1504,8 @@ def run_prepare(db):
                 monitor.request_finished(key,False,error=str(exc) if isinstance(exc,CollectionError) else type(exc).__name__)
                 raise
             finally:
-                client.observer=None
+                if client is not None:
+                    client.observer=None
 
         def cooldown(profile,delay,reason):
             cube=f"{profile['code']}/{profile['cube_type']}"
@@ -1353,7 +1513,7 @@ def run_prepare(db):
             monitor.request_started(key,cube,reason,delay,kind="RECOVERY")
             monitor.retry(key,delay)
             try:
-                wait_seconds(delay)
+                wait_seconds(delay,check_stop)
             finally:
                 monitor.request_finished(key,True,error="Cooldown ended")
 
@@ -1414,20 +1574,29 @@ def run_prepare(db):
                     if kind not in ("RATE_LIMITED","SERVER_UNAVAILABLE","NETWORK_ERROR","DNS_ERROR",
                                     "CONNECTION_RESET","AUTH_ENDPOINT_ERROR","AUTH_TOKEN_EXPIRED") or attempt>=MAX_ATTEMPTS:
                         raise
-                    if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
+                    if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET") and client is not None:
                         client.reconnect()
                     minimum=5*(2**attempt) if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE") else 5
                     cooldown(profile,max(2**attempt,exc.delay,minimum),str(exc))
             raise RuntimeError("Discovery retry budget exhausted")
 
         def probe(req,profile,parallel=False):
+            nonlocal benchmark_client
+            ensure_running()
             # Concurrent preparation probes own their database and CURL
             # connection. Extraction workers remain separate visible processes.
             probe_db=OICDatabase(DB_PATH) if parallel else db
             probe_client=None
             key=req["id"]
             try:
-                probe_client=OICClient() if parallel else client
+                if parallel:
+                    probe_client=OICClient(stop=check_stop)
+                elif client is not None:
+                    probe_client=client
+                else:
+                    if benchmark_client is None:
+                        benchmark_client=OICClient(stop=check_stop)
+                    probe_client=benchmark_client
                 existing=probe_db.get_request(key)
                 scope=req["scope"]
                 detail=f"{scope['hierarchy'] or 'YEAR ONLY'} | X={len(scope['members'])} Y={len(scope['years'])} M={len(scope['measures'])}"
@@ -1443,9 +1612,9 @@ def run_prepare(db):
                 if result.get("pressure"):
                     delay=max(10,result.get("delay",0))
                     monitor.retry(key,delay)
-                    wait_seconds(delay)
+                    wait_seconds(delay,check_stop)
                 monitor.request_finished(key,result.get("ok",False),result,error=result.get("error"))
-                if result.get("error") in ("AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR","DISK_FULL","SOURCE_VERSION_CHANGED","AUTH_ENDPOINT_ERROR"):
+                if result.get("error") in ("USER_STOP","AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR","DISK_FULL","SOURCE_VERSION_CHANGED","AUTH_ENDPOINT_ERROR"):
                     raise CollectionError(result["error"],"Preparation probe stopped")
                 return result
             except BaseException as exc:
@@ -1459,9 +1628,14 @@ def run_prepare(db):
                         probe_client.close()
                     probe_db.close()
 
-        ready=prepare_all(db,transport,probe,OUTPUT,log,emit=monitor.emit)
+        ready=prepare_all(db,transport,probe,OUTPUT,log,emit=emit,catalogs=catalogs)
         status="READY" if ready else "INCOMPLETE"
         return 0 if ready else 1
+    except CollectionError as exc:
+        if exc.kind!="USER_STOP":
+            raise
+        status="STOPPED"
+        return 130
     except KeyboardInterrupt:
         status="STOPPED"
         raise
@@ -1469,6 +1643,8 @@ def run_prepare(db):
         try:
             if client is not None:
                 client.close()
+            if benchmark_client is not None:
+                benchmark_client.close()
         finally:
             monitor.stop(status)
 

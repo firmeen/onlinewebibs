@@ -675,6 +675,41 @@ def _merge_catalog_fields(base: dict, incoming: dict, *, report: bool = False) -
     return merged
 
 
+def _restore_verified_mapping(code: str, kind: str, field: dict, evidence: dict | None) -> bool:
+    """Enrich an existing web field without adding membership or replacing a conflicting mapping."""
+    if not evidence or field.get("source") != "GETSTRUCTURE" or evidence.get("source") != "GETSTRUCTURE":
+        return False
+    if field.get("type") != evidence.get("type") or _field_identity(code, kind, field) != _field_identity(code, kind, evidence):
+        return False
+    if field.get("status") not in ("UNVERIFIED", "MAPPED", "VERIFIED"):
+        return False
+    if field.get("mapping_reason") in ("Conflicting duplicate field identity", "Ambiguous MDX mappings"):
+        return False
+    # Normalize the evidence using the existing identifier, calculation and
+    # XMLA Execute checks; a saved status alone is not proof.
+    verified = _normalize_report_field(code, kind, evidence)
+    if verified["status"] != "VERIFIED" or not verified.get("mdx"):
+        return False
+    current = field.get("mdx")
+    if current and current != verified["mdx"]:
+        return False
+    details = field.get("details") or {}
+    if field["type"] == "MEASURE" and (
+            str(details.get("DATAFIELD") or "").upper() == "CALCULATE"
+            or str(details.get("CALCULATE") or "").strip().lower() not in ("", "0", "false", "none", "null")
+            or str(details.get("SUMMARYTYPE") or "").strip().lower() not in ("", "sum")
+            or verified["mdx"].casefold() == "[measures].[calculate]"):
+        return False
+    if (field.get("status") == "VERIFIED" and current
+            and field.get("verification_method") == "XMLA_EXECUTE"
+            and str(field.get("verified_at") or "") > str(verified.get("verified_at") or "")):
+        return True
+    for name in ("mdx", "status", "mapping_status", "reported_status",
+                 "verified_at", "verification_method", "mapping_reason"):
+        field[name] = verified[name]
+    return True
+
+
 def merge_verification_catalog(catalog: dict, report: dict) -> dict:
     code, kind = report["insurance_code"], report["cube_type"]
     if not _catalog_matches(report, code, kind, report=True):
@@ -697,12 +732,7 @@ def merge_verification_catalog(catalog: dict, report: dict) -> dict:
         for raw in catalog["fields"]:
             item=dict(raw)
             evidence=verified.get(_field_identity(code,kind,item))
-            if (evidence and evidence.get("status")=="VERIFIED"
-                    and item.get("status") in ("MAPPED","VERIFIED")
-                    and item.get("mdx")==evidence.get("mdx")):
-                for name in ("status","mapping_status","reported_status","verified_at","verification_method","mapping_reason"):
-                    if name in evidence:
-                        item[name]=evidence[name]
+            _restore_verified_mapping(code, kind, item, evidence)
             merged.append(item)
         return dict(catalog,fields=merged,report_updated_at=_catalog_time(report),
                     verification_report_counts={k:sum(f.get("status")==k for f in merged) for k in counts})
@@ -736,6 +766,12 @@ def load_catalog(code: str, cube_type: str = "FY") -> dict:
     catalog = dict(bundled, source="BUNDLED_CATALOG") if bundled else (local or seeded_catalog(code, cube_type))
     if local and (not bundled or _structure_time(local) >= _structure_time(bundled)):
         catalog = dict(_merge_catalog_fields(catalog, local), source="CACHE")
+        if bundled:
+            previous = {_field_identity(code, cube_type, f): f for f in bundled["fields"]
+                        if f.get("source") == "GETSTRUCTURE"}
+            for field in catalog["fields"]:
+                _restore_verified_mapping(code, cube_type, field,
+                                          previous.get(_field_identity(code, cube_type, field)))
     report = load_verification_report(code, cube_type)
     if report:
         catalog = merge_verification_catalog(catalog, report)
@@ -788,6 +824,8 @@ def load_web_catalog(code: str, cube_type: str = "FY") -> dict:
     stamp, web_fields = max(candidates, key=lambda item: item[0])
     mapped = {_field_identity(code, cube_type, f): f for f in general["fields"]
               if f.get("source") == "GETSTRUCTURE"}
+    report_evidence = {_field_identity(code, cube_type, f): f for f in (report or {}).get("fields", [])
+                       if f.get("source") == "GETSTRUCTURE"}
     fields = []
     seen = set()
     for raw in web_fields:
@@ -797,12 +835,20 @@ def load_web_catalog(code: str, cube_type: str = "FY") -> dict:
         seen.add(key)
         field = dict(raw)
         verified = mapped.get(key)
-        if verified and verified.get("mdx")==field.get("mdx"):
-            # Retain the website identity, label, folder and calculation details.
+        # A legacy GetStructure snapshot can predate the MDX mapping itself.
+        # Restore proven mappings even if the original snapshot has mdx=None.
+        # A newer explicit mapping in the general catalog blocks a conflicting
+        # older report; missing/unsupported fields never expand web membership.
+        if verified and verified.get("mdx") == field.get("mdx") and verified.get("status") != "VERIFIED":
             for name in ("mdx", "status", "mapping_status", "reported_status",
                          "mapping_reason", "verified_at", "verification_method"):
                 if name in verified:
                     field[name] = verified[name]
+        _restore_verified_mapping(code, cube_type, field, verified)
+        evidence = report_evidence.get(key)
+        if not (verified and verified.get("mdx") and evidence
+                and verified["mdx"] != evidence.get("mdx")):
+            _restore_verified_mapping(code, cube_type, field, evidence)
         if field.get("status")=="VERIFIED" and (not field.get("verified_at") or field.get("verification_method")!="XMLA_EXECUTE"):
             field.update(status="MAPPED",mapping_status="MAPPED")
         fields.append(field)

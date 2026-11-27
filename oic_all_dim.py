@@ -1135,7 +1135,8 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
         for r in requests:
             scope=json.loads(r["scope_json"])
             raw=Path(r["response_path"]) if r["response_path"] else None
-            if not raw or not raw.is_file() or not r["response_hash"]:
+            if (not raw or not raw.resolve().is_relative_to(OUTPUT.resolve())
+                    or not raw.is_file() or not r["response_hash"]):
                 raise RuntimeError(f"Committed raw XML unavailable: {r['id'][:12]}")
             data=raw.read_bytes()
             if digest(data)!=r["response_hash"]:
@@ -1706,21 +1707,23 @@ class CollectionMonitor:
             with Live(console=console,screen=console.is_terminal,auto_refresh=False,vertical_overflow="crop") as live:
                 while True:
                     try:
-                        with conn:
-                            conn.execute("BEGIN")
-                            self.snapshot=collection_snapshot(conn,self.rid)
-                        if self.snapshot is None:
-                            raise RuntimeError("Run not found")
-                        self.states={n:read_worker_state(self.rid,n) for n in range(1,self.snapshot["run"]["workers"]+1)}
-                        self.error=""
-                    except sqlite3.Error as exc:
-                        self.error=f"Snapshot unavailable: {type(exc).__name__}"
-                    live.update(self.render(),refresh=True)
-                    if self.snapshot and self.snapshot["run"]["state"]!="RUNNING":
-                        break
-                    try:
+                        try:
+                            with conn:
+                                conn.execute("BEGIN")
+                                self.snapshot=collection_snapshot(conn,self.rid)
+                            if self.snapshot is None:
+                                raise RuntimeError("Run not found")
+                            self.states={n:read_worker_state(self.rid,n) for n in range(1,self.snapshot["run"]["workers"]+1)}
+                            self.error=""
+                        except sqlite3.Error as exc:
+                            self.error=f"Snapshot unavailable: {type(exc).__name__}"
+                        live.update(self.render(),refresh=True)
+                        if self.snapshot and self.snapshot["run"]["state"]!="RUNNING":
+                            break
                         time.sleep(1)
                     except KeyboardInterrupt:
+                        # Ctrl+C anywhere in the monitor loop requests stop,
+                        # without interrupting the supervisor's final export.
                         control=OICDatabase(DB_PATH)
                         try:
                             control.stop(self.rid)

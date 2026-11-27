@@ -1257,9 +1257,12 @@ def launch_worker_tabs(rid,workers):
         raise RuntimeError(f"Windows Terminal launcher exited {result.returncode}")
 
 
-def wait_workers_ready(db,rid,count):
+def wait_workers_ready(db,rid,count,stop_event=None):
     end=time.monotonic()+STARTUP_TIMEOUT
     while time.monotonic()<end:
+        if stop_event is not None and stop_event.is_set():
+            db.stop(rid)
+            return
         rows=db.workers(rid)
         if len(rows)==count and all(w["status"]=="READY" and process_alive(w["pid"],w["created"]) for w in rows):
             db.barrier(rid)
@@ -1281,12 +1284,15 @@ def recover_old_runs(db):
         db.finish_run(run["id"],"INTERRUPTED")
 
 
-def supervise_workers(db,rid,count):
+def supervise_workers(db,rid,count,stop_event=None):
     run=db.run(rid)
     replacements={i:0 for i in range(1,count+1)}
     launch_deadlines={}
     next_log=0
     while not stopped(db,rid):
+        if stop_event is not None and stop_event.is_set():
+            db.stop(rid)
+            return
         rows={w["worker"]:w for w in db.workers(rid)}
         for number,w in rows.items():
             if process_alive(w["pid"],w["created"]):
@@ -1313,7 +1319,7 @@ def supervise_workers(db,rid,count):
 
 def shutdown_workers(db,rid):
     db.stop(rid)
-    deadline=time.monotonic()+310
+    deadline=time.monotonic()+630
     while time.monotonic()<deadline:
         live=[w for w in db.workers(rid) if process_alive(w["pid"],w["created"])]
         if not live:
@@ -1462,6 +1468,7 @@ def load_member_inventory_summary(catalogs):
     if not DB_PATH.is_file():
         return inventory_summary(None,catalogs)
     conn=sqlite3.connect(DB_PATH.resolve().as_uri()+"?mode=ro",uri=True,timeout=2)
+    conn.row_factory=sqlite3.Row
     try:
         conn.execute("BEGIN")
         return inventory_summary(conn,catalogs)
@@ -1485,7 +1492,6 @@ def prepare_from_collector(catalogs,collector_client,on_progress,stop_event,mode
 def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_event=None,mode="all"):
     monitor=PrepareMonitor(on_progress=on_progress)
     client=None
-    benchmark_client=None
     status="FAILED"
     check_stop=stop_event.is_set if stop_event is not None else lambda:False
 
@@ -1637,13 +1643,11 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
         try:
             if client is not None:
                 client.close()
-            if benchmark_client is not None:
-                benchmark_client.close()
         finally:
             monitor.stop(status)
 
 
-def run_extraction(db,workers):
+def run_extraction(db,workers,stop_event=None):
     prep=db.latest_preparation()
     if not prep or prep["status"]!="READY":
         raise RuntimeError("Run --prepare successfully before extraction")
@@ -1663,8 +1667,8 @@ def run_extraction(db,workers):
     state="FAILED"
     try:
         launch_worker_tabs(rid,list(range(1,workers+1)))
-        wait_workers_ready(db,rid,workers)
-        supervise_workers(db,rid,workers)
+        wait_workers_ready(db,rid,workers,stop_event)
+        supervise_workers(db,rid,workers,stop_event)
         progress=db.progress(prep["id"])
         if stopped(db,rid):
             state="STOPPED"

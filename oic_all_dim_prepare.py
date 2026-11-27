@@ -20,7 +20,7 @@ XMLA_NS = query.XMLA_NS
 MD_NS = query.MD_NS
 CATEGORIES = ("AH", "FI", "MR", "MI", "MV")
 YEAR_TYPES = ("FY", "UY", "AY")
-PLANNER_VERSION = 2
+PLANNER_VERSION = 3
 MAX_CELLS = 20000
 PROBE_BUDGET = 60
 DISCOVERY_PAGE = 100
@@ -63,23 +63,15 @@ def load_all_catalogs(emit=None):
         key = f"{code}/{kind}"
         emit_event(emit, "phase", phase="CATALOG", cube=key, detail="Reading local catalog")
         status = query.cube_status(code, kind)
-        catalog = query.load_catalog(code, kind)
+        catalog = query.load_web_catalog(code, kind)
         profile = dict(query.cube_profile(code, kind, discovery=True))
         profile.update(code=code, cube_type=kind, availability=status["status"])
-        if catalog.get("source") != "PROFILE":
+        if catalog.get("web_scope_ready"):
             profile["cube"] = catalog.get("cube") or profile["cube"]
             profile["catalog"] = catalog.get("catalog") or profile["catalog"]
         fields = catalog.get("fields", [])
-        # Preserve the original report (including unresolved identifiers/formulas).
-        report = query.load_verification_report(code, kind)
-        if report:
-            original = {}
-            for f in report.get("fields", []):
-                try:
-                    original[str(query._field_identity(code,kind,f))]=f
-                except (KeyError,TypeError,ValueError):
-                    continue
-            fields = [dict(f, original_report=original.get(str(f.get("id")))) for f in fields]
+        # Web membership is authoritative; XMLA-only rows must never enter this list.
+        fields = [f for f in fields if f.get("source") == "GETSTRUCTURE"]
         result[key] = (profile, catalog, fields)
         emit_event(emit, "catalog", cube=key, source=catalog.get("source") or "UNKNOWN",
                    fields=len(fields), availability=profile["availability"])
@@ -90,7 +82,7 @@ def classify_fields(fields):
     dimensions, measures = {}, {}
     for field in fields:
         mdx = field.get("mdx")
-        if field.get("status") not in ("VERIFIED", "MAPPED") or not mdx:
+        if field.get("source") != "GETSTRUCTURE" or field.get("status") not in ("VERIFIED", "MAPPED") or not mdx:
             continue
         typ = field.get("type")
         if typ == "DIMENSION" and query.IDENTIFIER.fullmatch(mdx) and not mdx.startswith("[Measures]."):
@@ -362,10 +354,12 @@ def inventory_summary(conn,catalogs,prep=None):
     cubes={}
     eligible={}
     for cube,(profile,catalog,fields) in catalogs.items():
-        dims,_=classify_fields(fields)
-        available=profile["availability"]=="AVAILABLE" and catalog.get("source")!="PROFILE"
+        dims,measures=classify_fields(fields)
+        available=profile["availability"]=="AVAILABLE" and catalog.get("web_scope_ready",False)
         eligible[cube]=set(dims) if available else set()
-        cubes[cube]={"available":available,"total":len(eligible[cube]),"hierarchies":{}}
+        cubes[cube]={"available":available,"availability":profile["availability"],"total":len(eligible[cube]),"hierarchies":{},
+                     "unresolved_views":sum(f["type"]=="DIMENSION" and f.get("mdx") not in dims for f in fields),
+                     "unresolved_measures":sum(f["type"]=="MEASURE" and f.get("mdx") not in measures for f in fields)}
     if conn is not None and prep:
         for cube,hierarchy in conn.execute("SELECT cube,hierarchy FROM oic_dimensions WHERE prep=?",(prep,)):
             if hierarchy in eligible.get(cube,()):
@@ -748,6 +742,12 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
                        fields=len(fields),availability=profile["availability"])
         log("CATALOG | Existing in-memory snapshot reused")
     emit_event(emit,"phase",phase="CATALOG",detail="Checking preparation snapshot")
+    # Do not create a partial scope or reuse the old all-XMLA plan if a web list is missing.
+    missing=[cube for cube,(profile,catalog,fields) in catalogs.items()
+             if profile["availability"]!="NOT_AVAILABLE" and
+             (profile["availability"]!="AVAILABLE" or not catalog.get("web_scope_ready") or not fields)]
+    if missing:
+        raise RuntimeError("Missing GetStructure catalog; refresh: "+", ".join(missing))
     fingerprint=digest([PLANNER_VERSION,catalogs])
     current=db.preparation(fingerprint)
     prep=current["id"]
@@ -783,8 +783,12 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
         emit_event(emit,"cube",cube=cube,status="DISCOVERING",total=len(dimensions),done=0,members=0,
                    phase="METADATA_DISCOVERY",detail="Checking saved inventory")
         total_fields+=len(fields)
-        unresolved+=sum(1 for f in fields if f.get("mdx") not in dimensions and f.get("mdx") not in measures)
-        if profile["availability"]!="AVAILABLE" or catalog.get("source")=="PROFILE":
+        unresolved_views=[f for f in fields if f["type"]=="DIMENSION" and f.get("mdx") not in dimensions]
+        unresolved_measures=[f for f in fields if f["type"]=="MEASURE" and f.get("mdx") not in measures]
+        unresolved+=len(unresolved_views)+len(unresolved_measures)
+        for field in unresolved_views+unresolved_measures:
+            log(f"{cube} | WEB FIELD UNRESOLVED | {field['type']} | {field.get('caption')} | {field.get('status')} | {field.get('mapping_reason','')}")
+        if profile["availability"]!="AVAILABLE" or not catalog.get("web_scope_ready"):
             db.save_catalog(prep,cube,profile,fields,measures)
             if profile["availability"]=="NOT_AVAILABLE":
                 unavailable.append(cube)
@@ -882,7 +886,8 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
                if not m["is_all_member"] and not m["is_calculated_member"]
                and (m["member_type"] is not None or (m["level_number"] or 0)>0)]
         cube_summary[cube]={"fields":len(fields),"dimensions":len(dimensions),"inventories_complete":len(inventory),
-                            "members":sum(len(m) for m in inventory.values()),"years":len(years),"native_measures":len(measures)}
+                            "members":sum(len(m) for m in inventory.values()),"years":len(years),"native_measures":len(measures),
+                            "unresolved_views":len(unresolved_views),"unresolved_measures":len(unresolved_measures)}
         if not years or not measures:
             errors.append(f"{cube}: no validated years or native measures")
             emit_event(emit,"cube",cube=cube,status="INCOMPLETE")
@@ -902,7 +907,7 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
                 db.save_job(prep,job,cube,h,scope)
                 jobs.append((job,cube,profile,scope))
         emit_event(emit,"cube",cube=cube,status="INVENTORY READY" if len(inventory)==len(dimensions) else "INCOMPLETE")
-    summary={"preparation":prep,"catalog_fields":total_fields,"discovered_members":total_members,
+    summary={"preparation":prep,"scope":"WEB_ONLY","planner_version":PLANNER_VERSION,"catalog_fields":total_fields,"discovered_members":total_members,
              "unresolved_fields":unresolved,"jobs":len(jobs),"errors":errors,
              "cube_details":cube_summary,"unavailable_cubes":unavailable,"available_cubes":sum(p[0]["availability"]=="AVAILABLE" for p in catalogs.values())}
     if errors:
@@ -959,5 +964,5 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
     db.finalize_preparation(prep,"READY",summary,concurrency=concurrency["limit"])
     (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     emit_event(emit,"summary",summary=summary)
-    log(f"PREPARE READY | {len(jobs)} jobs | {summary['requests']}")
+    log(f"PREPARE READY (executable web fields) | {len(jobs)} jobs | unresolved web fields {unresolved} | {summary['requests']}")
     return True

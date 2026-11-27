@@ -23,9 +23,7 @@ YEAR_TYPES = ("FY", "UY", "AY")
 PLANNER_VERSION = 3
 MAX_CELLS = 20000
 PROBE_BUDGET = 60
-DISCOVERY_PAGE = 100
-MAX_DISCOVERY_PAGE = 500
-MIN_DISCOVERY_PAGE = 25
+MAX_DISCOVERY_PAGE = 5000
 MAX_DISCOVERY_PAGES = 10000
 DEFAULT_TIMEOUT = 180
 
@@ -375,7 +373,9 @@ def emit_inventory(db,prep,cube,hierarchy,emit):
 def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=None):
     state=db.load_discovery_checkpoint(prep,cube,hierarchy)
     offset=state.get("next_offset",0)
-    size=max(1,min(MAX_DISCOVERY_PAGE,state.get("page_size",DISCOVERY_PAGE)))
+    # Fresh inventories try the full remaining count up to the response budget.
+    # Resumes retain the learned page size and the committed member boundary.
+    size=max(1,min(MAX_DISCOVERY_PAGE,state.get("page_size",MAX_DISCOVERY_PAGE) if offset else count,count-offset))
     last=state.get("last_member")
     # Resume validates the cached boundary against the live member ordering.
     # This is best effort: the provider does not expose a guaranteed immutable snapshot.
@@ -385,7 +385,7 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
         if boundary[0]["unique_name"]!=last:
             db.reset_partial_inventory(prep,cube,hierarchy)
             emit_inventory(db,prep,cube,hierarchy,emit)
-            offset,last,size=0,None,DISCOVERY_PAGE
+            offset,last,size=0,None,min(MAX_DISCOVERY_PAGE,count)
             emit_event(emit,"activity",message=f"{cube} | source order changed; reset only {hierarchy}")
     pages=0
     previous_rate=None
@@ -393,8 +393,8 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
         pages+=1
         if pages>MAX_DISCOVERY_PAGES:
             raise ValueError(f"Discovery page safety budget reached; resume retained at {offset:,}/{count:,}")
-        take=min(size,count-offset)
         overlap=1 if offset else 0
+        take=min(size,count-offset,MAX_DISCOVERY_PAGE-overlap)
         emit_event(emit,"phase",phase="MEMBER_DISCOVERY",detail=f"MDX page | {hierarchy} | offset {offset:,} | size {take}")
         emit_event(emit,"discovery",message=f"Members committed {offset:,}/{count:,} | page {take} | next offset {offset:,}")
         start=time.monotonic()
@@ -439,12 +439,9 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
 
 
 def select_discovery_strategy(count,levels):
-    if count<=500:
-        return "RESTRICTED"
-    if count>2000 and levels and all(
-        0<=integer(l.get("LEVEL_CARDINALITY"),-1)<=500 for l in levels):
-        return "LEVEL"
-    return "MDX_PAGINATION"
+    # Small hierarchies already have a one-request restricted discovery path.
+    # Larger hierarchies start with one full-size MDX page, not per-level requests.
+    return "RESTRICTED" if count<=500 else "MDX_PAGINATION"
 
 
 def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata,levels,count,emit=None):
@@ -459,21 +456,9 @@ def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata
     capability=db.load_profile(prep,cube,"DISCOVERY_METADATA:MEMBER_CAPABILITY") or {}
     if capability.get("prefer_mdx"):
         strategy="MDX_PAGINATION"
-    if not state.get("next_offset") and strategy in ("RESTRICTED","LEVEL"):
+    if not state.get("next_offset") and strategy=="RESTRICTED":
         try:
-            if strategy=="RESTRICTED":
-                rows=discover_rows(transport,profile,"MDSCHEMA_MEMBERS",{"HIERARCHY_UNIQUE_NAME":hierarchy},emit=emit)
-            else:
-                rows=[]
-                for level in levels:
-                    name=level.get("LEVEL_UNIQUE_NAME")
-                    if not name:
-                        raise ValueError("Missing level unique name")
-                    part=discover_rows(transport,profile,"MDSCHEMA_MEMBERS",
-                                       {"HIERARCHY_UNIQUE_NAME":hierarchy,"LEVEL_UNIQUE_NAME":name},emit=emit)
-                    if any(r.get("LEVEL_UNIQUE_NAME")!=name for r in part):
-                        raise ValueError("Level restriction not honored")
-                    rows.extend(part)
+            rows=discover_rows(transport,profile,"MDSCHEMA_MEMBERS",{"HIERARCHY_UNIQUE_NAME":hierarchy},emit=emit)
             members=deduplicate_members(rows,hierarchy)
             if len(members)!=count:
                 raise ValueError(f"Restricted member count mismatch: expected={count:,}, unique={len(members):,}, rows={len(rows):,}")

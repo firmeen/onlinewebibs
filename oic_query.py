@@ -751,7 +751,7 @@ def load_web_catalog(code: str, cube_type: str = "FY") -> dict:
             if fields:
                 # Older LIVE caches preserve the original web list; reports
                 # and bundled catalogs are a fallback for existing installs.
-                if candidate.get("source") == "LIVE" and not candidate.get("report_updated_at"):
+                if candidate.get("source") == "LIVE":
                     snapshots.append((str(candidate.get("refreshed_at") or ""), fields))
                 else:
                     legacy.append((_catalog_time(candidate), fields))
@@ -2147,6 +2147,7 @@ def discover_fields(
         field for field in catalog["fields"]
         if field.get("source") != "XMLA_DISCOVER" or field.get("mdx") in identifiers
     ]
+    catalog["web_fields"] = [dict(f) for f in catalog["fields"] if f.get("source") == "GETSTRUCTURE"]
     catalog["view_count"] = sum(f["type"] == "DIMENSION" for f in catalog["fields"])
     catalog["data_count"] = sum(f["type"] == "MEASURE" for f in catalog["fields"])
     year = _year_from_fields(catalog["fields"], cube_type)

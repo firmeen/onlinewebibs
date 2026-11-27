@@ -173,3 +173,41 @@ python oic_collector.py
 **ข้อจำกัด:** Live Metadata และการเปิด Windows Terminal 3 Windows ต้องตรวจด้วย Windows และ Session จริง; Offline Checks ไม่ใช่หลักฐานว่า Extract ครบทั้ง 5 Cube ทุก Combination
 
 ห้าม Commit .env, JWT, Cookie, Headers, Session, Network Dump หรือ Raw XML; โปรแกรมไม่สร้าง Web UI/Database/Queue และไม่ควบคุม Chrome
+
+
+## All-dimension collection: round-robin paged plan
+
+The Main Collector remains the entry point. REFRESH CATALOG, CHECK VERIFIED
+and REFRESH MEMBER use the existing web-only catalog and member inventory.
+Use JOB PLAN to generate deterministic round-robin jobs and exact member/year
+pages locally. No HTTP calls, benchmark or new member discovery are needed
+for a complete compatible inventory. A previous full-first plan is preserved:
+the paged preparation copies inventory within the same SQLite database.
+Previously committed full-first requests do not count as completed paged requests.
+
+Defaults: 4 workers, 1 year and 20 members per request, all supported native
+measures, 60-second collection timeout and 1-second delay. All HTTP sessions
+use curl_cffi. START COLLECTION uses the worker count saved in the plan.
+
+```powershell
+python -m pip install -r requirements.txt
+python oic_collector.py
+# Alternatively, use the shared CLI:
+python oic_parallel.py --prepare
+python oic_parallel.py
+python oic_parallel.py --status
+python oic_parallel.py --export-only
+# Optional custom plan (changes create a separate preparation when needed):
+python oic_parallel.py --prepare --workers 2 --years-per-request 1 --members-per-request 20 --timeout 60 --delay 1
+python oic_parallel.py --workers 2
+```
+
+A validated, committed request produces one Excel workbook in
+`output/oic_all_dim/excel/<preparation>/<category>/<year-type>/<job>/`.
+The workbook has DATA and INFO sheets; source XML and checkpoints remain
+under the existing output directory. Failed exports can be retried without
+new HTTP requests using --export-only. STOP or Ctrl+C requests graceful
+shutdown and flushes unexported committed requests after workers stop.
+Resume uses the same saved plan and skips committed requests.
+The original oic_parallel.py script is available in Git history at 6c17a7e;
+the current CLI delegates to oic_all_dim.py instead of maintaining a second engine.

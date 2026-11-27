@@ -76,7 +76,7 @@ from oic_query import (PROFILES as QUERY_PROFILES, SCHEMA_VERSION, load_catalog,
                        validate_query, build_mdx as selected_mdx, query_hash,
                         cube_status, cube_profile, cube_options, CUBE_TYPES,
                         verify_field, catalog_verification_summary,
-                        export_verified_catalogs)
+                        export_verified_catalogs, load_web_catalog)
 
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -2340,13 +2340,19 @@ def launch_terminal_ui(args, return_app: bool = False):
             "python -m pip install -U requests textual rich"
         ) from exc
 
+    class CredentialInput(Input):
+        BINDINGS = [Binding("ctrl+a","select_all","Select all",show=False,priority=True)]
+
+        def action_select_all(self):
+            self.selection = type(self.selection)(0,len(self.value))
+
+
     class OICApp(App):
         TITLE = "OIC XMLA Collector"
         SUB_TITLE = "Insurance Data Workspace"
 
         BINDINGS = [
             ("ctrl+r", "reload_config", "Reload"),
-            ("ctrl+t", "test_api", "Test"),
             ("ctrl+d", "start_collection", "Collect"),
             ("ctrl+s", "stop_collection", "Stop"),
             ("ctrl+o", "open_output", "Output"),
@@ -2448,6 +2454,20 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         Input:focus {
             border: tall #ac9b79;
+        }
+
+        .credential_editor {
+            height: 3;
+        }
+
+        .credential_editor Input {
+            width: 1fr;
+        }
+
+        .credential_editor Button {
+            min-width: 7;
+            width: 9;
+            height: 3;
         }
 
         /* ACTIONS */
@@ -2771,11 +2791,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                             classes="input_label",
                         )
 
-                        yield Input(
-                            placeholder="Paste JWT here...",
-                            password=True,
-                            id="token",
-                        )
+                        with Horizontal(classes="credential_editor"):
+                            yield CredentialInput(placeholder="Paste JWT here...",password=True,id="token")
+                            yield Button("SHOW",id="show_token")
+                            yield Button("CLEAR",id="clear_token")
 
                         yield Static(
                             "JWT status updates immediately.",
@@ -2790,13 +2809,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                             classes="input_label",
                         )
 
-                        yield Input(
-                            placeholder=(
-                                "Paste complete Cookie header..."
-                            ),
-                            password=True,
-                            id="cookie",
-                        )
+                        with Horizontal(classes="credential_editor"):
+                            yield CredentialInput(placeholder="Paste complete Cookie header...",password=True,id="cookie")
+                            yield Button("SHOW",id="show_cookie")
+                            yield Button("CLEAR",id="clear_cookie")
 
                         yield Static(
                             "Cookie changes trigger GenToken validation.",
@@ -2817,20 +2833,13 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="save",
                     )
 
-                    yield Button(
-                        "CHECK SESSION",
-                        id="check",
-                    )
-
-                    yield Button(
-                        "TEST API",
-                        id="test",
-                    )
-
-                    yield Button("OPEN QUERY DESIGNER", id="open_designer")
-                    yield Button("REFRESH CATALOGS", id="refresh_all_catalogs")
-                    yield Button("EXPORT VERIFIED CATALOG", id="export_verified_catalog")
-                    yield Button("PREPARE", id="prepare_all_dimensions")
+                    yield Button("QUERY DESIGNER", id="open_designer")
+                    yield Button("LOAD ALL", id="load_all")
+                    yield Button("REFRESH CATALOG", id="refresh_all_catalogs")
+                    yield Button("CHECK VERIFIED", id="export_verified_catalog")
+                    yield Button("REFRESH MEMBER", id="prepare_all_dimensions")
+                    yield Button("JOB PLAN", id="job_plan")
+                    yield Button("RUN QUERIES", id="run_queries")
                     yield Button(
                         "START COLLECTION",
                         id="start",
@@ -3746,11 +3755,28 @@ def launch_terminal_ui(args, return_app: bool = False):
             elif button_id == "save":
                 self.save_credentials()
 
-            elif button_id == "check":
-                self.action_check_session()
+            elif button_id in ("clear_token","clear_cookie"):
+                if not self.busy and not self.catalog_running:
+                    name=button_id.split("_",1)[1]
+                    self.auth_sequence += 1
+                    self.cancel_auth_timer()
+                    self.query_one("#"+name,Input).value=""
+                    if name=="token":
+                        self.active_token=""
+                    self.dirty=True
+                    self.refresh_auth_cards()
 
-            elif button_id == "test":
-                self.action_test_api()
+            elif button_id in ("show_token","show_cookie"):
+                field=self.query_one("#"+button_id.split("_",1)[1],Input)
+                field.password=not field.password
+                event.button.label="SHOW" if field.password else "HIDE"
+            elif button_id=="run_queries":
+                if not self.busy and not self.catalog_running and not self.auth_check_running:
+                    self.start_selected_query()
+            elif button_id=="job_plan":
+                self.action_prepare_all_dimensions(mode="plan")
+            elif button_id=="load_all":
+                self.start_catalog_workflow("all")
 
             elif button_id == "start":
                 self.action_start_collection()
@@ -3776,29 +3802,9 @@ def launch_terminal_ui(args, return_app: bool = False):
             elif button_id == "prepare_all_dimensions":
                 self.action_prepare_all_dimensions()
             elif button_id == "refresh_all_catalogs":
-                if self.busy or self.active_run is not None or self.catalog_running or self.auth_check_running:
-                    return
-                if self.cookie_state != "VALID":
-                    self.info("Check Session before refreshing catalogs.", "warning")
-                    return
-                self.catalog_running = True
-                self.query_one("#refresh_all_catalogs", Button).disabled = True
-                self.query_one("#prepare_all_dimensions", Button).disabled = True
-                self.query_one("#export_verified_catalog", Button).disabled = True
-                self.discover_all_catalogs(force=True)
+                self.start_catalog_workflow("catalog")
             elif button_id == "export_verified_catalog":
-                button = self.query_one("#export_verified_catalog", Button)
-                if button.disabled:
-                    return
-                if self.busy or self.catalog_running or self.active_run is not None:
-                    self.info("Another operation is running; export is not started.", "warning")
-                    return
-                button.disabled = True
-                button.label = "EXPORTING..."
-                self.query_one("#refresh_all_catalogs", Button).disabled = True
-                self.query_one("#prepare_all_dimensions", Button).disabled = True
-                self.info("Exporting saved field verification reports...")
-                self.export_catalog_worker()
+                self.start_catalog_workflow("verify")
 
         # ====================================================
         # SELECTED INSURANCE CLASSES
@@ -3819,7 +3825,43 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_start_collection(self) -> None:
             if self.busy or self.catalog_running or self.auth_check_running or self.query_one("#export_verified_catalog", Button).disabled:
                 return
-            self.start_selected_query()
+            if self.active_run is not None or self.cookie_state!="VALID":
+                self.info("Finish the active operation or enter a valid Cookie first.","warning")
+                return
+            self.save_credentials()
+            self.cancel_auth_timer()
+            self.stop_event.clear()
+            self.set_busy(True)
+            self.query_one("#status",Static).update("COLLECTING / Full-first plan")
+            self.all_collection_worker()
+
+        @work(thread=True,group="all-collection",exclusive=True)
+        def all_collection_worker(self):
+            result=1
+            error=None
+            try:
+                from oic_all_dim import supervisor_lock, OICDatabase, DB_PATH, recover_old_runs, run_extraction
+                with supervisor_lock():
+                    db=OICDatabase(DB_PATH)
+                    try:
+                        db.initialize_schema()
+                        recover_old_runs(db)
+                        result=run_extraction(db,4,stop_event=self.stop_event)
+                    finally:
+                        db.close()
+            except Exception as exc:
+                error=str(exc)
+            finally:
+                self.call_from_thread(self.all_collection_finished,result,error)
+
+        def all_collection_finished(self,result,error):
+            self.set_busy(False)
+            self.watch_env_file()
+            self.reload_member_summary()
+            status="STOPPED" if self.stop_event.is_set() else "COMPLETED" if result==0 else "INCOMPLETE"
+            self.query_one("#status",Static).update("COLLECTION "+status)
+            self.info("COLLECTION "+status+(" / "+error if error else ""),
+                      "error" if error else "info")
 
         def action_stop_collection(self) -> None:
             if self.active_run is not None:
@@ -3913,8 +3955,13 @@ def launch_terminal_ui(args, return_app: bool = False):
             for button_id in (
                 "reload",
                 "save",
-                "check",
-                "test",
+                "load_all",
+                "job_plan",
+                "run_queries",
+                "clear_token",
+                "clear_cookie",
+                "show_token",
+                "show_cookie",
                 "start",
                 "open",
                 "prepare_all_dimensions",
@@ -4731,16 +4778,16 @@ def launch_terminal_ui(args, return_app: bool = False):
                     "error",
                 )
 
-        def action_prepare_all_dimensions(self) -> None:
+        def action_prepare_all_dimensions(self, mode="members") -> None:
             if self.auth_check_running:
-                self.info("Session validation in progress; PREPARE not started.", "warning")
+                self.info("Session validation in progress; retry after validation.", "warning")
                 return
             if (self.busy or self.prepare_running or self.catalog_running or
                     self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled):
                 self.info("Another operation is running.", "warning")
                 return
-            if self.cookie_state != "VALID":
-                self.info("Check Session before PREPARE.", "warning")
+            if mode!="plan" and self.cookie_state != "VALID":
+                self.info("Enter a valid Cookie before refreshing members.", "warning")
                 return
             missing = [key for key, (profile, catalog, fields) in self.catalog_snapshot.items()
                        if profile["availability"] != "NOT_AVAILABLE" and
@@ -4768,10 +4815,11 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.set_busy(True)
             self.query_one("#progress", ProgressBar).update(total=1, progress=0)
             self.query_one("#status", Static).update("PREPARING / Reusing saved catalog")
-            self.prepare_dimensions_worker(self.catalog_snapshot, cookie, token)
+            self.prepare_mode=mode
+            self.prepare_dimensions_worker(self.catalog_snapshot, cookie, token, mode)
 
         @work(thread=True, group="prepare-all-dimensions", exclusive=True)
-        def prepare_dimensions_worker(self, catalogs, cookie, token) -> None:
+        def prepare_dimensions_worker(self, catalogs, cookie, token, mode="members") -> None:
             client = None
             result = 1
             error = None
@@ -4801,11 +4849,12 @@ def launch_terminal_ui(args, return_app: bool = False):
                     # GenToken details remain available in the file log only.
                     log("AUTH | " + message, auth=True)
 
-                client = OICClient(cookie=cookie, token=token, stop_event=self.stop_event,
-                    on_auth=credentials_changed, on_log=prepare_client_log)
+                if mode!="plan":
+                    client = OICClient(cookie=cookie, token=token, stop_event=self.stop_event,
+                        on_auth=credentials_changed, on_log=prepare_client_log)
                 result = prepare_from_collector(catalogs, client,
                     lambda event, **data: self.call_from_thread(self.prepare_progress, event, data),
-                    self.stop_event)
+                    self.stop_event,mode=mode)
             except Exception as exc:
                 failed = True
                 error = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
@@ -4868,11 +4917,12 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.prepare_running = False
             self.set_busy(False)
             status = "FAILED" if failed else "READY" if result == 0 else "STOPPED" if result == 130 else "INCOMPLETE"
-            label = "PREPARE " + status
+            operation="REFRESH MEMBER" if getattr(self,"prepare_mode","members")=="members" else "JOB PLAN"
+            label = ("INVENTORY READY" if operation=="REFRESH MEMBER" else "COLLECTION READY") if status=="READY" else operation+" "+status
             if status == "READY" and self.prepare_unresolved:
                 label += f" / EXECUTABLE WEB FIELDS ONLY / UNRESOLVED {self.prepare_unresolved:,}"
             self.query_one("#status", Static).update(label)
-            self.info("PREPARE " + status + (f" / {error}" if error else ""),
+            self.info(label + (f" / {error}" if error else ""),
                       "success" if status=="READY" else "error" if failed else "warning")
             if status=="READY":
                 self.query_one("#progress", ProgressBar).update(total=1,progress=1)
@@ -4892,10 +4942,21 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         def reload_member_summary(self) -> None:
             try:
-                from oic_all_dim import load_member_inventory_summary
-                self.member_inventory = load_member_inventory_summary(self.catalog_snapshot)
+                import sqlite3
+                from oic_all_dim_prepare import inventory_summary
+                path=BASE_DIR/"output"/"oic_all_dim"/"oic.db"
+                if path.is_file():
+                    conn=sqlite3.connect(path.resolve().as_uri()+"?mode=ro",uri=True,timeout=2)
+                    try:
+                        conn.row_factory=sqlite3.Row
+                        conn.execute("BEGIN")
+                        self.member_inventory=inventory_summary(conn,self.catalog_snapshot)
+                    finally:
+                        conn.close()
+                else:
+                    self.member_inventory=inventory_summary(None,self.catalog_snapshot)
             except Exception as exc:
-                self.member_inventory = {"prep": None, "cubes": {}, "error": type(exc).__name__}
+                self.member_inventory = {"prep": None, "cubes": {}, "error": f"{type(exc).__name__}: {exc}"}
             self.update_member_summary()
 
         def update_member_summary(self) -> None:
@@ -4975,91 +5036,118 @@ def launch_terminal_ui(args, return_app: bool = False):
                 f"{available}/{len(QUERY_PROFILES) * len(CUBE_TYPES)}\n"
                 + "\n".join(lines))
 
-        @work(thread=True, group="catalog-export", exclusive=True)
-        def export_catalog_worker(self) -> None:
-            result = None
-            error = None
-            try:
-                result = export_verified_catalogs()
-            except Exception as exc:
-                error = str(exc) or type(exc).__name__
-            finally:
-                self.call_from_thread(self.catalog_export_finished, result, error)
+        def start_catalog_workflow(self,mode):
+            if self.busy or self.active_run is not None or self.catalog_running or self.auth_check_running:
+                self.info("Another operation is running.","warning")
+                return
+            if self.cookie_state!="VALID":
+                self.info("Enter a valid Cookie; session validation is automatic.","warning")
+                return
+            self.save_credentials()
+            self.cancel_auth_timer()
+            self.stop_event.clear()
+            self.catalog_running=True
+            self.set_busy(True)
+            self.catalog_workflow_worker(mode,self.cookie_value(),self.token_value())
 
-        def catalog_export_finished(self, result: dict | None, error: str | None) -> None:
-            button = self.query_one("#export_verified_catalog", Button)
-            button.label = "EXPORT VERIFIED CATALOG"
-            button.disabled = False
-            self.query_one("#refresh_all_catalogs", Button).disabled = False
-            self.query_one("#prepare_all_dimensions", Button).disabled = False
-            if error is not None:
-                self.info(f"Catalog export failed: {error}", "error")
-                return
-            if result is None:
-                self.info("Catalog export returned no result.", "error")
-                return
-            self.info(
-                f"EXPORT COMPLETED | CUBES: {result['cubes']} | "
-                f"FIELDS: {result['fields']:,} | DESTINATION: {result['directory']}",
-                "success",
-            )
-            self.update_catalog_summary()
-
-        @work(thread=True, group="five-cube-discovery", exclusive=True)
-        def discover_all_catalogs(self, force: bool = False) -> None:
-            if not force or not self.catalog_running:
-                return
-            sequence = self.auth_sequence
-            cookie, token = self.cookie_value(), self.token_value()
+        @work(thread=True,group="catalog-workflow",exclusive=True)
+        def catalog_workflow_worker(self,mode,cookie,token):
+            client=None
+            errors=[]
+            snapshot=None
             try:
-                if self.cookie_state != "VALID":
-                    if force:
-                        self.call_from_thread(self.info, "Saved catalogs loaded; live refresh requires a valid session.", "warning")
-                    return
-                for code in QUERY_PROFILES:
-                    for cube_type in CUBE_TYPES:
-                        if sequence != self.auth_sequence:
-                            return
-                        try:
-                            result = discover_fields(code, token, cookie, cube_type=cube_type)
-                            self.call_from_thread(self.catalog_discovery_event,
-                                                  code, cube_type, result, None)
-                        except Exception as exc:
-                            error = str(exc)[:150]
-                            self.call_from_thread(self.catalog_discovery_event,
-                                                  code, cube_type, None, error)
-                            if any(x in error.upper() for x in ("SESSION_EXPIRED", "SESSION EXPIRED", "HTTP 401", "HTTP 403")):
+                from oic_verify_fields import OICClient as VerifyClient, verify_saved_catalog
+                client=VerifyClient(cookie,token)
+                for phase in (("catalog","verify") if mode=="all" else (mode,)):
+                    for code in QUERY_PROFILES:
+                        for kind in CUBE_TYPES:
+                            if self.stop_event.is_set():
                                 return
+                            key=f"{code}/{kind}"
+                            try:
+                                if phase=="catalog":
+                                    self.call_from_thread(self.catalog_phase,"REFRESH CATALOG",key)
+                                    if jwt_info(client.token)["status"]!="VALID" or int(decode_jwt_payload(client.token).get("exp",0))<=time.time()+120:
+                                        client.refresh_token(code)
+                                    catalog=discover_fields(code,client.token,client.cookie,cube_type=kind)
+                                    current=load_web_catalog(code,kind)
+                                    self.call_from_thread(self.catalog_discovery_event,code,kind,current,None)
+                                    if any("incomplete XMLA metadata" in str(e) for e in catalog.get("errors",[])):
+                                        errors.append(key+" incomplete metadata")
+                                else:
+                                    self.call_from_thread(self.catalog_phase,"CHECK VERIFIED",key)
+                                    current=load_web_catalog(code,kind)
+                                    if not current.get("web_scope_ready"):
+                                        if cube_status(code,kind)["status"]=="NOT_AVAILABLE":
+                                            continue
+                                        raise ValueError("Missing web catalog; refresh first")
+                                    current=verify_saved_catalog(client,code,kind,current,
+                                        stop=self.stop_event.is_set,
+                                        progress=lambda n,total: self.call_from_thread(self.catalog_field_progress,key,n,total) if n==total or n%25==0 else None)
+                                    self.call_from_thread(self.catalog_discovery_event,code,kind,current,None)
+                            except Exception as exc:
+                                if self.stop_event.is_set():
+                                    return
+                                errors.append(key+": "+str(exc)[:180])
+                                self.call_from_thread(self.catalog_discovery_event,code,kind,None,str(exc)[:180])
+                                if any(x in str(exc).upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
+                                    return
+                    if errors:
+                        break
+                if mode in ("all","verify") and not self.stop_event.is_set() and not errors:
+                    export_verified_catalogs()
+            except Exception as exc:
+                errors.append(str(exc)[:180])
             finally:
-                # This is the only post-startup snapshot reload, triggered by
-                # the explicit REFRESH CATALOGS button.
-                from oic_all_dim_prepare import load_all_catalogs
+                if client is not None:
+                    try:
+                        if client.token and client.token!=token:
+                            self.call_from_thread(self.collection_auth_updated,client.token,client.cookie)
+                    finally:
+                        client.close()
                 try:
-                    snapshot = load_all_catalogs()
+                    from oic_all_dim_prepare import load_all_catalogs
+                    snapshot=load_all_catalogs()
                 except Exception as exc:
-                    self.call_from_thread(self.info, "Saved catalog reload failed: " + type(exc).__name__, "error")
-                    snapshot = None
-                self.call_from_thread(self.catalog_refresh_finished, snapshot)
+                    errors.append(str(exc)[:180])
+                self.call_from_thread(self.catalog_refresh_finished,snapshot,mode,errors)
 
-        def catalog_refresh_finished(self, snapshot) -> None:
+        def catalog_phase(self,phase,key):
+            self.query_one("#status",Static).update(f"{phase} / {key}")
+
+        def catalog_field_progress(self,key,n,total):
+            self.query_one("#status",Static).update(f"CHECK VERIFIED / {key} / {n}/{total}")
+            self.query_one("#progress",ProgressBar).update(total=max(1,total),progress=n)
+
+        def catalog_refresh_finished(self,snapshot,mode,errors):
             if snapshot is not None:
-                self.catalog_snapshot = snapshot
-                self.field_catalog = snapshot["MV/FY"][1]
-            self.catalog_running = False
-            for button_id in ("refresh_all_catalogs","prepare_all_dimensions","export_verified_catalog"):
-                self.query_one(f"#{button_id}", Button).disabled = self.busy
+                self.catalog_snapshot=snapshot
+                self.field_catalog=snapshot["MV/FY"][1]
+            self.catalog_running=False
+            self.set_busy(False)
             self.update_catalog_summary()
             self.reload_member_summary()
+            status="STOPPED" if self.stop_event.is_set() else "INCOMPLETE" if errors else "READY"
+            self.query_one("#status",Static).update("CATALOG / "+status)
+            self.info("CATALOG / "+status+(" / "+"; ".join(errors) if errors else ""),
+                      "warning" if errors else "info")
+            if mode=="all" and status=="READY":
+                self.action_prepare_all_dimensions(mode="members")
 
-        def catalog_discovery_event(self, code: str, cube_type: str,
-                                    catalog: dict | None, error: str | None) -> None:
-            key = f"{code}/{cube_type}"
+        def catalog_discovery_event(self,code,kind,catalog,error):
+            key=f"{code}/{kind}"
             if error:
-                self.info(f"{key} refresh failed; saved catalog kept: {error}", "warning")
-            elif catalog:
-                summary = catalog_verification_summary(catalog)
-                self.info(f"{key}: VERIFIED {summary['verified']}/{summary['total']}; "
-                          f"{summary['selectable']} selectable.", "success")
+                self.info(f"{key} refresh/verification failed: {error}","warning")
+                return
+            if catalog:
+                profile=dict(cube_profile(code,kind,discovery=True))
+                profile.update(code=code,cube_type=kind,availability=cube_status(code,kind)["status"])
+                profile["cube"]=catalog.get("cube") or profile["cube"]
+                profile["catalog"]=catalog.get("catalog") or profile["catalog"]
+                self.catalog_snapshot[key]=(profile,catalog,catalog["fields"])
+                self.update_catalog_summary()
+                summary=catalog_verification_summary(catalog)
+                self.info(f"{key}: VERIFIED {summary['verified']}/{summary['total']}; {summary['selectable']} selectable.","success")
 
         # ====================================================
         # SELECTED DATA EXTRACTION / WINDOW HANDOFF

@@ -1316,6 +1316,18 @@ class OICClient:
         )
 
     def refresh_token(self, code: str) -> None:
+        if getattr(self,"shared_auth",False):
+            from oic_all_dim import ensure_shared_auth
+            cookie,token=ensure_shared_auth(code,getattr(self,"auth_stop",lambda:False),validate=True,allow_login=False)
+            if cookie!=self.cookie:
+                self.session.cookies.clear()
+                self.webform_auth.clear()
+                for part in cookie.split(";"):
+                    name,sep,value=part.strip().partition("=")
+                    if sep and name:
+                        self.session.cookies.set(name.strip(),value.strip(),domain=urlparse(BASE_URL).hostname,path="/",secure=True)
+            self.cookie,self.token=cookie,token
+            return
         page_url = (
             WEBFORM_PATH
             + "?Class="
@@ -1447,6 +1459,9 @@ class OICClient:
                 raise
 
             if response.status_code == 200:
+                from oic_all_dim import extract_error_details,CollectionError
+                if extract_error_details(response.content)=="AUTH_COOKIE_EXPIRED":
+                    raise CollectionError("AUTH_COOKIE_EXPIRED","XMLA session expired")
                 return response.content
 
             if response.status_code in (401, 403):
@@ -2334,6 +2349,9 @@ def verify_one_field(
         ValueError,
         ET.ParseError,
     ) as exc:
+        from oic_all_dim import is_session_error
+        if is_session_error(exc) or any(x in str(exc).upper() for x in ("HTTP 401","HTTP 403","AUTHENTICATION REJECTED")):
+            raise
         field["status"] = "MAPPED"
         field["verified_at"] = None
         field["verification_method"] = (

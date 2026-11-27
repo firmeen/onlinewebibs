@@ -3422,6 +3422,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
                 if current != self.last_token_value:
                     self.last_token_value = current
+                    self.auth_sequence += 1
                     self.dirty = True
 
                     self.refresh_auth_cards()
@@ -3568,14 +3569,9 @@ def launch_terminal_ui(args, return_app: bool = False):
             still matches the value being validated.
             """
 
-            client = OICClient(
-                cookie=cookie,
-                token="",
-                timeout=45,
-                retries=2,
-            )
-
+            client = None
             try:
+                client = OICClient(cookie=cookie,token="",timeout=45,retries=2)
                 token = client.request_token(
                     "AH"
                 )
@@ -3604,7 +3600,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
 
             finally:
-                client.close()
+                if client is not None:
+                    client.close()
 
         def session_validation_finished(
             self,
@@ -3620,8 +3617,11 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.auth_check_running = False
             self.auth_operation = "IDLE"
             if sequence != self.auth_sequence:
-                if not self.busy and self.cookie_value():
+                if self.cookie_value() and self.cookie_value()!=original_cookie and not self.busy:
                     self.schedule_auth_check(delay=0.3)
+                elif self.cookie_state=="CHECKING":
+                    self.cookie_state="NOT CHECKED"
+                    self.cookie_message="Credential editor changed; automatic validation will retry"
                 self.refresh_auth_cards()
                 return
 
@@ -4809,7 +4809,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.cancel_auth_timer()
             self.prepare_running = True
             self.prepare_unresolved = 0
-            self.auth_operation = "VALID"
+            if mode!="plan":
+                self.auth_operation = "VALID"
             self.refresh_auth_cards()
             self.stop_event.clear()
             self.set_busy(True)
@@ -4933,11 +4934,11 @@ def launch_terminal_ui(args, return_app: bool = False):
             if failed and error and error.startswith(("AUTH_COOKIE_EXPIRED", "ACCESS_DENIED", "AUTH_TOKEN_EXPIRED", "AUTH_ENDPOINT_ERROR")):
                 self.auth_operation = "ERROR"
                 self.cookie_state = "SESSION_EXPIRED" if error.startswith("AUTH_COOKIE_EXPIRED") else "NOT CHECKED"
-                self.cookie_message = "Check Session before retrying"
+                self.cookie_message = "Edit Cookie before retrying"
             elif self.auth_operation in ("REFRESHING", "RETRYING"):
                 self.auth_operation = "IDLE"
                 self.cookie_state = "NOT CHECKED"
-                self.cookie_message = "Check Session before retrying"
+                self.cookie_message = "Edit Cookie before retrying"
             self.refresh_auth_cards()
 
         def reload_member_summary(self) -> None:
@@ -5056,7 +5057,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             errors=[]
             snapshot=None
             try:
-                from oic_verify_fields import OICClient as VerifyClient, verify_saved_catalog
+                from oic_verify_fields import OICClient as VerifyClient, verify_saved_catalog, safe_error
                 client=VerifyClient(cookie,token)
                 for phase in (("catalog","verify") if mode=="all" else (mode,)):
                     for code in QUERY_PROFILES:
@@ -5088,20 +5089,27 @@ def launch_terminal_ui(args, return_app: bool = False):
                             except Exception as exc:
                                 if self.stop_event.is_set():
                                     return
-                                errors.append(key+": "+str(exc)[:180])
-                                self.call_from_thread(self.catalog_discovery_event,code,kind,None,str(exc)[:180])
-                                if any(x in str(exc).upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
+                                error=safe_error(exc,(cookie,token,client.cookie,client.token))
+                                if cube_status(code,kind)["status"]=="NOT_AVAILABLE" and not any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
+                                    self.call_from_thread(self.info,key+" | NOT AVAILABLE","warning")
+                                    continue
+                                errors.append(key+": "+error[:180])
+                                self.call_from_thread(self.catalog_discovery_event,code,kind,None,error[:180])
+                                if any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
                                     return
                     if errors:
                         break
                 if mode in ("all","verify") and not self.stop_event.is_set() and not errors:
-                    export_verified_catalogs()
+                    try:
+                        export_verified_catalogs()
+                    except (OSError,ValueError) as exc:
+                        self.call_from_thread(self.info,"Local verification saved; bundle export failed: "+type(exc).__name__,"warning")
             except Exception as exc:
                 errors.append(str(exc)[:180])
             finally:
                 if client is not None:
                     try:
-                        if client.token and client.token!=token:
+                        if client.token and (client.token!=token or client.cookie!=cookie) and not any(x in " ".join(errors).upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
                             self.call_from_thread(self.collection_auth_updated,client.token,client.cookie)
                     finally:
                         client.close()

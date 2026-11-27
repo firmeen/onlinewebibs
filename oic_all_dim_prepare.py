@@ -26,6 +26,9 @@ PROBE_BUDGET = 60
 MAX_DISCOVERY_PAGE = 5000
 MAX_DISCOVERY_PAGES = 10000
 DEFAULT_TIMEOUT = 180
+COLLECTION_TIMEOUT = 600
+MEMBER_TIMEOUT = 300
+PLAN_POLICY = "FULL_FIRST_MEMBERS"
 
 
 def local(tag):
@@ -293,7 +296,7 @@ def read_member_page(transport,profile,hierarchy,offset,size,emit=None):
     cube=profile["cube"].replace("]","]]")
     mdx=(f"SELECT Subset({hierarchy}.AllMembers,{offset},{size}) "
          f"DIMENSION PROPERTIES MEMBER_TYPE,PARENT_UNIQUE_NAME,CHILDREN_CARDINALITY,HIERARCHY_UNIQUE_NAME ON COLUMNS FROM [{cube}]")
-    root=checked_root(transport(profile,build_soap(profile,mdx),90))
+    root=checked_root(transport(profile,build_soap(profile,mdx),MEMBER_TIMEOUT))
     axis=root.find(f".//{{{MD_NS}}}Axis[@name='Axis0']")
     if axis is None:
         raise ValueError("Missing member enumeration axis")
@@ -341,14 +344,41 @@ def inventory_checkpoint(conn,prep,cube,hierarchy):
     return {"status":status,"saved":saved,"expected":expected,"error":state.get("error")}
 
 
+def inventory_fingerprint(catalogs):
+    return digest([PLANNER_VERSION, [
+        (key, profile["catalog"], profile["cube"], profile["availability"],
+         sorted(classify_fields(fields)[0]), sorted(classify_fields(fields)[1]))
+        for key,(profile,catalog,fields) in sorted(catalogs.items())
+    ]])
+
+
+def matching_preparation(conn,catalogs):
+    fingerprint=inventory_fingerprint(catalogs)
+    row=conn.execute("SELECT * FROM oic_preparations WHERE catalog_hash=? AND status IN ('READY','PREPARING') ORDER BY created_at DESC LIMIT 1",(fingerprint,)).fetchone()
+    if row:
+        return dict(row)
+    # Adopt a legacy web-only snapshot only if its saved executable scope matches.
+    for row in conn.execute("SELECT * FROM oic_preparations WHERE status IN ('READY','PREPARING') ORDER BY created_at DESC"):
+        prep=row["id"]
+        stored={}
+        for cube,raw in conn.execute("SELECT cube,profile_json FROM oic_cubes WHERE prep=?",(prep,)):
+            profile=json.loads(raw)
+            fields=[json.loads(f[0]) for f in conn.execute("SELECT field_json FROM oic_fields WHERE prep=? AND cube=?",(prep,cube))]
+            if any(f.get("source")!="GETSTRUCTURE" for f in fields):
+                break
+            stored[cube]=(profile,{},fields)
+        else:
+            if set(stored)==set(catalogs) and inventory_fingerprint(stored)==fingerprint:
+                return dict(row)
+    return None
+
+
 def inventory_summary(conn,catalogs,prep=None):
     """Checkpoint-only snapshot; no materialization of the member table."""
-    fingerprint=digest([PLANNER_VERSION,catalogs])
     if prep is None and conn is not None:
-        row=conn.execute("SELECT id,status FROM oic_preparations WHERE catalog_hash=? ORDER BY created_at DESC LIMIT 1",
-                         (fingerprint,)).fetchone()
-        if row and row[1] in ("READY","PREPARING"):
-            prep=row[0]
+        row=matching_preparation(conn,catalogs)
+        if row:
+            prep=row["id"]
     cubes={}
     eligible={}
     for cube,(profile,catalog,fields) in catalogs.items():
@@ -649,7 +679,7 @@ def reprepare_failed_requests(db,prep,log):
     rows=[dict(r) for r in db.conn.execute("SELECT * FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE'",(prep,))]
     for row in rows:
         scope=json.loads(row["scope_json"])
-        axis=max(("members","years","measures"),key=lambda k:len(scope[k]))
+        axis="members"
         if len(scope[axis])<2:
             log(f"{row['id'][:12]} remains unresolved: minimum request scope")
             continue
@@ -665,9 +695,7 @@ def reprepare_failed_requests(db,prep,log):
 
 def build_recovery_requests(req,profile):
     scope=req["scope"]
-    if req["potential_cells"]<1000:
-        return []
-    axis=max(("members","years","measures"),key=lambda k:len(scope[k]))
+    axis="members"
     values=scope[axis]
     if len(values)<2:
         return []
@@ -676,46 +704,30 @@ def build_recovery_requests(req,profile):
                            req["timeout"],"STANDBY",req["id"]) for part in (values[:middle],values[middle:])]
 
 
-def generate_request_plan(db,prep,job,cube,profile,scope,adaptive,emit=None):
-    probes=[json.loads(r[0]) for r in db.conn.execute(
-        "SELECT scope_json FROM oic_requests WHERE prep=? AND job=? AND status IN ('COMMITTED','EMPTY') AND parent IS NULL",
-        (prep,job))]
-    # Generation runs only during PREPARING. Previously generated primary
-    # requests may exist after interruption; their IDs are deterministic.
-    n=0
-    recovery=0
-    total=0
-    batch=[]
-    for x,y,m in itertools.product(partition(scope["members"],adaptive["x"]),
-                                    partition(scope["years"],adaptive["y"]),
-                                    partition(scope["measures"],adaptive["m"])):
-        part=dict(scope,members=x,years=y,measures=m,profile_id=adaptive.get("profile_id"))
-        remaining=[part]
-        for covered in probes:
-            remaining=[r for piece in remaining for r in subtract_scope(piece,covered)]
-        for piece in remaining:
-            req=request_record(prep,job,cube,profile,piece,adaptive["timeout"])
-            batch.append(req)
-            children=build_recovery_requests(req,profile)
-            batch.extend(children)
-            recovery+=len(children)
-            n+=1
-            total+=req["potential_cells"]
-            if len(batch)>=100:
-                db.insert_requests(batch)
-                emit_event(emit,"plan_batch",primary=n,recovery=recovery)
-                batch=[]
-    if batch:
-        db.insert_requests(batch)
-    emit_event(emit,"plan_batch",primary=n,recovery=recovery)
-    # Probe scopes are constructed disjointly; remaining rectangles are
-    # generated by exact subtraction from disjoint Cartesian partitions.
-    if total+sum(potential(p) for p in probes)!=potential(scope):
-        raise RuntimeError("Prepared request coverage mismatch")
-    return n
+def generate_request_plan(db,prep,job,cube,profile,scope,adaptive=None,emit=None):
+    # One primary request per independent dimension; split only on failure.
+    req=request_record(prep,job,cube,profile,scope,COLLECTION_TIMEOUT)
+    db.insert_requests([req])
+    emit_event(emit,"plan_batch",primary=1,recovery=0)
+    return 1
 
 
-def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
+def reset_legacy_plan(db,prep):
+    if db.conn.execute("SELECT 1 FROM oic_runs WHERE prep=? LIMIT 1",(prep,)).fetchone():
+        raise RuntimeError("Existing extraction history uses the legacy plan; preserve it before rebuilding")
+    with db.transaction():
+        db.conn.execute("DELETE FROM oic_values WHERE observation IN (SELECT id FROM oic_observations WHERE prep=?)",(prep,))
+        db.conn.execute("DELETE FROM oic_coordinates WHERE observation IN (SELECT id FROM oic_observations WHERE prep=?)",(prep,))
+        db.conn.execute("DELETE FROM oic_observations WHERE prep=?",(prep,))
+        db.conn.execute("DELETE FROM oic_requests WHERE prep=?",(prep,))
+        db.conn.execute("DELETE FROM oic_jobs WHERE prep=?",(prep,))
+        db.conn.execute("DELETE FROM oic_profiles WHERE prep=? AND profile NOT LIKE 'DISCOVERY_METADATA:%'",(prep,))
+        db.conn.execute("UPDATE oic_preparations SET status='PREPARING',summary_json='{}' WHERE id=?",(prep,))
+
+
+def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"):
+    if mode not in ("all","members","plan"):
+        raise ValueError("Invalid preparation mode")
     if catalogs is None:
         catalogs=load_all_catalogs(emit=emit)
     else:
@@ -733,19 +745,31 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
              (profile["availability"]!="AVAILABLE" or not catalog.get("web_scope_ready") or not fields)]
     if missing:
         raise RuntimeError("Missing GetStructure catalog; refresh: "+", ".join(missing))
-    fingerprint=digest([PLANNER_VERSION,catalogs])
-    current=db.preparation(fingerprint)
+    fingerprint=inventory_fingerprint(catalogs)
+    current=matching_preparation(db.conn,catalogs)
+    if current is None:
+        if mode=="plan":
+            raise RuntimeError("Refresh Members before Job Plan")
+        current=db.preparation(fingerprint)
+    elif current["catalog_hash"]!=fingerprint:
+        db.conn.execute("UPDATE oic_preparations SET catalog_hash=? WHERE id=?",(fingerprint,current["id"]))
     prep=current["id"]
+    old_policy=json.loads(current["summary_json"] or "{}").get("plan_policy")
+    if mode=="plan":
+        snapshot=inventory_summary(db.conn,catalogs,prep)
+        if any(c["available"] and (len(c["hierarchies"])!=c["total"] or any(h["status"] not in ("COMPLETE","EMPTY") for h in c["hierarchies"].values())) for c in snapshot["cubes"].values()):
+            raise RuntimeError("Member inventory incomplete; Refresh Members first")
     version_changed=db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND error LIKE 'SOURCE_VERSION_CHANGED%' LIMIT 1",(prep,)).fetchone()
     if version_changed:
         db.conn.execute("UPDATE oic_preparations SET status='STALE' WHERE id=?",(prep,))
         current=db.preparation(fingerprint)
         prep=current["id"]
         log("Source update marker changed; preparing a new snapshot")
-    elif current["status"]=="READY":
+    elif current["status"]=="READY" and old_policy==PLAN_POLICY:
         emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
         emit_event(emit,"phase",phase="REUSING",detail="Reusing prepared inventory and recovering failed requests")
-        reprepare_failed_requests(db,prep,log)
+        if mode!="members":
+            reprepare_failed_requests(db,prep,log)
         log("Existing READY inventory reused; failed scopes reprepared when possible")
         summary=json.loads(current["summary_json"])
         summary.update(requests=db.progress(prep),coverage=db.coverage(prep))
@@ -753,6 +777,8 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
         (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
         emit_event(emit,"summary",summary=summary)
         return not db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE' LIMIT 1",(prep,)).fetchone()
+    if old_policy!=PLAN_POLICY and mode!="members":
+        reset_legacy_plan(db,prep)
     db.recover_preparation(prep)
     emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
     errors=[]
@@ -803,6 +829,8 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
         emit_event(emit,"activity",message=f"{cube} | {len(inventory)} cached hierarchies | {len(pending)} pending")
         hierarchies,levels,live_measures=[],[],[]
         if pending:
+            if mode=="plan":
+                raise RuntimeError(f"{cube}: Member inventory incomplete")
             targets=(("MDSCHEMA_HIERARCHIES",hierarchies),("MDSCHEMA_LEVELS",levels),("MDSCHEMA_MEASURES",live_measures))
             for kind,target in targets:
                 cached=db.load_profile(prep,cube,"DISCOVERY_METADATA:"+kind)
@@ -821,7 +849,9 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
             db.save_catalog(prep,cube,profile,fields,measures)
         else:
             stored=db.conn.execute("SELECT measure,metadata_json FROM oic_measures WHERE prep=? AND cube=?",(prep,cube)).fetchall()
-            measures={r[0]:json.loads(r[1]) for r in stored}
+            saved={r[0]:json.loads(r[1]) for r in stored}
+            measures={k:dict(v,live_metadata=(saved.get(k) or {}).get("live_metadata")) for k,v in measures.items()}
+            db.save_catalog(prep,cube,profile,fields,measures)
         hierarchy_meta={str(r.get("HIERARCHY_UNIQUE_NAME","")).casefold():r for r in hierarchies}
         levels_by_h={}
         for row in levels:
@@ -881,13 +911,9 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
             members=[m["unique_name"] for m in inventory.get(h,[])] if h else [""]
             if not members:
                 continue
-            groups={}
-            for name,meta in measures.items():
-                group=(meta.get("live_metadata") or {}).get("MEASUREGROUP_NAME") or "UNKNOWN"
-                groups.setdefault(group,[]).append(name)
-            for group,names in sorted(groups.items()):
+            if mode!="members":
                 scope={"hierarchy":h,"year_hierarchy":profile["year"],"members":members,
-                       "years":years,"measures":sorted(names),"measure_group":group}
+                       "years":years,"measures":sorted(measures),"measure_group":"ALL"}
                 job=digest([prep,cube,h,scope])
                 db.save_job(prep,job,cube,h,scope)
                 jobs.append((job,cube,profile,scope))
@@ -901,53 +927,24 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
         emit_event(emit,"summary",summary=summary)
         log(f"PREPARE INCOMPLETE | {len(errors)} errors; rerun --prepare")
         return False
-    # Spend at most four shape probes per cube, keeping the global budget
-    # distributed across all categories instead of exhausting it on the first.
-    profiles={}
-    for index,(job,cube,profile,scope) in enumerate(sorted(jobs,key=lambda j:len(j[3]["members"]),reverse=True),1):
-        emit_event(emit,"phase",phase="ADAPTIVE",cube=cube,detail=f"Job {index}/{len(jobs)} | {scope['hierarchy'] or 'YEAR ONLY'}")
-        key=("YEAR_ONLY" if not scope["hierarchy"] else workload_group(len(scope["members"])))+":"+str(len(scope["years"]))+":"+digest(scope["measures"])[:12]
-        adaptive=db.load_profile(prep,cube,key)
-        if adaptive is None:
-            base=initial_profile(len(scope["members"]),len(scope["years"]),len(scope["measures"]))
-            used=db.conn.execute("""SELECT count(*) FROM oic_requests WHERE prep=? AND cube=?
-                 AND status IN ('PROBE','PROBE_FAILED','COMMITTED','EMPTY') AND json_extract(scope_json,'$.probe_kind') IS NULL""",(prep,cube)).fetchone()[0]
-            budget=max(0,min(4-used,PROBE_BUDGET))
-            adaptive,_=benchmark_profile(db,prep,job,cube,profile,scope,base,probe,budget,emit=emit)
-            db.save_profile(prep,cube,key,adaptive)
-        emit_event(emit,"profile",cube=cube,key=key,profile=adaptive)
-        profiles[job]=dict(adaptive,profile_id=key)
-    concurrency=optimize_concurrency(db,prep,jobs,probe,emit=emit)
-    emit_event(emit,"activity",message=f"Selected concurrency: {concurrency['limit']} | {concurrency['source']}")
+    if mode=="members":
+        summary["inventory_ready"]=True
+        if old_policy==PLAN_POLICY:
+            summary["plan_policy"]=PLAN_POLICY
+        db.finalize_preparation(prep,"PREPARING",summary)
+        (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
+        emit_event(emit,"summary",summary=summary)
+        return True
     for index,(job,cube,profile,scope) in enumerate(jobs,1):
         emit_event(emit,"plan_job",cube=cube,index=index,total=len(jobs),detail=scope["hierarchy"] or "YEAR ONLY")
-        generate_request_plan(db,prep,job,cube,profile,scope,profiles[job],emit=emit)
+        generate_request_plan(db,prep,job,cube,profile,scope,emit=emit)
         emit_event(emit,"plan_done")
-    emit_event(emit,"phase",phase="VALIDATING",detail="Finalizing coverage and preparation summary")
-    db.conn.execute("UPDATE oic_requests SET status='PROBE_FAILED' WHERE prep=? AND status='PROBE'",(prep,))
-    summary["requests"]=db.progress(prep)
-    summary["coverage"]=db.coverage(prep)
-    summary["probe_budget"]=PROBE_BUDGET
-    summary["profile_counts"]={}
-    for row in db.conn.execute("SELECT metadata_json FROM oic_profiles WHERE prep=? AND cube!='GLOBAL' AND profile NOT LIKE 'DISCOVERY_METADATA:%'",(prep,)):
-        source=json.loads(row[0]).get("source","UNKNOWN")
-        summary["profile_counts"][source]=summary["profile_counts"].get(source,0)+1
-    summary["estimated_extraction_seconds"]=None
-    # Only extrapolate when all pending jobs have measured throughput.
-    elapsed=0.0
-    for job,_,_,scope in jobs:
-        good=[sample["covered_per_second"] for sample in profiles[job].get("samples",[]) if sample.get("ok") and sample.get("covered_per_second",0)>0]
-        remaining=db.conn.execute("SELECT coalesce(sum(potential_cells),0) FROM oic_requests WHERE prep=? AND job=? AND status='PENDING'",(prep,job)).fetchone()[0]
-        if remaining and not good:
-            break
-        if remaining:
-            elapsed+=remaining/max(good)
-    else:
-        summary["estimated_extraction_seconds"]=round(elapsed/max(1,concurrency["limit"]))
-    summary["recommended_concurrency"]=concurrency["limit"]
-    summary["concurrency_profile"]=concurrency
-    db.finalize_preparation(prep,"READY",summary,concurrency=concurrency["limit"])
+    summary.update(plan_policy=PLAN_POLICY,inventory_ready=True,requests=db.progress(prep),coverage=db.coverage(prep),
+                   recommended_concurrency=4,estimated_extraction_seconds=None)
+    if summary["coverage"]["planned"]!=sum(potential(scope) for _,_,_,scope in jobs):
+        raise RuntimeError("Prepared request coverage mismatch")
+    db.finalize_preparation(prep,"READY",summary,concurrency=4)
     (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     emit_event(emit,"summary",summary=summary)
-    log(f"PREPARE READY (executable web fields) | {len(jobs)} jobs | unresolved web fields {unresolved} | {summary['requests']}")
+    log(f"PREPARE READY | {len(jobs)} full-first jobs")
     return True

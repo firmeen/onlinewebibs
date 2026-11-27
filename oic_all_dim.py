@@ -94,6 +94,7 @@ class PrepareMonitor:
         self.cubes={f"{c}/{y}":{"status":"PENDING","done":0,"total":None,"members":0}
                     for c in ("AH","FI","MR","MI","MV") for y in ("FY","UY","AY")}
         self.active={}
+        self.auth_state=None
         self.events=deque(maxlen=8)
         self.samples=deque(maxlen=4)
         self.concurrency_samples=deque(maxlen=3)
@@ -214,6 +215,14 @@ class PrepareMonitor:
                 "attempt":attempt,"started":now,"stage_at":now,"stage":"INITIALIZING","bytes":0}
         log(f"{cube} | {kind} | {detail} | attempt {attempt} | START")
 
+    def auth_status(self,state,operation):
+        with self.lock:
+            if self.auth_state==state:
+                return
+            self.auth_state=state
+        if self.on_progress is not None:
+            self.on_progress("auth_status",state=state,operation=operation)
+
     def request_updated(self,key,stage,**data):
         with self.lock:
             row=self.active.get(key)
@@ -226,9 +235,13 @@ class PrepareMonitor:
         auth_stage=stage in ("AUTH REFRESH","AUTH LOCK WAIT","REUSING VALID TOKEN","REUSING SHARED TOKEN","AUTH RETRY")
         if self.on_progress is not None:
             if stage in ("AUTH REFRESH","AUTH LOCK WAIT","AUTH RETRY"):
-                self.on_progress("auth_status",state="REFRESHING" if stage!="AUTH RETRY" else "RETRYING",operation=stage)
+                self.auth_status("REFRESHING" if stage!="AUTH RETRY" else "RETRYING",stage)
             elif stage in ("REUSING VALID TOKEN","REUSING SHARED TOKEN","REQUEST IN FLIGHT"):
-                self.on_progress("auth_status",state="VALID",operation="SESSION ACTIVE")
+                with self.lock:
+                    waiting=any(v["stage"] in ("AUTH REFRESH","AUTH LOCK WAIT","AUTH RETRY")
+                                for v in self.active.values())
+                if not waiting:
+                    self.auth_status("VALID","SESSION ACTIVE")
         if stage not in ("RECEIVING",):
             suffix=f" | HTTP {data['http_status']}" if "http_status" in data else ""
             if "remaining_seconds" in data:
@@ -1356,6 +1369,8 @@ def execute_discovery_request(collector_client,profile,payload,timeout,observe):
             observe("REUSING VALID TOKEN",remaining_seconds=int(jwt_exp(collector_client.token)-time.time()))
         try:
             collector_client.ensure_token(code,force=force)
+        except CollectionError:
+            raise
         except RuntimeError as exc:
             # The collector may be running as __main__; don't import a second
             # copy of its exception classes. Expose only safe error categories.
@@ -1573,8 +1588,11 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                     return data
                 except CollectionError as exc:
                     kind=exc.kind
-                    if exc.endpoint=="GEN_TOKEN" and on_progress is not None:
-                        on_progress("auth_status",state="RETRYING" if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE","AUTH_ENDPOINT_ERROR","AUTH_TOKEN_EXPIRED") and attempt<MAX_ATTEMPTS else "ERROR",operation=kind)
+                    if exc.endpoint=="LOCAL_CREDENTIALS":
+                        monitor.auth_status("ERROR",kind)
+                        raise
+                    if exc.endpoint=="GEN_TOKEN":
+                        monitor.auth_status("RETRYING" if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE","AUTH_ENDPOINT_ERROR","AUTH_TOKEN_EXPIRED") and attempt<MAX_ATTEMPTS else "ERROR",kind)
                     if kind in ("QUERY_SCOPE_ERROR","QUERY_FAULT","DISCOVER_NOT_SUPPORTED","RESPONSE_TOO_LARGE"):
                         raise
                     if kind in ("HTTP_500_UNKNOWN","RESPONSE_TIMEOUT","XMLA_FAULT_UNKNOWN") and exc.endpoint!="GEN_TOKEN":
@@ -1626,7 +1644,12 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                 monitor.request_started(key,req["cube"],detail,req["timeout"],kind="CONCURRENCY PROBE" if parallel else "SHAPE PROBE")
                 probe_client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
                 claimed=probe_db.claim_probe(key)
+                before_credentials=credential_values() if on_progress is not None else None
                 result=execute_resilient(probe_db,probe_client,claimed,probe=True)
+                if before_credentials is not None:
+                    after_credentials=credential_values()
+                    if after_credentials!=before_credentials:
+                        on_progress("auth_credentials",cookie=after_credentials[0],token=after_credentials[1])
                 if result.get("pressure"):
                     delay=max(10,result.get("delay",0))
                     monitor.retry(key,delay)

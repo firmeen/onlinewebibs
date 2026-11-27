@@ -803,6 +803,8 @@ def load_web_catalog(code: str, cube_type: str = "FY") -> dict:
                          "mapping_reason", "verified_at", "verification_method"):
                 if name in verified:
                     field[name] = verified[name]
+        if field.get("status")=="VERIFIED" and (not field.get("verified_at") or field.get("verification_method")!="XMLA_EXECUTE"):
+            field.update(status="MAPPED",mapping_status="MAPPED")
         fields.append(field)
     counts = {status: 0 for status in ("VERIFIED", "MAPPED", "UNVERIFIED", "UNSUPPORTED")}
     for field in fields:
@@ -830,7 +832,7 @@ def _replace_catalog_file(temporary: Path, destination: Path) -> None:
 
 
 def export_verified_catalogs() -> dict:
-    # All reports must be present before generating the distributable catalog.
+    # Export valid reports independently; keep other bundled catalogs intact.
     prepared, index = {}, _read_catalog_json(BUNDLED_CATALOG_DIR / "cube_types.json") or {}
     for code in PROFILES:
         for kind in CUBE_TYPES:
@@ -841,6 +843,7 @@ def export_verified_catalogs() -> dict:
             if not catalog.get("web_scope_ready"):
                 continue
             catalog["source"] = "BUNDLED_CATALOG"
+            catalog["web_fields"] = [dict(f) for f in catalog["fields"]]
             prepared[cache_path(code, kind).name] = catalog
             index.setdefault(code, {})[kind] = {
                 "status": "AVAILABLE", "cube": catalog["cube"],
@@ -1875,6 +1878,7 @@ def discover_xmla_metadata(
     *,
     timeout: int = 30,
     profile: dict | None = None,
+    kinds=("MDSCHEMA_HIERARCHIES","MDSCHEMA_MEASURES"),
 ) -> tuple[list[dict], list[str]]:
     import requests
 
@@ -1897,10 +1901,8 @@ def discover_xmla_metadata(
         "X-Requested-With": "XMLHttpRequest",
     }
 
-    for kind in (
-        "MDSCHEMA_HIERARCHIES",
-        "MDSCHEMA_MEASURES",
-    ):
+    for kind in kinds:
+        start=len(fields)
         try:
             response = session.post(
                 PROXY_URL,
@@ -1969,11 +1971,14 @@ def discover_xmla_metadata(
                         "type": field_type,
                     })
 
+            if len(fields)==start:
+                raise ValueError("Empty XMLA metadata rowset")
         except (
             requests.RequestException,
             ValueError,
             ET.ParseError,
         ) as exc:
+            del fields[start:]
             errors.append(
                 f"{kind}: {exc}"
             )
@@ -2132,9 +2137,11 @@ def discover_fields(
         )
 
         if xmla_errors or not xmla_fields:
-            retry_fields, retry_errors = discover_xmla_metadata(session,code,token,referer,timeout=timeout,profile=profile)
-            if not retry_errors and retry_fields:
-                xmla_fields,xmla_errors=retry_fields,retry_errors
+            failed_kinds=tuple(e.split(":",1)[0] for e in xmla_errors) or ("MDSCHEMA_HIERARCHIES","MDSCHEMA_MEASURES")
+            retry_fields,retry_errors=discover_xmla_metadata(session,code,token,referer,
+                timeout=timeout,profile=profile,kinds=failed_kinds)
+            xmla_fields.extend(retry_fields)
+            xmla_errors=retry_errors
         errors.extend(xmla_errors)
 
     # NORMALIZE CATALOG

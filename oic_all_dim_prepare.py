@@ -357,6 +357,10 @@ def matching_preparation(conn,catalogs):
     row=conn.execute("SELECT * FROM oic_preparations WHERE catalog_hash=? AND status IN ('READY','PREPARING') ORDER BY created_at DESC LIMIT 1",(fingerprint,)).fetchone()
     if row:
         return dict(row)
+    row=conn.execute("SELECT * FROM oic_preparations WHERE catalog_hash=? AND status IN ('READY','PREPARING') ORDER BY created_at DESC LIMIT 1",
+                     (digest([PLANNER_VERSION,catalogs]),)).fetchone()
+    if row:
+        return dict(row)
     # Adopt a legacy web-only snapshot only if its saved executable scope matches.
     for row in conn.execute("SELECT * FROM oic_preparations WHERE status IN ('READY','PREPARING') ORDER BY created_at DESC"):
         prep=row["id"]
@@ -371,6 +375,40 @@ def matching_preparation(conn,catalogs):
             if set(stored)==set(catalogs) and inventory_fingerprint(stored)==fingerprint:
                 return dict(row)
     return None
+
+
+def reuse_unchanged_inventories(db,prep,cube,profile,dimensions):
+    # A changed executable scope gets its own preparation. Copy only complete
+    # inventories from the newest compatible web-only cube; retain the old DB rows.
+    rows=db.conn.execute("""SELECT p.id,c.profile_json FROM oic_preparations p
+        JOIN oic_cubes c ON c.prep=p.id
+        WHERE p.id!=? AND c.cube=? AND p.status IN ('READY','PREPARING')
+        ORDER BY p.created_at DESC""",(prep,cube)).fetchall()
+    for old,raw in rows:
+        old_profile=json.loads(raw)
+        if any(old_profile.get(k)!=profile.get(k) for k in ("catalog","cube")):
+            continue
+        old_fields=[json.loads(r[0]) for r in db.conn.execute("SELECT field_json FROM oic_fields WHERE prep=? AND cube=?",(old,cube))]
+        if not old_fields or any(f.get("source")!="GETSTRUCTURE" for f in old_fields):
+            continue
+        old_dims,_=classify_fields(old_fields)
+        with db.transaction():
+            for h in dimensions:
+                if h not in old_dims:
+                    continue
+                if db.conn.execute("SELECT 1 FROM oic_dimensions WHERE prep=? AND cube=? AND hierarchy=?",(prep,cube,h)).fetchone():
+                    continue
+                result=db.conn.execute("""INSERT INTO oic_dimensions
+                    SELECT ?,cube,hierarchy,status,metadata_json FROM oic_dimensions
+                    WHERE prep=? AND cube=? AND hierarchy=? AND status IN ('COMPLETE','EMPTY')""",(prep,old,cube,h))
+                if result.rowcount:
+                    db.conn.execute("""INSERT INTO oic_levels
+                        SELECT ?,cube,hierarchy,level,metadata_json FROM oic_levels
+                        WHERE prep=? AND cube=? AND hierarchy=?""",(prep,old,cube,h))
+                    db.conn.execute("""INSERT INTO oic_members
+                        SELECT ?,cube,hierarchy,unique_name,caption,parent,level,metadata_json FROM oic_members
+                        WHERE prep=? AND cube=? AND hierarchy=?""",(prep,old,cube,h))
+        break
 
 
 def inventory_summary(conn,catalogs,prep=None):
@@ -817,6 +855,8 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
             continue
         if not db.conn.execute("SELECT 1 FROM oic_cubes WHERE prep=? AND cube=?",(prep,cube)).fetchone():
             db.save_catalog(prep,cube,profile,fields,measures)
+            if not version_changed and mode!="plan":
+                reuse_unchanged_inventories(db,prep,cube,profile,dimensions)
         inventory={}
         for h in dimensions:
             cached=db.inventory(prep,cube,h)
@@ -913,7 +953,7 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
                 continue
             if mode!="members":
                 scope={"hierarchy":h,"year_hierarchy":profile["year"],"members":members,
-                       "years":years,"measures":sorted(measures),"measure_group":"ALL"}
+                       "years":years,"measures":sorted(measures),"measure_group":"ALL","plan_policy":PLAN_POLICY}
                 job=digest([prep,cube,h,scope])
                 db.save_job(prep,job,cube,h,scope)
                 jobs.append((job,cube,profile,scope))
@@ -935,6 +975,10 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
         (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
         emit_event(emit,"summary",summary=summary)
         return True
+    # Mark the plan policy before creating requests so an interrupted local plan
+    # can resume without deleting deterministic full-first requests.
+    summary["plan_policy"]=PLAN_POLICY
+    db.finalize_preparation(prep,"PREPARING",summary)
     for index,(job,cube,profile,scope) in enumerate(jobs,1):
         emit_event(emit,"plan_job",cube=cube,index=index,total=len(jobs),detail=scope["hierarchy"] or "YEAR ONLY")
         generate_request_plan(db,prep,job,cube,profile,scope,emit=emit)

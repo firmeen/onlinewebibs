@@ -66,7 +66,7 @@ MAX_LOGIN_ATTEMPTS = 2
 MAX_SESSION_CONFIRMATIONS = 1
 
 HEADLESS = False
-CLOSE_BROWSER = True
+CLOSE_BROWSER = False
 
 
 # ============================================================
@@ -330,6 +330,8 @@ def create_driver() -> webdriver.Chrome:
 
     options = webdriver.ChromeOptions()
 
+    options.add_experimental_option("detach", True)
+
     options.add_argument("--start-maximized")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
@@ -520,23 +522,9 @@ def handle_login_alert(
     print("  Confirm only if authorized to terminate that session.")
     print("-" * 76)
 
-    try:
+    choice = "y"
 
-        choice = input(
-            "  Confirm termination of existing session? [Y/n]: "
-        ).strip().lower() or "y"
-
-    except (EOFError, KeyboardInterrupt):
-
-        try:
-
-            alert.dismiss()
-
-        except NoAlertPresentException:
-
-            pass
-
-        raise
+    log("INFO", "Session conflict automatically confirmed")
 
     if choice not in ("y", "yes"):
 

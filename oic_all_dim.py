@@ -192,11 +192,17 @@ class PrepareMonitor:
             # File logging remains independent of the live renderer.
             log(message)
         if self.on_progress is not None and event in ("phase","cube","plan_job","summary"):
+            if event=="phase" and "cube" not in data:
+                data=dict(data,cube=self.context_cube())
             self.on_progress(event,**data)
 
     def context(self):
         with self.lock:
             return self.phase,self.detail
+
+    def context_cube(self):
+        with self.lock:
+            return self.cube
 
     def request_started(self,key,cube,detail,timeout,attempt=1,kind="DISCOVERY"):
         now=time.monotonic()
@@ -1380,6 +1386,8 @@ def execute_discovery_request(collector_client,profile,payload,timeout,observe,r
                 observe("HEADERS RECEIVED",http_status=response.status_code)
                 if response.status_code in (401,403) and attempt==0:
                     retry_auth=True
+                elif response.status_code in (401,403):
+                    raise CollectionError("ACCESS_DENIED",f"XMLA HTTP {response.status_code} after JWT refresh",endpoint="XMLA",http_status=response.status_code)
                 elif response.status_code!=200:
                     body=bytearray()
                     for chunk in response.iter_content(chunk_size=8192):

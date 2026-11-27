@@ -149,6 +149,9 @@ class OICDatabase:
             PRIMARY KEY(run,worker)
         );
         """)
+        with self.transaction():
+            if "auth_json" not in {row[1] for row in self.conn.execute("PRAGMA table_info(oic_runs)")}:
+                self.conn.execute("ALTER TABLE oic_runs ADD COLUMN auth_json TEXT NOT NULL DEFAULT '{}'")
         self.conn.execute("PRAGMA user_version=1")
 
     def preparation(self, fingerprint):
@@ -399,10 +402,39 @@ class OICDatabase:
     def finish_run(self,rid,state):
         self.conn.execute("UPDATE oic_runs SET state=?,stop=1 WHERE id=?", (state,rid))
 
+    def auth_state(self,rid):
+        run=self.run(rid)
+        return json.loads(run.get("auth_json") or "{}") if run else {}
+
+    def set_auth_state(self,rid,state,**fields):
+        with self.transaction():
+            current=self.auth_state(rid)
+            current.update(state=state,**fields)
+            self.conn.execute("UPDATE oic_runs SET auth_json=? WHERE id=?",
+                              (canonical(current),rid))
+
+    def request_relogin(self,rid,generation):
+        with self.transaction():
+            current=self.auth_state(rid)
+            if current.get("generation",0)!=generation or current.get("state","IDLE")!="IDLE":
+                return
+            current["state"]="RELOGIN_REQUIRED"
+            self.conn.execute("UPDATE oic_runs SET auth_json=? WHERE id=?",(canonical(current),rid))
+
+    def auth_retry(self,r,error):
+        with self.transaction():
+            self._fence(r)
+            self.conn.execute("""UPDATE oic_requests SET status='RETRY',error=?,available_at=?,
+                attempts=max(0,attempts-1),owner=NULL,lease=NULL,expires=NULL WHERE id=?""",
+                (error,time.time(),r["id"]))
+
+    def active_http_slots(self,rid):
+        return self.conn.execute("SELECT count(*) FROM oic_workers WHERE run=? AND slot=1",(rid,)).fetchone()[0]
+
     def claim_next_request(self,rid,owner):
         with self.transaction():
             run=self.run(rid)
-            if not run or run["stop"] or not run["barrier"]:
+            if not run or run["stop"] or not run["barrier"] or json.loads(run.get("auth_json") or "{}").get("state","IDLE")!="IDLE":
                 return None
             worker=self.conn.execute("SELECT worker FROM oic_workers WHERE run=? AND owner=? AND status='READY'",(rid,owner)).fetchone()
             if not worker:
@@ -521,7 +553,7 @@ class OICDatabase:
     def acquire_slot(self,rid,owner):
         with self.transaction():
             run=self.run(rid)
-            if not run or run["stop"] or run["cooldown"]>time.time():
+            if not run or run["stop"] or run["cooldown"]>time.time() or json.loads(run.get("auth_json") or "{}").get("state","IDLE")!="IDLE":
                 return False
             n=self.conn.execute("SELECT count(*) FROM oic_workers WHERE run=? AND slot=1",(rid,)).fetchone()[0]
             if n>=run["allowed"]:

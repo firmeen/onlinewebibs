@@ -1032,111 +1032,165 @@ def wait_seconds(seconds,check=lambda:False):
         time.sleep(min(0.5,max(0,end-time.monotonic())))
 
 
-def request_excel_path(r):
-    scope=json.loads(r["scope_json"])
-    category,kind=r["cube"].split("/")
-    return OUTPUT/"excel"/r["prep"][:12]/category/kind/f"J{scope.get('job_index',0):04d}_{r['job'][:8]}"/(
-        f"Y{scope.get('year_offset',0):03d}_M{scope.get('member_offset',0):06d}_{r['id'][:20]}.xlsx")
+EXCEL_DATA_ROWS = 1_048_575
 
 
-def export_request_excel(db,r):
-    """Export committed raw XML only; never repeat a network request."""
-    from openpyxl import Workbook
-    from openpyxl.cell import WriteOnlyCell
-    scope=json.loads(r["scope_json"])
-    path=request_excel_path(r)
-    metrics=json.loads(r.get("metrics_json") or "{}")
-    if metrics.get("excel_status")=="SAVED" and path.is_file():
-        return True
-    temp=path.with_name(uuid.uuid4().hex[:16]+".tmp.xlsx")
-    wb=None
+def export_consolidated_excel(db,prep,rid=None,on_progress=None):
+    """Supervisor-only, offline export of the entire committed preparation.
+
+    Rebuild from validated raw XML, including prior runs, so resume is
+    idempotent. No worker writes XLSX; split workbooks only at Excel's row limit.
+    """
+    root=OUTPUT/"excel"/prep[:12]
+    staging=root/(".export_"+uuid.uuid4().hex[:12])
+    total=db.conn.execute("SELECT count(*) FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')",(prep,)).fetchone()[0]
+    done=rows_written=0
+    files=[]
+    wb=sheet=None
+    part_rows=0
+    last_report=0.0
+
+    def report(status,error=None):
+        nonlocal last_report
+        last_report=time.monotonic()
+        state={"run_id":rid,"status":status,"requests":done,"total_requests":total,
+               "rows":rows_written,"files":len(files),"error":error}
+        db.conn.execute("""UPDATE oic_preparations SET summary_json=json_set(
+            coalesce(summary_json,'{}'),'$.excel_export',json(?)) WHERE id=?""",
+            (json.dumps(state,ensure_ascii=False),prep))
+        if rid:
+            notify_collection_progress(db,rid,on_progress)
+
     try:
-        path.parent.mkdir(parents=True,exist_ok=True)
-        raw=Path(r["response_path"]) if r.get("response_path") else None
-        if not raw or not raw.is_file() or not r.get("response_hash"):
-            raise RuntimeError("Committed raw XML is unavailable")
-        data=raw.read_bytes()
-        if digest(data)!=r["response_hash"]:
-            raise RuntimeError("Raw response hash mismatch")
-        years,rows,cells,updated=parse_xmla(data,scope)
-        captions={}
-        for hierarchy in (scope["year_hierarchy"],scope["hierarchy"]):
-            if hierarchy:
-                captions.update({name:caption for name,caption in db.conn.execute(
-                    "SELECT unique_name,caption FROM oic_members WHERE prep=? AND cube=? AND hierarchy=?",
-                    (r["prep"],r["cube"],hierarchy))})
+        report("EXPORTING")
+        if not total:
+            report("EMPTY")
+            return 0
+        from openpyxl import Workbook
+        from openpyxl.cell import WriteOnlyCell
+        root.mkdir(parents=True,exist_ok=True)
+        staging.mkdir()
+        measures=sorted({m for (raw,) in db.conn.execute("SELECT scope_json FROM oic_jobs WHERE prep=?",(prep,))
+                         for m in json.loads(raw)["measures"]})
+        headers=["CATEGORY","YEAR_TYPE","CUBE","HIERARCHY","YEAR","YEAR_UNIQUE_NAME",
+                 "MEMBER","MEMBER_UNIQUE_NAME","REQUEST_ID","SOURCE_UPDATE",*measures]
+        if len(headers)>16384:
+            raise RuntimeError("Combined measure columns exceed Excel column limit")
+        captions={(cube,hierarchy,name):caption for cube,hierarchy,name,caption in db.conn.execute(
+            "SELECT cube,hierarchy,unique_name,caption FROM oic_members WHERE prep=?",(prep,))}
+
         def value(raw):
             if raw is None:
                 return None
             try:
                 d=Decimal(raw)
                 if d.is_finite() and len(d.as_tuple().digits)<=15 and abs(d)<Decimal("1e15"):
-                    return int(d) if d==d.to_integral_value() else float(d)
+                    if d==d.to_integral_value():
+                        return int(d)
+                    number=float(d)
+                    if number!=0:
+                        return number
             except (InvalidOperation,OverflowError,ValueError):
                 pass
             return str(raw)
-        def append(sheet,items):
-            result=[]
+
+        def append(target,items):
+            cells=[]
             for item in items:
                 if isinstance(item,str):
-                    cell=WriteOnlyCell(sheet,value=item)
+                    cell=WriteOnlyCell(target,value=item)
                     cell.data_type="s"
-                    result.append(cell)
+                    cells.append(cell)
                 else:
-                    result.append(item)
-            sheet.append(result)
-        grouped={}
-        for i,(member,measure) in enumerate(rows):
-            for j,year in enumerate(years):
-                grouped.setdefault((year,member),{})[measure]=value(cells.get(i*len(years)+j,(None,None))[0])
-        wb=Workbook(write_only=True)
-        headers=["YEAR","YEAR_UNIQUE_NAME","HIERARCHY","MEMBER","MEMBER_UNIQUE_NAME",*scope["measures"]]
-        sheet=wb.create_sheet("DATA")
-        append(sheet,headers)
-        for idx,((year,member),values) in enumerate(grouped.items(),1):
-            if idx>1 and (idx-1)%1048575==0:
-                sheet=wb.create_sheet(f"DATA_{(idx-1)//1048575+1}")
-                append(sheet,headers)
-            append(sheet,[captions.get(year) or year,year,scope["hierarchy"],captions.get(member) or member,
-                          member,*[values.get(m) for m in scope["measures"]]])
-        info=wb.create_sheet("INFO")
-        for name,item in (("CUBE",r["cube"]),("JOB",r["job"]),("REQUEST",r["id"]),
-                          ("WORKER",scope.get("worker_id")),("YEAR_OFFSET",scope.get("year_offset",0)),
-                          ("MEMBER_OFFSET",scope.get("member_offset",0)),("EXPECTED_CELLS",r["potential_cells"]),
-                          ("ROWS",len(grouped)),("SOURCE_UPDATE",updated),("STATUS",r["status"]),
-                          ("DATA_TYPE","OLAP AGGREGATE"),("NOTICE","Do not sum All members with detail members")):
-            append(info,[name,item])
-        wb.save(temp)
-        os.replace(temp,path)
-        db.export_result(r["id"],path=path)
-        log(f"EXCEL SAVED | {r['cube']} | {r['id'][:12]} | {len(grouped):,} rows")
-        return True
-    except Exception as exc:
-        log(f"EXCEL ERROR | {r['id'][:12]} | {type(exc).__name__}")
-        try:
-            db.export_result(r["id"],error=type(exc).__name__)
-        except sqlite3.Error:
-            pass
-        return False
+                    cells.append(item)
+            target.append(cells)
+
+        def begin_part():
+            nonlocal wb,sheet,part_rows
+            wb=Workbook(write_only=True)
+            sheet=wb.create_sheet("DATA")
+            append(sheet,headers)
+            part_rows=0
+
+        def save_part():
+            nonlocal wb,sheet
+            path=staging/f"OIC_DATA_{len(files)+1:03d}.xlsx"
+            info=wb.create_sheet("INFO")
+            for key,item in (("PREPARATION",prep),("PART",len(files)+1),("ROWS",part_rows),
+                             ("COMMITTED_REQUESTS",total),("DATA_TYPE","OLAP AGGREGATE"),
+                             ("NOTICE","Do not sum All members with detail members"),
+                             ("SCOPE","Committed requests only; may be partial collection")):
+                append(info,[key,item])
+            wb.save(path)
+            wb.close()
+            wb=sheet=None
+            files.append(path)
+
+        requests=db.conn.execute("""SELECT r.id,r.cube,r.scope_json,r.response_path,r.response_hash
+            FROM oic_requests r JOIN oic_jobs j ON j.prep=r.prep AND j.id=r.job
+            WHERE r.prep=? AND r.status IN ('COMMITTED','EMPTY')
+            ORDER BY json_extract(j.scope_json,'$.job_index'),
+                     json_extract(r.scope_json,'$.year_offset'),
+                     json_extract(r.scope_json,'$.member_offset'),r.id""",(prep,))
+        for r in requests:
+            scope=json.loads(r["scope_json"])
+            raw=Path(r["response_path"]) if r["response_path"] else None
+            if (not raw or not raw.resolve().is_relative_to(OUTPUT.resolve())
+                    or not raw.is_file() or not r["response_hash"]):
+                raise RuntimeError(f"Committed raw XML unavailable: {r['id'][:12]}")
+            data=raw.read_bytes()
+            if digest(data)!=r["response_hash"]:
+                raise RuntimeError(f"Raw response hash mismatch: {r['id'][:12]}")
+            years,axes,cells,updated=parse_xmla(data,scope)
+            grouped={}
+            for idx,(member,measure) in enumerate(axes):
+                for yi,year in enumerate(years):
+                    grouped.setdefault((year,member),{})[measure]=value(cells.get(idx*len(years)+yi,(None,None))[0])
+            category,kind=r["cube"].split("/")
+            for (year,member),values in grouped.items():
+                if wb is None:
+                    begin_part()
+                elif part_rows>=EXCEL_DATA_ROWS:
+                    save_part()
+                    begin_part()
+                append(sheet,[category,kind,r["cube"],scope["hierarchy"],
+                    captions.get((r["cube"],scope["year_hierarchy"],year)) or year,year,
+                    captions.get((r["cube"],scope["hierarchy"],member)) or member,member,
+                    r["id"],updated,*[values.get(m) for m in measures]])
+                part_rows+=1
+                rows_written+=1
+            done+=1
+            if time.monotonic()-last_report>=1:
+                report("EXPORTING")
+        if wb is not None:
+            save_part()
+        if done!=total:
+            raise RuntimeError("Committed request count changed during export")
+        # Only publish after every raw response has been validated and written.
+        for path in files:
+            os.replace(path,root/path.name)
+        # A rebuilt snapshot may have fewer parts; remove only our own old files.
+        names={path.name for path in files}
+        for path in root.glob("OIC_DATA_*.xlsx"):
+            if re.fullmatch(r"OIC_DATA_\d{3,}\.xlsx",path.name) and path.name not in names:
+                path.unlink()
+        report("SAVED")
+        log(f"EXCEL SAVED | {len(files)} file(s) | {rows_written:,} rows | {root}")
+        return 0
+    except (Exception,KeyboardInterrupt) as exc:
+        error=f"{type(exc).__name__}: {exc}"[:300]
+        log(f"EXCEL ERROR | {error}")
+        report("FAILED",error)
+        return 1
     finally:
         if wb is not None:
             try:
+                if sheet is not None:
+                    sheet.close()
                 wb.close()
             except Exception:
                 pass
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-def flush_pending_exports(db,prep):
-    failed=0
-    rows=db.conn.execute("SELECT id FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')",(prep,)).fetchall()
-    for row in rows:
-        if not export_request_excel(db,db.get_request(row[0])):
-            failed+=1
-    return failed
+        shutil.rmtree(staging,ignore_errors=True)
 
 
 def process_request(db,client,r,rid=None,owner=None):
@@ -1353,12 +1407,11 @@ def collection_snapshot(conn,rid):
         (run["created_at"],prep)).fetchone()
     totals["committed_bytes"]=metrics[0] or 0
     totals["run_cells"]=metrics[1] or 0
-    exports=conn.execute("""SELECT coalesce(sum(CASE WHEN json_extract(metrics_json,'$.excel_status')='SAVED' THEN 1 ELSE 0 END),0),
-        coalesce(sum(CASE WHEN json_extract(metrics_json,'$.excel_status')='FAILED' THEN 1 ELSE 0 END),0)
-        FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')""",(prep,)).fetchone()
-    totals["excel_saved"]=exports[0]
-    totals["excel_failed"]=exports[1]
-    totals["excel_pending"]=totals["committed"]-exports[0]-exports[1]
+    row=conn.execute("SELECT summary_json FROM oic_preparations WHERE id=?",(prep,)).fetchone()
+    export=json.loads(row[0] or "{}").get("excel_export",{}) if row else {}
+    if export.get("run_id")!=rid:
+        export={"status":"DEFERRED","requests":0,"total_requests":totals["committed"],"rows":0,"files":0}
+    totals["excel_export"]=export
     workers=[dict(row) for row in conn.execute("SELECT * FROM oic_workers WHERE run=? ORDER BY worker",(rid,))]
     return {"run":run,"totals":totals,"cubes":cubes,"workers":workers,"assignments":assignments}
 
@@ -1389,7 +1442,7 @@ class WorkerMonitor:
         self.last_publish=0
         self.state={"owner":owner,"worker":worker,"stage":"STARTING","started":self.started,
                     "stage_at":self.started,"request":{},"stats":{"committed":0,"failed":0,"splits":0,"retries":0,
-                    "cells":0,"bytes":0,"seconds":0.0,"excel_saved":0,"excel_failed":0},"recent":[],"events":[]}
+                    "cells":0,"bytes":0,"seconds":0.0},"recent":[],"events":[]}
         self.live=None
         self.handler=None
 
@@ -1467,7 +1520,6 @@ class WorkerMonitor:
                 stats["cells"]+=q["cells"]
                 stats["bytes"]+=0 if result.get("replayed") else int(result.get("response_bytes",0) or 0)
                 stats["seconds"]+=duration
-                stats["excel_saved" if result.get("excel_saved") else "excel_failed"]+=1
             elif status=="REPLACED":
                 stats["splits"]+=1
             elif status=="RETRY":
@@ -1547,7 +1599,7 @@ class WorkerMonitor:
                 ("Auth",{"AUTH LOCK WAIT","AUTH REFRESH","REUSING VALID TOKEN","REUSING SHARED TOKEN"}),
                 ("HTTP",{"REQUEST IN FLIGHT","HEADERS RECEIVED"}),
                 ("XML",{"RECEIVING","SAVING RAW XML","REPLAYING SAVED XML"}),
-                ("Parse",{"PARSING"}),("Commit",{"COMMITTING"}),("Excel",{"EXPORTING EXCEL"})]
+                ("Parse",{"PARSING"}),("Commit",{"COMMITTING"})]
         flow=Text()
         for label,stages in phases:
             active=s["stage"] in stages
@@ -1569,8 +1621,7 @@ class WorkerMonitor:
         return Group(Panel(header,border_style="cyan"),Panel(table,title="01 / CURRENT REQUEST"),
                      Panel(lifecycle,title="02 / REQUEST LIFECYCLE"),
                      Panel(Text(f"Saved {stats['committed']}  |  Failed {stats['failed']}  |  Splits {stats['splits']}  |  Retries {stats['retries']}\n"
-                                f"Cells {stats['cells']:,}  |  Received {stats['bytes']/1048576:.2f} MiB  |  Avg saved request {avg:.1f}s\n"
-                                f"Excel saved {stats['excel_saved']} | Excel failed {stats['excel_failed']}"),title="03 / WORKER STATISTICS (this process)"),
+                                f"Cells {stats['cells']:,}  |  Received {stats['bytes']/1048576:.2f} MiB  |  Avg saved request {avg:.1f}s"),title="03 / WORKER STATISTICS (this process)"),
                      Panel(recent,title="04 / RECENT REQUESTS"),Panel(activity,title="05 / ACTIVITY"))
 
 
@@ -1593,13 +1644,18 @@ class CollectionMonitor:
         duration=max(1,time.time()-run["created_at"])
         pct=100*t["covered"]/max(1,t["planned"])
         status="STOPPING" if run["state"]=="RUNNING" and run["stop"] else "STARTING" if run["state"]=="RUNNING" and not run["barrier"] else run["state"]
+        export=t["excel_export"]
+        if export["status"]=="EXPORTING":
+            status="EXPORTING"
         header=Text(f"OIC COLLECTION  |  LIVE MONITOR\n{status}  |  Run {self.rid[:12]}  |  Elapsed {elapsed_label(duration)}",
                     style="bold cyan")
         global_panel=Group(Text(f"Jobs {t['jobs_done']}/{t['jobs']}  |  Failed jobs {t['jobs_failed']}  |  Splits {t['splits']}"),
             Text(f"Cells {t['covered']:,}/{t['planned']:,}  |  {pct:.2f}%"),rich_progress(t["covered"],t["planned"]),
             Text(f"Saved requests {t['committed']}  |  Pending {t['pending']}  |  Running {t['running']}  |  Failed {t['failed']}"),
             Text(f"Request attempts {t['attempts']} (plan lifetime)  |  {t['run_cells']/duration:,.0f} cells/s (this run)  |  Saved XML {t['committed_bytes']/1048576:.2f} MiB"),
-            Text(f"Excel saved {t['excel_saved']} | Pending {t['excel_pending']} | Failed {t['excel_failed']}"))
+            Text("Excel: deferred until collection stops" if export["status"]=="DEFERRED" else
+                 f"Excel: {export['status']} | Requests {export['requests']}/{export['total_requests']} | Rows {export['rows']:,} | Files {export['files']}"+
+                 (f" | {export['error']}" if export.get("error") else "")))
         workers=Table(expand=True)
         for col in ("Worker","Jobs","Cube / Dimension","Stage","Elapsed","Saved","Cells"):
             workers.add_column(col,overflow="fold")
@@ -1651,21 +1707,23 @@ class CollectionMonitor:
             with Live(console=console,screen=console.is_terminal,auto_refresh=False,vertical_overflow="crop") as live:
                 while True:
                     try:
-                        with conn:
-                            conn.execute("BEGIN")
-                            self.snapshot=collection_snapshot(conn,self.rid)
-                        if self.snapshot is None:
-                            raise RuntimeError("Run not found")
-                        self.states={n:read_worker_state(self.rid,n) for n in range(1,self.snapshot["run"]["workers"]+1)}
-                        self.error=""
-                    except sqlite3.Error as exc:
-                        self.error=f"Snapshot unavailable: {type(exc).__name__}"
-                    live.update(self.render(),refresh=True)
-                    if self.snapshot and self.snapshot["run"]["state"]!="RUNNING":
-                        break
-                    try:
+                        try:
+                            with conn:
+                                conn.execute("BEGIN")
+                                self.snapshot=collection_snapshot(conn,self.rid)
+                            if self.snapshot is None:
+                                raise RuntimeError("Run not found")
+                            self.states={n:read_worker_state(self.rid,n) for n in range(1,self.snapshot["run"]["workers"]+1)}
+                            self.error=""
+                        except sqlite3.Error as exc:
+                            self.error=f"Snapshot unavailable: {type(exc).__name__}"
+                        live.update(self.render(),refresh=True)
+                        if self.snapshot and self.snapshot["run"]["state"]!="RUNNING":
+                            break
                         time.sleep(1)
                     except KeyboardInterrupt:
+                        # Ctrl+C anywhere in the monitor loop requests stop,
+                        # without interrupting the supervisor's final export.
                         control=OICDatabase(DB_PATH)
                         try:
                             control.stop(self.rid)
@@ -1727,9 +1785,6 @@ def run_worker(rid,worker):
             monitor.begin(r,captions.get((r["cube"],scope["hierarchy"]),scope["hierarchy"] or "YEAR TOTALS"))
             result=execute_resilient(db,client,r,rid,owner)
             saved=db.get_request(r["id"])
-            if saved and saved["status"] in ("COMMITTED","EMPTY"):
-                monitor.observe("EXPORTING EXCEL")
-                result["excel_saved"]=export_request_excel(db,saved)
             monitor.finish(result,saved["status"] if saved else "UNKNOWN")
             delay=json.loads(r["scope_json"]).get("delay",1.0)
             try:
@@ -2217,7 +2272,7 @@ def run_extraction(db,workers=None,stop_event=None,on_progress=None):
     if workers!=settings.get("workers"):
         raise RuntimeError("Worker count differs from saved Job Plan; generate a matching plan")
     if db.all_work_finished(prep["id"]):
-        failed_exports=flush_pending_exports(db,prep["id"])
+        failed_exports=export_consolidated_excel(db,prep["id"])
         progress=db.progress(prep["id"])
         log(f"No pending work | {progress}")
         return int(bool(failed_exports) or any(k in progress for k in ("FAILED","NEEDS_REPREPARE")))
@@ -2243,10 +2298,11 @@ def run_extraction(db,workers=None,stop_event=None,on_progress=None):
         code=130
     finally:
         if shutdown_workers(db,rid,on_progress):
-            log("EXPORTING | checking pending Excel files")
-            failed_exports=flush_pending_exports(db,prep["id"])
-            if failed_exports and state=="COMPLETED":
-                state="PARTIAL"
+            log("EXPORTING | consolidating all committed raw XML")
+            failed_exports=export_consolidated_excel(db,prep["id"],rid,on_progress)
+            if failed_exports:
+                if state=="COMPLETED":
+                    state="PARTIAL"
                 code=1
             db.finish_run(rid,state)
         else:
@@ -2312,7 +2368,7 @@ def main():
                 prep=matching_preparation(db.conn,load_all_catalogs())
                 if not prep:
                     raise RuntimeError("No matching preparation")
-                return int(bool(flush_pending_exports(db,prep["id"])))
+                return export_consolidated_excel(db,prep["id"])
             from oic_all_dim_prepare import plan_settings
             settings=plan_settings(args.workers or DEFAULT_WORKERS,args.years_per_request,
                                    args.members_per_request,args.timeout,args.delay)

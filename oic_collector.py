@@ -3868,10 +3868,15 @@ def launch_terminal_ui(args, return_app: bool = False):
             state="STOPPING" if self.stop_event.is_set() or run["stop"] else "RUNNING" if run["barrier"] else "STARTING"
             if run["state"]!="RUNNING":
                 state=run["state"]
+            export=t.get("excel_export",{})
+            if export.get("status")=="EXPORTING":
+                state="EXPORTING"
             self.query_one("#status",Static).update(
                 f"COLLECTION / {state} / Jobs {t['jobs_done']}/{t['jobs']} / "
                 f"Cells {t['covered']:,}/{t['planned']:,} / "
-                f"Running {t['running']} / Failed {t['failed']} / Splits {t['splits']} / Excel {t.get('excel_saved',0)}")
+                f"Running {t['running']} / Failed {t['failed']} / Splits {t['splits']} / "
+                + ("Excel deferred" if export.get("status")=="DEFERRED" else
+                   f"Excel {export.get('status','-')} / {export.get('rows',0):,} rows / {export.get('files',0)} files"))
 
         def all_collection_finished(self,result,error):
             self.set_busy(False)
@@ -3883,6 +3888,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                 t=snapshot["totals"]
                 status=snapshot["run"]["state"] if snapshot["run"]["state"]!="RUNNING" else status
                 detail=f" / Jobs {t['jobs_done']}/{t['jobs']} / Cells {t['covered']:,}/{t['planned']:,} / Failed {t['failed']}"
+                export=t.get("excel_export",{})
+                if export:
+                    detail+=f" / Excel {export.get('status','-')} / {export.get('rows',0):,} rows / {export.get('files',0)} files"
+                    if export.get("error"):
+                        detail+=" / "+export["error"]
             else:
                 detail=""
                 if result==0:

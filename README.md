@@ -202,12 +202,20 @@ python oic_parallel.py --prepare --workers 2 --years-per-request 1 --members-per
 python oic_parallel.py --workers 2
 ```
 
-A validated, committed request produces one Excel workbook in
-`output/oic_all_dim/excel/<preparation>/<category>/<year-type>/<job>/`.
-The workbook has DATA and INFO sheets; source XML and checkpoints remain
-under the existing output directory. Failed exports can be retried without
-new HTTP requests using --export-only. STOP or Ctrl+C requests graceful
-shutdown and flushes unexported committed requests after workers stop.
-Resume uses the same saved plan and skips committed requests.
+During collection, workers save raw XML and SQLite checkpoints only; they
+never open or write Excel. After all workers finish, or after STOP/Ctrl+C
+and graceful worker shutdown, the supervisor rebuilds a single consolidated
+workbook from all committed raw responses in the current preparation:
+
+`output/oic_all_dim/excel/<preparation>/OIC_DATA_001.xlsx`
+
+DATA contains all categories, year types, hierarchies, years, members and
+a common set of measure columns; INFO records aggregate-data metadata.
+Only when DATA exceeds 1,048,575 data rows (plus its header) is the next
+workbook created. Resume retains the same plan and checkpoints; the next
+export replaces the consolidated snapshot rather than appending duplicates.
+`python oic_parallel.py --export-only` rebuilds it offline after workers stop.
+Existing per-request Excel files from older versions are not deleted.
+No new job plan, member refresh or HTTP request is needed for this export.
 The original oic_parallel.py script is available in Git history at 6c17a7e;
 the current CLI delegates to oic_all_dim.py instead of maintaining a second engine.

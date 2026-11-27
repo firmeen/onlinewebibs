@@ -318,8 +318,12 @@ def read_member_page(transport,profile,hierarchy,offset,size,emit=None):
         node=nodes[0]
         props={local(e.tag):e.text for e in node}
         actual=props.get("HIERARCHY_UNIQUE_NAME") or node.get("Hierarchy")
-        if not actual or actual.casefold()!=hierarchy.casefold():
-            raise ValueError("Unexpected member hierarchy: missing or mismatched XMLA identity")
+        if actual and actual.casefold()!=hierarchy.casefold():
+            raise ValueError("Unexpected member hierarchy: mismatched XMLA identity")
+        if not actual:
+            name=props.get("UName") or ""
+            if not (name.casefold()==hierarchy.casefold() or name.casefold().startswith(hierarchy.casefold()+".")):
+                raise ValueError("Unexpected member hierarchy: cannot establish XMLA identity")
         row={"MEMBER_UNIQUE_NAME":props.get("UName"),"MEMBER_CAPTION":props.get("Caption"),
              "LEVEL_UNIQUE_NAME":props.get("LName"),"LEVEL_NUMBER":props.get("LNum"),
              "PARENT_UNIQUE_NAME":props.get("PARENT_UNIQUE_NAME"),"MEMBER_TYPE":props.get("MEMBER_TYPE"),
@@ -356,13 +360,15 @@ def inventory_summary(conn,catalogs,prep=None):
         if row and row[1] in ("READY","PREPARING"):
             prep=row[0]
     cubes={}
+    eligible={}
     for cube,(profile,catalog,fields) in catalogs.items():
         dims,_=classify_fields(fields)
         available=profile["availability"]=="AVAILABLE" and catalog.get("source")!="PROFILE"
-        cubes[cube]={"available":available,"total":len(dims) if available else 0,"hierarchies":{}}
+        eligible[cube]=set(dims) if available else set()
+        cubes[cube]={"available":available,"total":len(eligible[cube]),"hierarchies":{}}
     if conn is not None and prep:
         for cube,hierarchy in conn.execute("SELECT cube,hierarchy FROM oic_dimensions WHERE prep=?",(prep,)):
-            if cube in cubes:
+            if hierarchy in eligible.get(cube,()):
                 cubes[cube]["hierarchies"][hierarchy]=inventory_checkpoint(conn,prep,cube,hierarchy)
     return {"prep":prep,"cubes":cubes}
 
@@ -840,11 +846,16 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
                 meta=hierarchy_meta.get(h.casefold(),{})
                 if count is not None and count>MAX_DISCOVERY_PAGES*MAX_DISCOVERY_PAGE:
                     reported=integer(meta.get("HIERARCHY_CARDINALITY"))
-                    confirmed=exact_member_count(transport,profile,h,emit)
-                    log(f"{cube} | LARGE CARDINALITY | {h} | batch={count:,} | individual={confirmed:,} | metadata={reported} | page budget may require resume")
+                    try:
+                        confirmed=exact_member_count(transport,profile,h,emit)
+                    except (RuntimeError,ValueError) as exc:
+                        raise_if_fatal(exc)
+                        confirmed=None
+                        log(f"{cube} | {h} | individual cardinality failed: {str(exc)[:200]}")
+                    log(f"{cube} | LARGE CARDINALITY | {h} | batch={count:,} | individual={confirmed} | metadata={reported} | page budget may require resume")
                     if confirmed!=count:
                         counts[h]=count=None
-                        log(f"{cube} | {h} | inconsistent cardinality; retaining previous checkpoint")
+                        log(f"{cube} | {h} | unconfirmed cardinality; retaining previous checkpoint")
                 db.save_cardinality(prep,cube,h,meta,levels_by_h.get(h.casefold(),[]),count)
                 emit_inventory(db,prep,cube,h,emit)
             for h,count in counts.items():

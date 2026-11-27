@@ -819,7 +819,8 @@ class OICClient:
             if self.stop():
                 raise CollectionError("USER_STOP")
             started=time.monotonic()
-            self.observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0)
+            self.observe("REQUEST IN FLIGHT",stage_timeout=timeout,bytes=0,
+                         remaining_seconds=max(0,int(jwt_exp(self.token)-time.time())))
             try:
                 with self.session.stream("POST",XMLA_URL,data=payload,
                     headers={"Accept":"text/plain, */*; q=0.01","Content-Type":"text/xml",
@@ -866,6 +867,7 @@ class OICClient:
                                 os.fsync(stream.fileno())
                                 stream.close()
                                 stream=None
+                                self.observe("SAVING RAW XML",bytes=size)
                                 temporary.replace(destination)
                             metrics={"duration":time.monotonic()-overall,"http_status":200,
                                      "response_bytes":size,"token_refresh_seconds":auth_seconds,
@@ -1039,6 +1041,7 @@ def process_request(db,client,r,rid=None,owner=None):
     client.observe("CHECKING RAW RESPONSE")
     replay=replay_raw_response(r)
     if replay:
+        client.observe("REPLAYING SAVED XML")
         path,parsed,sha=replay
         metrics=json.loads(r.get("metrics_json") or "{}")
         metrics["replayed"]=True
@@ -1046,6 +1049,7 @@ def process_request(db,client,r,rid=None,owner=None):
     else:
         path=raw_path(r)
         if rid:
+            client.observe("WAITING FOR HTTP SLOT")
             while not db.acquire_slot(rid,owner):
                 if stopped(db,rid):
                     raise CollectionError("USER_STOP")
@@ -1127,6 +1131,8 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
         children=build_recovery_requests({**r,"scope":scope},db.profile(r["prep"],r["cube"]))
         if not children or not db.activate_recovery_requests(r,message,children):
             db.fail(r,message,"FAILED")
+        else:
+            log(f"{r['cube']} | {r['id'][:12]} | SPLIT X={len(scope['members'])} -> {len(scope['members'])//2} + {len(scope['members'])-len(scope['members'])//2} | Y/M unchanged")
     elif kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","INVALID_XML","DATABASE_BUSY"):
         if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
             client.reconnect()
@@ -1173,14 +1179,372 @@ def heartbeat_loop(owner,done):
         db.close()
 
 
+def elapsed_label(seconds):
+    seconds=max(0,int(seconds))
+    return f"{seconds//3600:02}:{seconds//60%60:02}:{seconds%60:02}"
+
+
+def collection_snapshot(conn,rid):
+    """Small read-only aggregates; replaced parents never count toward coverage."""
+    run=conn.execute("SELECT * FROM oic_runs WHERE id=?",(rid,)).fetchone()
+    if run is None:
+        return None
+    run=dict(run)
+    prep=run["prep"]
+    groups=conn.execute("""SELECT cube,job,status,count(*) AS n,
+        coalesce(sum(potential_cells),0) AS cells,
+        coalesce(sum(attempts),0) AS attempts
+        FROM oic_requests WHERE prep=? GROUP BY cube,job,status""",(prep,)).fetchall()
+    cubes={}
+    jobs={}
+    totals={"planned":0,"covered":0,"pending":0,"running":0,"committed":0,
+            "failed":0,"splits":0,"attempts":0}
+    for row in groups:
+        cube,job,status,n,cells,attempts=row
+        totals["attempts"]+=attempts
+        if status=="REPLACED":
+            totals["splits"]+=n
+        if status in ("STANDBY","REPLACED","PROBE","PROBE_FAILED"):
+            continue
+        c=cubes.setdefault(cube,{"planned":0,"covered":0})
+        j=jobs.setdefault(job,{"planned":0,"covered":0,"failed":False})
+        for item in (c,j,totals):
+            item["planned"]+=cells
+            if status in ("COMMITTED","EMPTY"):
+                item["covered"]+=cells
+        if status in ("COMMITTED","EMPTY"):
+            totals["committed"]+=n
+        elif status in ("FAILED","NEEDS_REPREPARE"):
+            totals["failed"]+=n
+            j["failed"]=True
+        elif status=="RUNNING":
+            totals["running"]+=n
+        else:
+            totals["pending"]+=n
+    totals["jobs"]=conn.execute("SELECT count(*) FROM oic_jobs WHERE prep=?",(prep,)).fetchone()[0]
+    totals["jobs_done"]=sum(j["planned"]>0 and j["covered"]==j["planned"] and not j["failed"] for j in jobs.values())
+    totals["jobs_failed"]=sum(j["failed"] for j in jobs.values())
+    metrics=conn.execute("""SELECT coalesce(sum(CASE WHEN json_valid(metrics_json)
+            THEN json_extract(metrics_json,'$.response_bytes') ELSE 0 END),0),
+            coalesce(sum(CASE WHEN committed_at>=? THEN potential_cells ELSE 0 END),0)
+        FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')""",
+        (run["created_at"],prep)).fetchone()
+    totals["committed_bytes"]=metrics[0] or 0
+    totals["run_cells"]=metrics[1] or 0
+    workers=[dict(row) for row in conn.execute("SELECT * FROM oic_workers WHERE run=? ORDER BY worker",(rid,))]
+    return {"run":run,"totals":totals,"cubes":cubes,"workers":workers}
+
+
+def worker_state_path(rid,worker):
+    return OUTPUT/"runs"/rid/f"worker_{worker:02}.state.json"
+
+
+def read_worker_state(rid,worker):
+    try:
+        state=json.loads(worker_state_path(rid,worker).read_text(encoding="utf-8"))
+        return state if isinstance(state,dict) else {}
+    except (OSError,ValueError):
+        return {}
+
+
+def rich_progress(done,total):
+    from rich.progress_bar import ProgressBar
+    return ProgressBar(total=max(1,total),completed=done,complete_style="green",finished_style="green")
+
+
+class WorkerMonitor:
+    """Display-only state. Publishing failure must never fail an extraction."""
+    def __init__(self,rid,worker,owner,count):
+        self.rid,self.worker,self.owner,self.count=rid,worker,owner,count
+        self.lock=threading.RLock()
+        self.started=time.time()
+        self.last_publish=0
+        self.state={"owner":owner,"worker":worker,"stage":"STARTING","started":self.started,
+                    "stage_at":self.started,"request":{},"stats":{"committed":0,"failed":0,"splits":0,"retries":0,
+                    "cells":0,"bytes":0,"seconds":0.0},"recent":[],"events":[]}
+        self.live=None
+        self.handler=None
+
+    def publish(self,force=False):
+        now=time.monotonic()
+        if not force and now-self.last_publish<0.5:
+            return
+        self.last_publish=now
+        self.state["updated_at"]=time.time()
+        path=worker_state_path(self.rid,self.worker)
+        tmp=path.with_name(f"w{self.worker:02}.{self.owner[:8]}.tmp")
+        try:
+            path.parent.mkdir(parents=True,exist_ok=True)
+            tmp.write_text(json.dumps(self.state,ensure_ascii=False),encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            pass
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def observe(self,stage,**data):
+        with self.lock:
+            changed=stage!=self.state["stage"]
+            if changed:
+                self.state.update(stage=stage,stage_at=time.time())
+            # Do not serialize credentials or arbitrary response content.
+            for k in ("stage_timeout","bytes","http_status","remaining_seconds"):
+                if k in data:
+                    self.state[k]=data[k]
+            if "remaining_seconds" in data:
+                self.state["jwt_expires_at"]=time.time()+data["remaining_seconds"]
+            if stage=="REQUEST IN FLIGHT":
+                self.state.pop("http_status",None)
+                self.state.pop("http_finished",None)
+                self.state["http_started"]=time.time()
+                self.state["http_attempts"]=self.state.get("http_attempts",0)+1
+            if stage in ("SAVING RAW XML","PARSING","COMMITTING") and self.state.get("http_started") and not self.state.get("http_finished"):
+                self.state["http_finished"]=time.time()
+            if self.state["request"] and changed:
+                self.state["request"].setdefault("stages",[]).append(stage)
+            self.publish(force=changed)
+
+    def event(self,message):
+        with self.lock:
+            self.state["events"]=(self.state["events"]+[{"time":time.time(),"text":str(message)[:240]}])[-6:]
+            self.publish()
+
+    def begin(self,r,caption):
+        scope=json.loads(r["scope_json"])
+        with self.lock:
+            self.state["request"]={"id":r["id"],"cube":r["cube"],"hierarchy":scope["hierarchy"],
+                "caption":caption,"x":len(scope["members"]) if scope["hierarchy"] else 0,
+                "y":len(scope["years"]),"m":len(scope["measures"]),"cells":r["potential_cells"],
+                "attempt":r["attempts"],"timeout":r["timeout"],"parent":r["parent"],
+                "started":time.time()}
+            for k in ("http_status","http_started","http_finished","stage_timeout"):
+                self.state.pop(k,None)
+            self.state["bytes"]=0
+            self.observe("LOADING PAYLOAD")
+
+    def finish(self,result,status):
+        with self.lock:
+            q=self.state["request"]
+            stats=self.state["stats"]
+            duration=max(0,time.time()-q.get("started",time.time()))
+            label={"COMMITTED":"SAVED","EMPTY":"EMPTY","REPLACED":"SPLIT","RETRY":"RETRY"}.get(status,status)
+            if status in ("COMMITTED","EMPTY"):
+                stats["committed"]+=1
+                stats["cells"]+=q["cells"]
+                stats["bytes"]+=0 if result.get("replayed") else int(result.get("response_bytes",0) or 0)
+                stats["seconds"]+=duration
+            elif status=="REPLACED":
+                stats["splits"]+=1
+            elif status=="RETRY":
+                stats["retries"]+=1
+            else:
+                stats["failed"]+=1
+            record={**q,"result":label,"duration":duration,"error":result.get("error",""),"time":time.time()}
+            self.state["recent"]=(self.state["recent"]+[record])[-6:]
+            self.event(f"{q['cube']} | {q['caption']} | {label} | {duration:.1f}s"+(f" | {record['error']}" if record["error"] else ""))
+            self.state["request"]={}
+            self.observe(label)
+            self.publish(True)
+
+    def start(self):
+        from rich.console import Console
+        from rich.live import Live
+        console=Console()
+        monitor=self
+        class Activity(logging.Handler):
+            def emit(self,record):
+                if not getattr(record,"auth_event",False) and not record.getMessage().startswith("AUTH |"):
+                    monitor.event(record.getMessage())
+        self.handler=Activity()
+        LOGGER.addHandler(self.handler)
+        self.publish(True)
+        if console.is_terminal:
+            self.live=Live(console=console,get_renderable=self.render,refresh_per_second=2,
+                           screen=True,vertical_overflow="crop")
+            try:
+                self.live.start(refresh=True)
+            except Exception as exc:
+                self.live=None
+                LOGGER.warning("Rich worker display unavailable: %s",type(exc).__name__)
+                console_handler=logging.StreamHandler(sys.stdout)
+                console_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s",datefmt="%H:%M:%S"))
+                LOGGER.addHandler(console_handler)
+
+    def stop(self,final):
+        self.observe(final)
+        self.publish(True)
+        if self.live is not None:
+            try:
+                self.live.stop()
+                self.live.console.print(self.render())
+            except Exception as exc:
+                LOGGER.warning("Rich final display unavailable: %s",type(exc).__name__)
+        if self.handler:
+            LOGGER.removeHandler(self.handler)
+            self.handler.close()
+
+    def render(self):
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        from copy import deepcopy
+        with self.lock:
+            s=deepcopy(self.state)
+        q=s["request"]
+        stats=s["stats"]
+        header=Text(f"OIC COLLECTION  |  WORKER {self.worker:02}/{self.count:02}\n"
+                    f"{s['stage']}  |  Elapsed {elapsed_label(time.time()-self.started)}  |  curl_cffi / XMLA",
+                    style="bold cyan")
+        table=Table.grid(padding=(0,2),expand=True)
+        table.add_column(ratio=1);table.add_column(ratio=1)
+        table.add_row(Text(f"Cube: {q.get('cube','-')}  |  {q.get('caption','Waiting for work')}"),
+                      Text(f"Request: {q.get('id','-')[:12]}  |  Attempt {q.get('attempt','-')}"))
+        table.add_row(Text(q.get("hierarchy") or "Year totals / idle"),Text("DIMENSION SPLIT" if q.get("parent") else "FULL FIRST"))
+        table.add_row(Text(f"X={q.get('x',0):,}  Y={q.get('y',0):,}  M={q.get('m',0):,}"),
+                      Text(f"Expected cells: {q.get('cells',0):,}  |  Timeout {q.get('timeout','-')}s"))
+        stage=Text(f"{s['stage']}  |  Stage elapsed {elapsed_label(time.time()-s['stage_at'])}"
+                   f"  |  HTTP {s.get('http_status','-')}  |  Received {s.get('bytes',0)/1048576:.2f} MiB")
+        http_elapsed=s.get("http_finished",time.time())-s["http_started"] if q and s.get("http_started") else 0
+        budget=q.get("timeout",0)
+        visited=set(q.get("stages",[]))
+        phases=[("Payload",{"LOADING PAYLOAD","CHECKING RAW RESPONSE"}),
+                ("Auth",{"AUTH LOCK WAIT","AUTH REFRESH","REUSING VALID TOKEN","REUSING SHARED TOKEN"}),
+                ("HTTP",{"REQUEST IN FLIGHT","HEADERS RECEIVED"}),
+                ("XML",{"RECEIVING","SAVING RAW XML","REPLAYING SAVED XML"}),
+                ("Parse",{"PARSING"}),("Commit",{"COMMITTING"})]
+        flow=Text()
+        for label,stages in phases:
+            active=s["stage"] in stages
+            flow.append(label+(" *" if active else " + " if visited.intersection(stages) else " - "),
+                        style="bold yellow" if active else "green" if visited.intersection(stages) else "dim")
+            flow.append("  ")
+        jwt=f"JWT remaining {max(0,int(s['jwt_expires_at']-time.time()))}s" if s.get("jwt_expires_at") else "JWT expiry not yet observed"
+        lifecycle=Group(stage,flow,Text(jwt+" | Auth activity shown in stage"),
+                        Text(f"HTTP elapsed {elapsed_label(http_elapsed)} / configured {budget}s (time, not download progress)"),
+                        rich_progress(min(http_elapsed,budget),budget))
+        recent=Table(expand=True)
+        for name in ("Cube / Dimension","Cells","Time","Result"):
+            recent.add_column(name,overflow="fold")
+        for item in reversed(s["recent"]):
+            recent.add_row(Text(f"{item['cube']} / {item['caption']}"),f"{item['cells']:,}",
+                           f"{item['duration']:.1f}s",Text(item["result"],style="green" if item["result"] in ("SAVED","EMPTY") else "yellow"))
+        activity=Group(*(Text(time.strftime("%H:%M:%S",time.localtime(e["time"]))+"  "+e["text"]) for e in s["events"][-4:]))
+        avg=stats["seconds"]/max(1,stats["committed"])
+        return Group(Panel(header,border_style="cyan"),Panel(table,title="01 / CURRENT REQUEST"),
+                     Panel(lifecycle,title="02 / REQUEST LIFECYCLE"),
+                     Panel(Text(f"Saved {stats['committed']}  |  Failed {stats['failed']}  |  Splits {stats['splits']}  |  Retries {stats['retries']}\n"
+                                f"Cells {stats['cells']:,}  |  Received {stats['bytes']/1048576:.2f} MiB  |  Avg saved request {avg:.1f}s"),title="03 / WORKER STATISTICS (this process)"),
+                     Panel(recent,title="04 / RECENT REQUESTS"),Panel(activity,title="05 / ACTIVITY"))
+
+
+class CollectionMonitor:
+    def __init__(self,rid):
+        self.rid=rid
+        self.snapshot=None
+        self.states={}
+        self.error=""
+
+    def render(self):
+        from rich.console import Group
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        if not self.snapshot:
+            return Panel(Text(self.error or "Waiting for run snapshot"),title="OIC LIVE MONITOR")
+        run=self.snapshot["run"]
+        t=self.snapshot["totals"]
+        duration=max(1,time.time()-run["created_at"])
+        pct=100*t["covered"]/max(1,t["planned"])
+        status="STOPPING" if run["state"]=="RUNNING" and run["stop"] else "STARTING" if run["state"]=="RUNNING" and not run["barrier"] else run["state"]
+        header=Text(f"OIC COLLECTION  |  LIVE MONITOR\n{status}  |  Run {self.rid[:12]}  |  Elapsed {elapsed_label(duration)}",
+                    style="bold cyan")
+        global_panel=Group(Text(f"Jobs {t['jobs_done']}/{t['jobs']}  |  Failed jobs {t['jobs_failed']}  |  Splits {t['splits']}"),
+            Text(f"Cells {t['covered']:,}/{t['planned']:,}  |  {pct:.2f}%"),rich_progress(t["covered"],t["planned"]),
+            Text(f"Saved requests {t['committed']}  |  Pending {t['pending']}  |  Running {t['running']}  |  Failed {t['failed']}"),
+            Text(f"Request attempts {t['attempts']} (plan lifetime)  |  {t['run_cells']/duration:,.0f} cells/s (this run)  |  Saved XML {t['committed_bytes']/1048576:.2f} MiB"))
+        workers=Table(expand=True)
+        for col in ("Worker","Cube / Dimension","Stage","Elapsed","Saved","Cells"):
+            workers.add_column(col,overflow="fold")
+        events=[]
+        registered={w["worker"]:w for w in self.snapshot["workers"]}
+        for n in range(1,run["workers"]+1):
+            w=registered.get(n,{})
+            s=self.states.get(n,{})
+            q=s.get("request",{})
+            valid=bool(w and s.get("owner")==w.get("owner"))
+            if not valid and run["state"]=="RUNNING":
+                s={};q={}
+            stage=s.get("stage",w.get("status","STARTING"))
+            if w and w.get("status")!="READY":
+                stage=w["status"]
+            elif w and time.time()-w["heartbeat"]>15:
+                stage="HEARTBEAT STALE"
+            stats=s.get("stats",{})
+            workers.add_row(f"W{n:02}",Text(f"{q.get('cube','-')} / {q.get('caption','-')}"),
+                            Text(stage),elapsed_label(time.time()-q.get("started",time.time())),
+                            str(stats.get("committed",0)),f"{stats.get('cells',0):,}")
+            events.extend((e["time"],n,e["text"]) for e in s.get("events",[]))
+        grid=Table(expand=True)
+        for col in ("Category","FY","UY","AY"):
+            grid.add_column(col)
+        for c in ("AH","FI","MR","MI","MV"):
+            values=[]
+            for y in ("FY","UY","AY"):
+                v=self.snapshot["cubes"].get(c+"/"+y)
+                values.append(f"{100*v['covered']/max(1,v['planned']):.1f}%" if v else "-")
+            grid.add_row(c,*values)
+        activity=Group(*(Text(f"{time.strftime('%H:%M:%S',time.localtime(ts))}  W{n:02}  {msg}") for ts,n,msg in sorted(events,reverse=True)[:5]))
+        jwt_known=[s["jwt_expires_at"] for n,s in self.states.items() if s.get("jwt_expires_at") and n in registered and s.get("owner")==registered[n]["owner"]]
+        auth_note=f"JWT min remaining {max(0,int(min(jwt_known)-time.time()))}s" if jwt_known else "JWT expiry not observed"
+        footer=Text(f"Registered {len(registered)}/{run['workers']}  |  HTTP slots {sum(w['slot'] for w in registered.values())}/{run['allowed']}  |  {auth_note}  |  Read-only SQLite / 1s refresh"
+                    +(f"  |  {self.error}" if self.error else ""))
+        return Group(Panel(header,border_style="cyan"),Panel(global_panel,title="01 / GLOBAL PROGRESS"),
+                     Panel(workers,title="02 / ACTIVE WORKERS"),Panel(grid,title="03 / CUBE COVERAGE"),
+                     Panel(activity,title="04 / RECENT ACTIVITY"),footer)
+
+    def run(self):
+        from rich.console import Console
+        from rich.live import Live
+        console=Console()
+        conn=sqlite3.connect(DB_PATH.resolve().as_uri()+"?mode=ro",uri=True,timeout=2)
+        conn.row_factory=sqlite3.Row
+        try:
+            with Live(console=console,screen=console.is_terminal,auto_refresh=False,vertical_overflow="crop") as live:
+                while True:
+                    try:
+                        with conn:
+                            conn.execute("BEGIN")
+                            self.snapshot=collection_snapshot(conn,self.rid)
+                        if self.snapshot is None:
+                            raise RuntimeError("Run not found")
+                        self.states={n:read_worker_state(self.rid,n) for n in range(1,self.snapshot["run"]["workers"]+1)}
+                        self.error=""
+                    except sqlite3.Error as exc:
+                        self.error=f"Snapshot unavailable: {type(exc).__name__}"
+                    live.update(self.render(),refresh=True)
+                    if self.snapshot and self.snapshot["run"]["state"]!="RUNNING":
+                        break
+                    time.sleep(1)
+            console.print(self.render())
+            return 0
+        finally:
+            conn.close()
+
+
 def run_worker(rid,worker):
-    configure_log(OUTPUT/"runs"/rid/f"worker_{worker:02}.log")
+    from rich.console import Console
+    configure_log(OUTPUT/"runs"/rid/f"worker_{worker:02}.log",console_output=not Console().is_terminal)
     db=OICDatabase(DB_PATH)
     owner=uuid.uuid4().hex
     done=threading.Event()
     client=None
     thread=None
     registered=False
+    monitor=None
     final="FAILED"
     try:
         run=db.run(rid)
@@ -1191,6 +1555,15 @@ def run_worker(rid,worker):
             raise RuntimeError("OIC_COOKIE not configured")
         db.register_worker(rid,worker,owner,os.getpid(),psutil.Process().create_time())
         registered=True
+        monitor=WorkerMonitor(rid,worker,owner,run["workers"])
+        monitor.start()
+        client.observer=monitor.observe
+        captions={}
+        for row in db.conn.execute("SELECT cube,field_json FROM oic_fields WHERE prep=?",(run["prep"],)):
+            field=json.loads(row[1])
+            if field.get("type")=="DIMENSION" and field.get("mdx"):
+                captions.setdefault((row[0],field["mdx"]),field.get("caption") or field["mdx"])
+        monitor.observe("WAITING FOR BARRIER")
         thread=threading.Thread(target=heartbeat_loop,args=(owner,done),daemon=True)
         thread.start()
         log(f"W{worker:02} READY | curl_cffi | waiting for barrier")
@@ -1202,13 +1575,19 @@ def run_worker(rid,worker):
         while not stopped(db,rid):
             r=db.claim_next_request(rid,owner)
             if r is None:
+                monitor.observe("WAITING FOR WORK")
                 if db.all_work_finished(run["prep"]):
                     final="COMPLETED"
                     return 0
                 time.sleep(0.5)
                 continue
+            scope=json.loads(r["scope_json"])
+            monitor.begin(r,captions.get((r["cube"],scope["hierarchy"]),scope["hierarchy"] or "YEAR TOTALS"))
             result=execute_resilient(db,client,r,rid,owner)
+            saved=db.get_request(r["id"])
+            monitor.finish(result,saved["status"] if saved else "UNKNOWN")
             if result.get("error")=="AUTH_COOKIE_EXPIRED":
+                monitor.observe("WAITING FOR CREDENTIAL")
                 log("WAITING FOR CREDENTIAL | update local .env")
                 while not stopped(db,rid):
                     if client.reload_credentials():
@@ -1225,6 +1604,11 @@ def run_worker(rid,worker):
             thread.join(timeout=5)
         if client:
             client.close()
+        if monitor is not None:
+            try:
+                monitor.stop(final)
+            except Exception as exc:
+                LOGGER.warning("Worker monitor cleanup unavailable: %s",type(exc).__name__)
         if registered:
             # Supervisor fences and requeues remaining work if this process dies.
             db.finish_worker(owner,final)
@@ -1235,34 +1619,42 @@ def powershell_quote(value):
     return "'"+str(value).replace("'","''")+"'"
 
 
-def worker_command(rid,worker):
+def worker_command(rid,worker=None):
+    mode=" --monitor" if worker is None else " --worker-id "+str(worker)
     command=("& "+powershell_quote(sys.executable)+" "+powershell_quote(__file__)+
-             " --worker-id "+str(worker)+" --run-id "+powershell_quote(rid)+"; exit $LASTEXITCODE")
+             mode+" --run-id "+powershell_quote(rid)+"; $code=$LASTEXITCODE; Read-Host 'Press Enter to close this tab'; exit $code")
     return base64.b64encode(command.encode("utf-16-le")).decode("ascii")
 
 
-def launch_worker_tabs(rid,workers):
+def launch_worker_tabs(rid,workers,include_monitor=False):
     wt=shutil.which("wt.exe") or shutil.which("wt")
     ps=shutil.which("pwsh.exe") or shutil.which("powershell.exe")
     if os.name!="nt" or not wt or not ps:
         raise RuntimeError("Visible Windows Terminal and PowerShell are required; no hidden fallback")
     args=[wt,"-w","OIC-"+rid[:12]]
-    for index,worker in enumerate(workers):
+    tabs=([None] if include_monitor else [])+list(workers)
+    for index,worker in enumerate(tabs):
         if index:
             args.append(";")
-        args.extend(["new-tab","--startingDirectory",str(PROJECT_ROOT),"--title",f"OIC W{worker:02}",
+        args.extend(["new-tab","--startingDirectory",str(PROJECT_ROOT),"--suppressApplicationTitle","--title",("LIVE MONITOR" if worker is None else f"OIC W{worker:02}"),
                      ps,"-NoLogo","-NoProfile","-EncodedCommand",worker_command(rid,worker)])
+    if include_monitor:
+        args.extend([";","focus-tab","--target","0"])
     result=subprocess.run(args,check=False,timeout=30)
     if result.returncode:
         raise RuntimeError(f"Windows Terminal launcher exited {result.returncode}")
 
 
-def wait_workers_ready(db,rid,count,stop_event=None):
+def wait_workers_ready(db,rid,count,stop_event=None,on_progress=None):
     end=time.monotonic()+STARTUP_TIMEOUT
+    next_progress=0
     while time.monotonic()<end:
         if stop_event is not None and stop_event.is_set():
             db.stop(rid)
             return
+        if on_progress is not None and time.monotonic()>=next_progress:
+            notify_collection_progress(db,rid,on_progress)
+            next_progress=time.monotonic()+1
         rows=db.workers(rid)
         if len(rows)==count and all(w["status"]=="READY" and process_alive(w["pid"],w["created"]) for w in rows):
             db.barrier(rid)
@@ -1284,11 +1676,12 @@ def recover_old_runs(db):
         db.finish_run(run["id"],"INTERRUPTED")
 
 
-def supervise_workers(db,rid,count,stop_event=None):
+def supervise_workers(db,rid,count,stop_event=None,on_progress=None):
     run=db.run(rid)
     replacements={i:0 for i in range(1,count+1)}
     launch_deadlines={}
     next_log=0
+    next_progress=0
     while not stopped(db,rid):
         if stop_event is not None and stop_event.is_set():
             db.stop(rid)
@@ -1309,6 +1702,9 @@ def supervise_workers(db,rid,count,stop_event=None):
                 del launch_deadlines[number]
             elif time.monotonic()>deadline:
                 raise RuntimeError(f"W{number:02} replacement failed to start")
+        if on_progress is not None and time.monotonic()>=next_progress:
+            notify_collection_progress(db,rid,on_progress)
+            next_progress=time.monotonic()+1
         if time.monotonic()>=next_log:
             log(f"PROGRESS | coverage={db.coverage(run['prep'])} | {db.progress(run['prep'])}")
             next_log=time.monotonic()+10
@@ -1317,10 +1713,14 @@ def supervise_workers(db,rid,count,stop_event=None):
         time.sleep(0.5)
 
 
-def shutdown_workers(db,rid):
+def shutdown_workers(db,rid,on_progress=None):
     db.stop(rid)
     deadline=time.monotonic()+630
+    next_progress=0
     while time.monotonic()<deadline:
+        if on_progress is not None and time.monotonic()>=next_progress:
+            notify_collection_progress(db,rid,on_progress)
+            next_progress=time.monotonic()+1
         live=[w for w in db.workers(rid) if process_alive(w["pid"],w["created"])]
         if not live:
             break
@@ -1647,7 +2047,15 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
             monitor.stop(status)
 
 
-def run_extraction(db,workers,stop_event=None):
+def notify_collection_progress(db,rid,on_progress):
+    if on_progress is not None:
+        try:
+            on_progress(collection_snapshot(db.conn,rid))
+        except Exception as exc:
+            log(f"Monitor update unavailable: {type(exc).__name__}")
+
+
+def run_extraction(db,workers,stop_event=None,on_progress=None):
     from oic_all_dim_prepare import PLANNER_VERSION,PLAN_POLICY,inventory_fingerprint,load_all_catalogs,matching_preparation
     catalogs=load_all_catalogs()
     prep=matching_preparation(db.conn,catalogs)
@@ -1663,13 +2071,14 @@ def run_extraction(db,workers,stop_event=None):
         log(f"No pending work | {progress}")
         return int(any(k in progress for k in ("FAILED","NEEDS_REPREPARE")))
     rid=db.start_run(prep["id"],workers,min(workers,prep["concurrency"]),os.getpid(),psutil.Process().create_time())
-    configure_log(OUTPUT/"runs"/rid/"run.log")
+    configure_log(OUTPUT/"runs"/rid/"run.log",console_output=on_progress is None)
     code=0
     state="FAILED"
     try:
-        launch_worker_tabs(rid,list(range(1,workers+1)))
-        wait_workers_ready(db,rid,workers,stop_event)
-        supervise_workers(db,rid,workers,stop_event)
+        notify_collection_progress(db,rid,on_progress)
+        launch_worker_tabs(rid,list(range(1,workers+1)),include_monitor=True)
+        wait_workers_ready(db,rid,workers,stop_event,on_progress)
+        supervise_workers(db,rid,workers,stop_event,on_progress)
         progress=db.progress(prep["id"])
         if stopped(db,rid):
             state="STOPPED"
@@ -1682,10 +2091,11 @@ def run_extraction(db,workers,stop_event=None):
         state="STOPPED"
         code=130
     finally:
-        if shutdown_workers(db,rid):
+        if shutdown_workers(db,rid,on_progress):
             db.finish_run(rid,state)
         else:
             log("Workers still stopping; resume only after their processes exit")
+        notify_collection_progress(db,rid,on_progress)
         log(f"RUN {state} | {db.progress(prep['id'])}")
     return code
 
@@ -1698,6 +2108,7 @@ def build_parser():
     group.add_argument("--job-plan",action="store_true")
     group.add_argument("--status",action="store_true")
     parser.add_argument("--workers",type=int,default=DEFAULT_WORKERS)
+    group.add_argument("--monitor",action="store_true",help=argparse.SUPPRESS)
     parser.add_argument("--worker-id",type=int,help=argparse.SUPPRESS)
     parser.add_argument("--run-id",help=argparse.SUPPRESS)
     return parser
@@ -1708,6 +2119,10 @@ def main():
     configure_log()
     if not 1<=args.workers<=16:
         raise RuntimeError("Worker count must be between 1 and 16")
+    if args.monitor:
+        if not args.run_id or args.worker_id is not None:
+            raise RuntimeError("Monitor requires --run-id")
+        return CollectionMonitor(args.run_id).run()
     if args.worker_id is not None or args.run_id is not None:
         if args.worker_id is None or not args.run_id or args.prepare or args.status or args.refresh_members or args.job_plan:
             raise RuntimeError("Invalid internal worker invocation")

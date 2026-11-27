@@ -386,7 +386,7 @@ def reuse_unchanged_inventories(db,prep,cube,profile,dimensions):
         ORDER BY p.created_at DESC""",(prep,cube)).fetchall()
     for old,raw in rows:
         old_profile=json.loads(raw)
-        if any(old_profile.get(k)!=profile.get(k) for k in ("catalog","cube")):
+        if any(old_profile.get(k)!=profile.get(k) for k in ("catalog","cube")) or db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND cube=? AND error LIKE 'SOURCE_VERSION_CHANGED%' LIMIT 1",(old,cube)).fetchone():
             continue
         old_fields=[json.loads(r[0]) for r in db.conn.execute("SELECT field_json FROM oic_fields WHERE prep=? AND cube=?",(old,cube))]
         if not old_fields or any(f.get("source")!="GETSTRUCTURE" for f in old_fields):
@@ -804,13 +804,22 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
         prep=current["id"]
         log("Source update marker changed; preparing a new snapshot")
     elif current["status"]=="READY" and old_policy==PLAN_POLICY:
+        # Refresh field labels/evidence without invalidating the executable plan.
+        for cube,(profile,catalog,fields) in catalogs.items():
+            dims,measures=classify_fields(fields)
+            if profile["availability"]=="AVAILABLE":
+                profile["year"]=resolve_year_hierarchy(profile,dims)
+            saved={r[0]:json.loads(r[1]) for r in db.conn.execute("SELECT measure,metadata_json FROM oic_measures WHERE prep=? AND cube=?",(prep,cube))}
+            measures={k:dict(v,live_metadata=(saved.get(k) or {}).get("live_metadata")) for k,v in measures.items()}
+            db.save_catalog(prep,cube,profile,fields,measures)
         emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
         emit_event(emit,"phase",phase="REUSING",detail="Reusing prepared inventory and recovering failed requests")
         if mode!="members":
             reprepare_failed_requests(db,prep,log)
         log("Existing READY inventory reused; failed scopes reprepared when possible")
         summary=json.loads(current["summary_json"])
-        summary.update(requests=db.progress(prep),coverage=db.coverage(prep))
+        summary.update(requests=db.progress(prep),coverage=db.coverage(prep),
+                       catalog_fields=sum(len(fields) for _,_,fields in catalogs.values()))
         db.finalize_preparation(prep,"READY",summary,current["concurrency"])
         (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
         emit_event(emit,"summary",summary=summary)

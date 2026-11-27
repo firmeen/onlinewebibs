@@ -4081,7 +4081,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self,
             mode: str,
         ) -> None:
-            if self.busy:
+            if self.busy or self.catalog_running or self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled:
                 return
 
             codes = self.selected_codes()
@@ -4754,12 +4754,12 @@ def launch_terminal_ui(args, return_app: bool = False):
 
         @work(thread=True, group="prepare-all-dimensions", exclusive=True)
         def prepare_dimensions_worker(self, catalogs, cookie, token) -> None:
-            from oic_all_dim import prepare_from_collector, CollectionError
             client = None
             result = 1
             error = None
             failed = False
             try:
+                from oic_all_dim import prepare_from_collector
                 client = OICClient(cookie=cookie, token=token, stop_event=self.stop_event,
                     on_auth=lambda jwt, cookies: self.call_from_thread(
                         self.collection_auth_updated, jwt, cookies),
@@ -4770,11 +4770,13 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.stop_event)
             except Exception as exc:
                 failed = True
-                error = str(exc) if isinstance(exc, CollectionError) else type(exc).__name__
+                error = str(exc) if type(exc).__name__ == "CollectionError" else type(exc).__name__
             finally:
-                if client is not None:
-                    client.close()
-                self.call_from_thread(self.prepare_finished, result, error, failed)
+                try:
+                    if client is not None:
+                        client.close()
+                finally:
+                    self.call_from_thread(self.prepare_finished, result, error, failed)
 
         def prepare_progress(self, event, data) -> None:
             if event == "log":
@@ -5041,7 +5043,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.info(f"Cannot start batch: {type(exc).__name__}: {exc}", "error")
 
         def resume_selected_query(self) -> None:
-            if self.busy or self.catalog_running:
+            if self.busy or self.catalog_running or self.query_one("#export_verified_catalog", Button).disabled:
                 return
             if self.active_run is not None:
                 self.info("Stop or finish the active batch before RESUME.", "warning")

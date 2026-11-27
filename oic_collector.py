@@ -3294,6 +3294,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             ).value = output
 
             self.active_token = ""
+            self.auth_operation = "IDLE"
 
             self.cookie_state = (
                 "NOT CHECKED"
@@ -3332,7 +3333,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         # ====================================================
 
         def watch_env_file(self) -> None:
-            if self.busy:
+            if self.busy or self.catalog_running or self.auth_check_running:
                 return
 
             current_signature = (
@@ -3489,7 +3490,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             )
 
         def periodic_session_check(self) -> None:
-            if self.busy or self.catalog_running or self.auth_check_running:
+            if self.busy or self.catalog_running or self.auth_check_running or self.active_run is not None:
                 return
 
             if not self.cookie_value():
@@ -3511,7 +3512,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             self.cancel_auth_timer()
 
-            if self.busy or self.catalog_running or self.auth_check_running:
+            if self.busy or self.catalog_running or self.auth_check_running or self.active_run is not None:
                 return
 
             cookie = self.cookie_value()
@@ -3816,7 +3817,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             )
 
         def action_start_collection(self) -> None:
-            if self.busy or self.catalog_running or self.query_one("#export_verified_catalog", Button).disabled:
+            if self.busy or self.catalog_running or self.auth_check_running or self.query_one("#export_verified_catalog", Button).disabled:
                 return
             self.start_selected_query()
 
@@ -4091,7 +4092,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self,
             mode: str,
         ) -> None:
-            if self.busy or self.catalog_running or self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled:
+            if self.busy or self.catalog_running or self.auth_check_running or self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled:
                 return
 
             codes = self.selected_codes()
@@ -4745,7 +4746,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                        if profile["availability"] != "NOT_AVAILABLE" and
                        (profile["availability"] != "AVAILABLE" or not catalog.get("web_scope_ready") or not fields)]
             if len(self.catalog_snapshot) != len(QUERY_PROFILES) * len(CUBE_TYPES) or missing:
-                self.info("Saved catalog incomplete; use REFRESH CATALOGS: " + ", ".join(missing), "warning")
+                self.info("GetStructure catalog missing; use REFRESH CATALOGS: " + ", ".join(missing), "warning")
                 return
             cookie, token = self.cookie_value(), self.token_value()
             try:
@@ -4783,11 +4784,17 @@ def launch_terminal_ui(args, return_app: bool = False):
                 def credentials_changed(jwt, cookies):
                     nonlocal expected
                     if (cookies, jwt) != expected:
-                        with authentication_lock(self.stop_event.is_set):
-                            if not publish_credentials(expected, cookies, jwt):
-                                raise CollectionError("AUTH_ENDPOINT_ERROR",
-                                    "Credentials changed externally; stop and reload .env")
-                            expected = (cookies, jwt)
+                        try:
+                            with authentication_lock(self.stop_event.is_set):
+                                if not publish_credentials(expected, cookies, jwt):
+                                    raise CollectionError("AUTH_ENDPOINT_ERROR",
+                                        "Credentials changed externally; stop and reload .env",
+                                        endpoint="LOCAL_CREDENTIALS")
+                                expected = (cookies, jwt)
+                        except OSError:
+                            raise CollectionError("AUTH_ENDPOINT_ERROR",
+                                "Could not persist renewed credentials",
+                                endpoint="LOCAL_CREDENTIALS") from None
                     self.call_from_thread(self.collection_auth_updated, jwt, cookies, False)
 
                 def prepare_client_log(message, level="info"):
@@ -4801,7 +4808,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.stop_event)
             except Exception as exc:
                 failed = True
-                error = str(exc) if type(exc).__name__ == "CollectionError" else type(exc).__name__
+                error = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
             finally:
                 try:
                     if client is not None:
@@ -4810,7 +4817,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.call_from_thread(self.prepare_finished, result, error, failed)
 
         def prepare_progress(self, event, data) -> None:
-            if event == "auth_status":
+            if event == "auth_credentials":
+                if (data["token"], data["cookie"]) != (self.last_token_value, self.last_cookie_value):
+                    self.collection_auth_updated(data["token"], data["cookie"], False)
+            elif event == "auth_status":
                 state = data["state"]
                 if state != self.auth_operation:
                     self.auth_operation = state

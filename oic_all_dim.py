@@ -37,7 +37,7 @@ from curl_cffi.requests.exceptions import RequestException
 import psutil
 
 from oic_all_dim_db import OICDatabase, digest
-from oic_all_dim_prepare import prepare_all, MD_NS, checked_root, local
+from oic_all_dim_prepare import prepare_all, MD_NS, checked_root, local, build_recovery_requests
 
 OUTPUT = PROJECT_ROOT / "output" / "oic_all_dim"
 DB_PATH = OUTPUT / "oic.db"
@@ -845,7 +845,7 @@ class OICClient:
                         try:
                             if destination:
                                 destination.parent.mkdir(parents=True,exist_ok=True)
-                                temporary=destination.with_name(destination.name+"."+uuid.uuid4().hex+".partial")
+                                temporary=destination.with_name(uuid.uuid4().hex[:16]+".partial")
                                 stream=temporary.open("wb")
                             for chunk in response.iter_content():
                                 if not chunk:
@@ -893,7 +893,7 @@ class OICClient:
             except RequestException as exc:
                 raise classify_network(exc) from None
             except OSError as exc:
-                raise CollectionError("DISK_FULL" if exc.errno==28 else "STORAGE_ERROR",type(exc).__name__) from None
+                raise CollectionError("DISK_FULL" if exc.errno==28 else "STORAGE_ERROR",f"{type(exc).__name__}: {exc}") from None
         raise CollectionError("ACCESS_DENIED","Authentication retry exhausted")
 
     def discover(self,profile,payload,timeout):
@@ -985,7 +985,7 @@ def iter_database_records(parsed,scope,all_members):
 
 
 def raw_path(r):
-    return OUTPUT/"raw"/r["prep"]/r["cube"]/r["id"]/(r["payload_hash"]+"."+r["lease"]+".xml")
+    return OUTPUT/"raw"/r["prep"][:12]/r["id"][:24]/(r["payload_hash"][:16]+"."+r["lease"][:12]+".xml")
 
 
 def replay_raw_response(r):
@@ -996,11 +996,14 @@ def replay_raw_response(r):
     # atomic file write but before registering it in the database.
     folder=raw_path(r).parent
     if folder.is_dir():
-        candidates.extend((p,None) for p in sorted(folder.glob(r["payload_hash"]+".*.xml")))
+        candidates.extend((p,None) for p in sorted(folder.glob(r["payload_hash"][:16]+".*.xml")))
+    legacy=OUTPUT/"raw"/r["prep"]/r["cube"]/r["id"]
+    if legacy.is_dir():
+        candidates.extend((p,None) for p in sorted(legacy.glob(r["payload_hash"]+".*.xml")))
     for path,expected_hash in candidates:
         if not path.resolve().is_relative_to(OUTPUT.resolve()) or not path.is_file() or path.stat().st_size>MAX_RESPONSE_BYTES:
             continue
-        if not path.name.startswith(r["payload_hash"]+"."):
+        if not path.name.startswith((r["payload_hash"]+".",r["payload_hash"][:16]+".")):
             continue
         data=path.read_bytes()
         sha=digest(data)
@@ -1120,11 +1123,10 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
         db.pressure(rid,delay)
         db.fail(r,message,"RETRY" if r["attempts"]<MAX_ATTEMPTS else "FAILED",delay)
     elif kind in ("RESPONSE_TOO_LARGE","SOAP_FAULT","QUERY_FAULT","QUERY_SCOPE_ERROR","RESPONSE_TIMEOUT","INVALID_QUERY"):
-        if kind=="RESPONSE_TIMEOUT" and r["attempts"]<2:
-            db.pressure(rid,10)
-            db.fail(r,message,"RETRY",10)
-        elif not db.activate_recovery_requests(r,message):
-            db.fail(r,message,"NEEDS_REPREPARE")
+        scope=json.loads(r["scope_json"])
+        children=build_recovery_requests({**r,"scope":scope},db.profile(r["prep"],r["cube"]))
+        if not children or not db.activate_recovery_requests(r,message,children):
+            db.fail(r,message,"FAILED")
     elif kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","INVALID_XML","DATABASE_BUSY"):
         if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
             client.reconnect()
@@ -1467,7 +1469,7 @@ def load_member_inventory_summary(catalogs):
         conn.close()
 
 
-def prepare_from_collector(catalogs,collector_client,on_progress,stop_event):
+def prepare_from_collector(catalogs,collector_client,on_progress,stop_event,mode="all"):
     """Use the existing supervisor and DB lifecycle without starting a new UI."""
     with supervisor_lock():
         db=OICDatabase(DB_PATH)
@@ -1475,12 +1477,12 @@ def prepare_from_collector(catalogs,collector_client,on_progress,stop_event):
             db.initialize_schema()
             recover_old_runs(db)
             return run_prepare(db,catalogs=catalogs,collector_client=collector_client,
-                               on_progress=on_progress,stop_event=stop_event)
+                               on_progress=on_progress,stop_event=stop_event,mode=mode)
         finally:
             db.close()
 
 
-def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_event=None):
+def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_event=None,mode="all"):
     monitor=PrepareMonitor(on_progress=on_progress)
     client=None
     benchmark_client=None
@@ -1497,6 +1499,10 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
         monitor.emit(event,**data)
     try:
         monitor.start()
+        if mode=="plan":
+            ready=prepare_all(db,None,None,OUTPUT,log,emit=emit,catalogs=catalogs,mode=mode)
+            status="READY" if ready else "INCOMPLETE"
+            return 0 if ready else 1
         if collector_client is None:
             client=OICClient(periodic=False,stop=check_stop)
             if not client.cookie:
@@ -1616,60 +1622,7 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                     cooldown(profile,max(2**attempt,exc.delay,minimum),str(exc))
             raise RuntimeError("Discovery retry budget exhausted")
 
-        def probe(req,profile,parallel=False):
-            nonlocal benchmark_client
-            ensure_running()
-            # Concurrent preparation probes own their database and CURL
-            # connection. Extraction workers remain separate visible processes.
-            probe_db=OICDatabase(DB_PATH) if parallel else db
-            probe_client=None
-            key=req["id"]
-            try:
-                if parallel:
-                    probe_client=OICClient(stop=check_stop)
-                elif client is not None:
-                    probe_client=client
-                else:
-                    if benchmark_client is None:
-                        benchmark_client=OICClient(stop=check_stop)
-                    probe_client=benchmark_client
-                existing=probe_db.get_request(key)
-                scope=req["scope"]
-                detail=f"{scope['hierarchy'] or 'YEAR ONLY'} | X={len(scope['members'])} Y={len(scope['years'])} M={len(scope['measures'])}"
-                if existing["status"] in ("COMMITTED","EMPTY"):
-                    monitor.emit("activity",message=f"{req['cube']} | Reusing committed probe {key[:12]}")
-                    return {"ok":True,**json.loads(existing["metrics_json"] or "{}")}
-                if existing["status"]=="PROBE_FAILED":
-                    return {"ok":False}
-                monitor.request_started(key,req["cube"],detail,req["timeout"],kind="CONCURRENCY PROBE" if parallel else "SHAPE PROBE")
-                probe_client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
-                claimed=probe_db.claim_probe(key)
-                before_credentials=credential_values() if on_progress is not None else None
-                result=execute_resilient(probe_db,probe_client,claimed,probe=True)
-                if before_credentials is not None:
-                    after_credentials=credential_values()
-                    if after_credentials!=before_credentials:
-                        on_progress("auth_credentials",cookie=after_credentials[0],token=after_credentials[1])
-                if result.get("pressure"):
-                    delay=max(10,result.get("delay",0))
-                    monitor.retry(key,delay)
-                    wait_seconds(delay,check_stop)
-                monitor.request_finished(key,result.get("ok",False),result,error=result.get("error"))
-                if result.get("error") in ("USER_STOP","AUTH_COOKIE_EXPIRED","ACCESS_DENIED","TLS_ERROR","DISK_FULL","SOURCE_VERSION_CHANGED","AUTH_ENDPOINT_ERROR"):
-                    raise CollectionError(result["error"],"Preparation probe stopped")
-                return result
-            except BaseException as exc:
-                monitor.request_finished(key,False,error=getattr(exc,"kind",type(exc).__name__))
-                raise
-            finally:
-                if probe_client is not None:
-                    probe_client.observer=None
-                if parallel:
-                    if probe_client is not None:
-                        probe_client.close()
-                    probe_db.close()
-
-        ready=prepare_all(db,transport,probe,OUTPUT,log,emit=emit,catalogs=catalogs)
+        ready=prepare_all(db,transport,None,OUTPUT,log,emit=emit,catalogs=catalogs,mode=mode)
         status="READY" if ready else "INCOMPLETE"
         return 0 if ready else 1
     except CollectionError as exc:
@@ -1694,10 +1647,11 @@ def run_extraction(db,workers):
     prep=db.latest_preparation()
     if not prep or prep["status"]!="READY":
         raise RuntimeError("Run --prepare successfully before extraction")
-    from oic_all_dim_prepare import PLANNER_VERSION,load_all_catalogs
+    from oic_all_dim_prepare import PLANNER_VERSION,PLAN_POLICY,inventory_fingerprint,load_all_catalogs
     summary=json.loads(prep["summary_json"] or "{}")
     if (summary.get("scope")!="WEB_ONLY" or summary.get("planner_version")!=PLANNER_VERSION
-            or prep["catalog_hash"]!=digest([PLANNER_VERSION,load_all_catalogs()])):
+            or summary.get("plan_policy")!=PLAN_POLICY
+            or prep["catalog_hash"]!=inventory_fingerprint(load_all_catalogs())):
         raise RuntimeError("Saved plan is not the current web-only scope; run --prepare first")
     if db.all_work_finished(prep["id"]):
         progress=db.progress(prep["id"])
@@ -1735,6 +1689,8 @@ def build_parser():
     parser=argparse.ArgumentParser(description=__doc__)
     group=parser.add_mutually_exclusive_group()
     group.add_argument("--prepare",action="store_true")
+    group.add_argument("--refresh-members",action="store_true")
+    group.add_argument("--job-plan",action="store_true")
     group.add_argument("--status",action="store_true")
     parser.add_argument("--workers",type=int,default=DEFAULT_WORKERS)
     parser.add_argument("--worker-id",type=int,help=argparse.SUPPRESS)
@@ -1748,7 +1704,7 @@ def main():
     if not 1<=args.workers<=16:
         raise RuntimeError("Worker count must be between 1 and 16")
     if args.worker_id is not None or args.run_id is not None:
-        if args.worker_id is None or not args.run_id or args.prepare or args.status:
+        if args.worker_id is None or not args.run_id or args.prepare or args.status or args.refresh_members or args.job_plan:
             raise RuntimeError("Invalid internal worker invocation")
         return run_worker(args.run_id,args.worker_id)
     if args.status:
@@ -1770,7 +1726,7 @@ def main():
         try:
             db.initialize_schema()
             recover_old_runs(db)
-            return run_prepare(db) if args.prepare else run_extraction(db,args.workers)
+            return run_prepare(db,mode="members" if args.refresh_members else "plan" if args.job_plan else "all") if (args.prepare or args.refresh_members or args.job_plan) else run_extraction(db,args.workers)
         finally:
             db.close()
 

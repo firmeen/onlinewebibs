@@ -270,6 +270,10 @@ def _catalog_time(data: dict) -> str:
                or data.get("finished_at") or data.get("refreshed_at") or "")
 
 
+def _structure_time(data: dict) -> str:
+    return str(data.get("web_refreshed_at") or data.get("refreshed_at") or "")
+
+
 def _cube_index() -> dict:
     result = {}
     for path in (BUNDLED_CATALOG_DIR / "cube_types.json", CUBE_INDEX):
@@ -686,11 +690,27 @@ def merge_verification_catalog(catalog: dict, report: dict) -> dict:
                 "source": "VERIFICATION_REPORT", "refreshed_at": _catalog_time(report) or None,
                 "report_updated_at": _catalog_time(report),
                 "verification_report_counts": counts, "errors": []}
-    return _merge_catalog_fields(catalog, incoming, report=True)
+    # A report enriches the current structure, never replaces its membership.
+    if catalog.get("web_fields") or any(f.get("source")=="GETSTRUCTURE" for f in catalog.get("fields",[])):
+        verified={_field_identity(code,kind,f):f for f in fields}
+        merged=[]
+        for raw in catalog["fields"]:
+            item=dict(raw)
+            evidence=verified.get(_field_identity(code,kind,item))
+            if (evidence and evidence.get("status")=="VERIFIED"
+                    and item.get("status") in ("MAPPED","VERIFIED")
+                    and item.get("mdx")==evidence.get("mdx")):
+                for name in ("status","mapping_status","reported_status","verified_at","verification_method","mapping_reason"):
+                    if name in evidence:
+                        item[name]=evidence[name]
+            merged.append(item)
+        return dict(catalog,fields=merged,report_updated_at=_catalog_time(report),
+                    verification_report_counts={k:sum(f.get("status")==k for f in merged) for k in counts})
+    return _merge_catalog_fields(catalog,incoming,report=True)
 
 
 def catalog_verification_summary(catalog: dict) -> dict:
-    counts = catalog.get("verification_report_counts")
+    counts = None
     if not isinstance(counts, dict):
         counts = {status: 0 for status in ("VERIFIED", "MAPPED", "UNVERIFIED", "UNSUPPORTED")}
         for f in catalog["fields"]:
@@ -714,11 +734,10 @@ def load_catalog(code: str, cube_type: str = "FY") -> dict:
     if local and not _catalog_matches(local, code, cube_type):
         local = None
     catalog = dict(bundled, source="BUNDLED_CATALOG") if bundled else (local or seeded_catalog(code, cube_type))
-    if local and (not bundled or _catalog_time(local) >= _catalog_time(bundled)):
+    if local and (not bundled or _structure_time(local) >= _structure_time(bundled)):
         catalog = dict(_merge_catalog_fields(catalog, local), source="CACHE")
     report = load_verification_report(code, cube_type)
-    if report and (not catalog.get("verification_report_counts")
-                   or _catalog_time(report) > str(catalog.get("report_updated_at") or "")):
+    if report:
         catalog = merge_verification_catalog(catalog, report)
     return catalog
 
@@ -778,7 +797,7 @@ def load_web_catalog(code: str, cube_type: str = "FY") -> dict:
         seen.add(key)
         field = dict(raw)
         verified = mapped.get(key)
-        if verified:
+        if verified and verified.get("mdx")==field.get("mdx"):
             # Retain the website identity, label, folder and calculation details.
             for name in ("mdx", "status", "mapping_status", "reported_status",
                          "mapping_reason", "verified_at", "verification_method"):
@@ -812,13 +831,15 @@ def _replace_catalog_file(temporary: Path, destination: Path) -> None:
 
 def export_verified_catalogs() -> dict:
     # All reports must be present before generating the distributable catalog.
-    prepared, index = {}, {}
+    prepared, index = {}, _read_catalog_json(BUNDLED_CATALOG_DIR / "cube_types.json") or {}
     for code in PROFILES:
         for kind in CUBE_TYPES:
             report = load_verification_report(code, kind)
             if report is None:
-                raise ValueError(f"Missing valid AVAILABLE report: {code}/{kind}")
-            catalog = merge_verification_catalog(load_catalog(code, kind), report)
+                continue
+            catalog = load_web_catalog(code, kind)
+            if not catalog.get("web_scope_ready"):
+                continue
             catalog["source"] = "BUNDLED_CATALOG"
             prepared[cache_path(code, kind).name] = catalog
             index.setdefault(code, {})[kind] = {
@@ -2110,6 +2131,10 @@ def discover_fields(
             profile=profile,
         )
 
+        if xmla_errors or not xmla_fields:
+            retry_fields, retry_errors = discover_xmla_metadata(session,code,token,referer,timeout=timeout,profile=profile)
+            if not retry_errors and retry_fields:
+                xmla_fields,xmla_errors=retry_fields,retry_errors
         errors.extend(xmla_errors)
 
     # NORMALIZE CATALOG
@@ -2122,8 +2147,9 @@ def discover_fields(
         profile=profile,
     )
 
+    # Preserve a valid fresh GetStructure scope even if mapping discovery is partial.
     if xmla_errors or not xmla_fields:
-        raise ValueError(f"{code}/{cube_type}: incomplete XMLA metadata; saved catalog kept")
+        errors.append(f"{code}/{cube_type}: incomplete XMLA metadata; unresolved fields retained")
     catalog["errors"] = errors
     catalog["source"] = "LIVE"
     catalog["web_fields"] = [dict(f) for f in catalog["fields"]]
@@ -2216,6 +2242,7 @@ def verify_field(code: str, cube_type: str, field_id_value: str,
     selected["mapping_status"] = "VERIFIED"
     selected["mapping_reason"] = "XMLA Execute returned valid dataset"
     selected["verified_at"] = datetime.now(timezone.utc).isoformat()
+    selected["verification_method"] = "XMLA_EXECUTE"
     save_catalog(catalog)
     return selected
 

@@ -6,7 +6,7 @@ OIC XMLA COLLECTOR
 Professional Terminal UI | Textual + Rich | Excel Only
 
 INSTALL:
-    python -m pip install -U requests textual rich
+    python -m pip install -U curl_cffi textual rich
 
 RUN TERMINAL UI:
     python oic_collector.py
@@ -85,7 +85,8 @@ from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
-import requests
+from curl_cffi import requests
+from curl_cffi.requests.exceptions import RequestException
 
 
 # ============================================================
@@ -784,7 +785,7 @@ class OICClient:
 
         values = {}
 
-        for cookie in self.session.cookies:
+        for cookie in self.session.cookies.jar:
             domain = cookie.domain.lstrip(".")
 
             if domain == hostname:
@@ -857,7 +858,7 @@ class OICClient:
                 allow_redirects=False,
             )
 
-        except requests.RequestException as exc:
+        except RequestException as exc:
             raise OICAuthenticationError(
                 "GenToken network error: "
                 f"{type(exc).__name__}: {exc}"
@@ -1006,7 +1007,7 @@ class OICClient:
                     allow_redirects=False,
                 )
 
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 if attempt >= self.retries:
                     raise RuntimeError(
                         f"{code}: Network error: {exc}"
@@ -2337,7 +2338,7 @@ def launch_terminal_ui(args, return_app: bool = False):
     except ImportError as exc:
         raise RuntimeError(
             "Install dependencies: "
-            "python -m pip install -U requests textual rich"
+            "python -m pip install -U curl_cffi textual rich"
         ) from exc
 
     class CredentialInput(Input):
@@ -3562,7 +3563,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             cookie: str,
         ) -> None:
             """
-            A separate requests.Session is used for
+            A separate curl_cffi Session is used for
             each validation.
 
             Results are applied only when the Cookie
@@ -3848,7 +3849,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     try:
                         db.initialize_schema()
                         recover_old_runs(db)
-                        result=run_extraction(db,4,stop_event=self.stop_event,
+                        result=run_extraction(db,stop_event=self.stop_event,
                             on_progress=lambda snapshot: self.call_from_thread(self.all_collection_progress,snapshot))
                     finally:
                         db.close()
@@ -3870,7 +3871,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.query_one("#status",Static).update(
                 f"COLLECTION / {state} / Jobs {t['jobs_done']}/{t['jobs']} / "
                 f"Cells {t['covered']:,}/{t['planned']:,} / "
-                f"Running {t['running']} / Failed {t['failed']} / Splits {t['splits']}")
+                f"Running {t['running']} / Failed {t['failed']} / Splits {t['splits']} / Excel {t.get('excel_saved',0)}")
 
         def all_collection_finished(self,result,error):
             self.set_busy(False)
@@ -3932,9 +3933,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         # ====================================================
 
         def action_open_output(self) -> None:
-            output_dir = resolve_output_path(
-                self.output_value()
-            ) / "Excel"
+            output_dir = BASE_DIR / "output" / "oic_all_dim" / "excel"
 
             try:
                 output_dir.mkdir(
@@ -4939,7 +4938,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 summary=data["summary"]
                 self.prepare_unresolved = summary.get("unresolved_fields", 0)
                 self.info(f"WEB FIELDS UNRESOLVED: {self.prepare_unresolved:,}", "warning" if self.prepare_unresolved else "info")
-                self.info(f"PREPARE SUMMARY | Members {summary.get('discovered_members',0):,} | Jobs {summary.get('jobs',0):,}")
+                self.info(f"PREPARE SUMMARY | Members {summary.get('discovered_members',0):,} | Jobs {summary.get('jobs',0):,} | Requests {sum(v.get('requests',0) for v in summary.get('requests',{}).values()):,} | Cells {summary.get('coverage',{}).get('planned',0):,}")
 
         def prepare_finished(self, result, error, failed=False) -> None:
             self.prepare_running = False

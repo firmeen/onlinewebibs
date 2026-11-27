@@ -3832,7 +3832,9 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.cancel_auth_timer()
             self.stop_event.clear()
             self.set_busy(True)
-            self.query_one("#status",Static).update("COLLECTING / Full-first plan")
+            self.query_one("#status",Static).update("COLLECTING / Starting workers")
+            self.query_one("#progress",ProgressBar).update(total=100,progress=0)
+            self.all_collection_snapshot=None
             self.all_collection_worker()
 
         @work(thread=True,group="all-collection",exclusive=True)
@@ -3846,7 +3848,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                     try:
                         db.initialize_schema()
                         recover_old_runs(db)
-                        result=run_extraction(db,4,stop_event=self.stop_event)
+                        result=run_extraction(db,4,stop_event=self.stop_event,
+                            on_progress=lambda snapshot: self.call_from_thread(self.all_collection_progress,snapshot))
                     finally:
                         db.close()
             except Exception as exc:
@@ -3854,13 +3857,37 @@ def launch_terminal_ui(args, return_app: bool = False):
             finally:
                 self.call_from_thread(self.all_collection_finished,result,error)
 
+        def all_collection_progress(self,snapshot):
+            if not snapshot:
+                return
+            self.all_collection_snapshot=snapshot
+            run=snapshot["run"]
+            t=snapshot["totals"]
+            self.query_one("#progress",ProgressBar).update(total=max(1,t["planned"]),progress=t["covered"])
+            state="STOPPING" if self.stop_event.is_set() or run["stop"] else "RUNNING" if run["barrier"] else "STARTING"
+            if run["state"]!="RUNNING":
+                state=run["state"]
+            self.query_one("#status",Static).update(
+                f"COLLECTION / {state} / Jobs {t['jobs_done']}/{t['jobs']} / "
+                f"Cells {t['covered']:,}/{t['planned']:,} / "
+                f"Running {t['running']} / Failed {t['failed']} / Splits {t['splits']}")
+
         def all_collection_finished(self,result,error):
             self.set_busy(False)
             self.watch_env_file()
             self.reload_member_summary()
             status="STOPPED" if self.stop_event.is_set() else "COMPLETED" if result==0 else "INCOMPLETE"
-            self.query_one("#status",Static).update("COLLECTION "+status)
-            self.info("COLLECTION "+status+(" / "+error if error else ""),
+            snapshot=getattr(self,"all_collection_snapshot",None)
+            if snapshot:
+                t=snapshot["totals"]
+                status=snapshot["run"]["state"] if snapshot["run"]["state"]!="RUNNING" else status
+                detail=f" / Jobs {t['jobs_done']}/{t['jobs']} / Cells {t['covered']:,}/{t['planned']:,} / Failed {t['failed']}"
+            else:
+                detail=""
+                if result==0:
+                    self.query_one("#progress",ProgressBar).update(total=1,progress=1)
+            self.query_one("#status",Static).update("COLLECTION "+status+detail)
+            self.info("COLLECTION "+status+detail+(" / "+error if error else ""),
                       "error" if error else "info")
 
         def action_stop_collection(self) -> None:

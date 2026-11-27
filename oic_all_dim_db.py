@@ -535,11 +535,6 @@ class OICDatabase:
         self.conn.execute("UPDATE oic_runs SET cooldown=max(cooldown,?),allowed=max(1,allowed-1) WHERE id=?",
                           (time.time()+seconds,rid))
 
-    def export_result(self,rid,path=None,error=None):
-        self.conn.execute("""UPDATE oic_requests SET metrics_json=json_set(coalesce(metrics_json,'{}'),
-            '$.excel_path',?,'$.excel_error',?,'$.excel_status',?) WHERE id=? AND status IN ('COMMITTED','EMPTY')""",
-            (str(path) if path else None,error,"SAVED" if path and not error else "FAILED",rid))
-
     def reprepare_request(self, parent, children):
         with self.transaction():
             row=self.get_request(parent["id"])

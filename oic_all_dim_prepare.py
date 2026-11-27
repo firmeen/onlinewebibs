@@ -865,7 +865,12 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
         (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
         emit_event(emit,"summary",summary=summary)
         return not db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE' LIMIT 1",(prep,)).fetchone()
-    # New policy uses a separate preparation when an older plan exists.
+    # Persist the policy before inserting any jobs so interrupted offline
+    # planning can resume its deterministic pages rather than cloning again.
+    if mode!="members":
+        db.finalize_preparation(prep,"PREPARING",
+            {**old_summary,"scope":"WEB_ONLY","planner_version":PLANNER_VERSION,
+             "plan_policy":PLAN_POLICY,"plan_settings":settings})
     db.recover_preparation(prep)
     emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
     errors=[]
@@ -1029,7 +1034,7 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
         emit_event(emit,"summary",summary=summary)
         return True
     # Mark the plan policy before creating requests so an interrupted local plan
-    # can resume without deleting deterministic full-first requests.
+    # can resume without deleting deterministic paginated requests.
     summary["plan_policy"]=PLAN_POLICY
     summary["plan_settings"]=settings
     db.finalize_preparation(prep,"PREPARING",summary)

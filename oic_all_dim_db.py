@@ -169,8 +169,11 @@ class OICDatabase:
 
     def save_catalog(self, prep, cube, profile, fields, measures):
         with self.transaction():
-            self.conn.execute("INSERT OR IGNORE INTO oic_cubes VALUES(?,?,?)",
+            self.conn.execute("""INSERT INTO oic_cubes VALUES(?,?,?)
+                ON CONFLICT(prep,cube) DO UPDATE SET profile_json=excluded.profile_json""",
                               (prep,cube,canonical(profile)))
+            self.conn.execute("DELETE FROM oic_fields WHERE prep=? AND cube=?",(prep,cube))
+            self.conn.execute("DELETE FROM oic_measures WHERE prep=? AND cube=?",(prep,cube))
             self.conn.executemany("INSERT OR REPLACE INTO oic_fields VALUES(?,?,?,?)",
                 [(prep,cube,str(f.get("id") or digest(f)),canonical(f)) for f in fields])
             self.conn.executemany("INSERT OR REPLACE INTO oic_measures VALUES(?,?,?,?)",

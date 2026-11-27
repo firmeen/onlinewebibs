@@ -209,10 +209,18 @@ workbook from all committed raw responses in the current preparation:
 
 `output/oic_all_dim/excel/<preparation>/OIC_DATA_001.xlsx`
 
-DATA contains all categories, year types, hierarchies, years, members and
-a common set of measure columns; INFO records aggregate-data metadata.
-Only when DATA exceeds 1,048,575 data rows (plus its header) is the next
-workbook created. Resume retains the same plan and checkpoints; the next
+Excel contains up to 15 worksheets, one per collected category/year type
+(for example AH ปีบัญชี, MV ปีรับประกัน). Each worksheet has the columns
+ปี, มุมมอง, รายการ, followed only by the measures in that cube's saved
+plan, using original OIC catalog captions and member captions.
+Technical MDX names, request IDs and INFO sheets are not exported.
+Year totals use ภาพรวม / รวมทั้งหมด. Missing member captions use the
+XMLA display caption when available, otherwise ไม่ระบุ; missing field
+captions fail the export rather than displaying technical identifiers.
+Duplicate field captions are disambiguated by catalog folder or a suffix.
+Missing values remain blank and true zero values remain zero.
+Only when a sheet exceeds 1,048,575 data rows (plus its header) is the
+next workbook created. All other collection behavior is unchanged. Resume retains the same plan and checkpoints; the next
 export replaces the consolidated snapshot rather than appending duplicates.
 `python oic_parallel.py --export-only` rebuilds it offline after workers stop.
 Existing per-request Excel files from older versions are not deleted.

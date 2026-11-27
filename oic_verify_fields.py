@@ -2414,6 +2414,47 @@ def persist_report(
     )
 
 
+def verify_saved_catalog(client,code,kind,catalog,stop=lambda:False,progress=None):
+    """Verify only the current website fields; checkpoint without rediscovery."""
+    import oic_query as query
+    report=create_cube_report(code,kind)
+    report.update(status="AVAILABLE",catalog=catalog["catalog"],cube=catalog["cube"],
+                  fields=[dict(f) for f in catalog["fields"] if f.get("source")=="GETSTRUCTURE"])
+    fields=report["fields"]
+    anchor=next((f["mdx"] for f in fields if f["type"]=="MEASURE"
+                 and f.get("mdx") and f["status"] in ("MAPPED","VERIFIED")),None)
+    evidence={}
+    for field in fields:
+        if (field.get("status")=="VERIFIED" and field.get("verified_at")
+                and field.get("verification_method")=="XMLA_EXECUTE"):
+            evidence[(field["type"],field.get("mdx"))]=field
+    try:
+        for index,field in enumerate(fields,1):
+            if stop():
+                raise RuntimeError("Verification stopped")
+            key=(field["type"],field.get("mdx"))
+            if field.get("status") in ("MAPPED","VERIFIED") and field.get("mdx"):
+                if key in evidence:
+                    for name in ("status","verified_at","verification_method","mapping_reason"):
+                        field[name]=evidence[key].get(name)
+                elif field["type"]=="MEASURE" or anchor:
+                    verify_one_field(client,code,report["cube"],field,anchor)
+                    if field["status"]=="VERIFIED":
+                        evidence[key]=field
+                field["mapping_status"]=field["status"]
+            if index%25==0:
+                persist_report(report)
+            if progress:
+                progress(index,len(fields))
+    finally:
+        persist_report(report)
+    report["completed_at"]=utc_now()
+    persist_report(report)
+    # The verification loader merges matching evidence, never old membership.
+    current=query.load_web_catalog(code,kind)
+    return current
+
+
 def restore_verified_fields(
     current: list[dict],
     previous: dict,

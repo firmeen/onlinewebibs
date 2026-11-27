@@ -26,9 +26,13 @@ PROBE_BUDGET = 60
 MAX_DISCOVERY_PAGE = 5000
 MAX_DISCOVERY_PAGES = 10000
 DEFAULT_TIMEOUT = 180
-COLLECTION_TIMEOUT = 600
+COLLECTION_TIMEOUT = 60
+DEFAULT_WORKERS = 4
+YEARS_PER_REQUEST = 1
+MEMBERS_PER_REQUEST = 20
+REQUEST_DELAY = 1.0
 MEMBER_TIMEOUT = 300
-PLAN_POLICY = "FULL_FIRST_MEMBERS"
+PLAN_POLICY = "ROUND_ROBIN_PAGED"
 
 
 def local(tag):
@@ -738,16 +742,42 @@ def build_recovery_requests(req,profile):
     if len(values)<2:
         return []
     middle=len(values)//2
-    return [request_record(req["prep"],req["job"],req["cube"],profile,dict(scope,**{axis:part}),
-                           req["timeout"],"STANDBY",req["id"]) for part in (values[:middle],values[middle:])]
+    return [request_record(req["prep"],req["job"],req["cube"],profile,
+                           dict(scope,members=part,member_offset=scope.get("member_offset",0)+offset),
+                           req["timeout"],"STANDBY",req["id"]) for offset,part in ((0,values[:middle]),(middle,values[middle:]))]
+
+
+def plan_settings(workers=DEFAULT_WORKERS,years=YEARS_PER_REQUEST,members=MEMBERS_PER_REQUEST,
+                  timeout=COLLECTION_TIMEOUT,delay=REQUEST_DELAY):
+    if not 1<=workers<=16 or min(years,members,timeout)<1 or not math.isfinite(delay) or delay<0:
+        raise ValueError("Invalid worker, page size, timeout or delay")
+    return {"workers":workers,"years_per_request":years,"members_per_request":members,
+            "timeout":timeout,"delay":delay}
 
 
 def generate_request_plan(db,prep,job,cube,profile,scope,adaptive=None,emit=None):
-    # One primary request per independent dimension; split only on failure.
-    req=request_record(prep,job,cube,profile,scope,COLLECTION_TIMEOUT)
-    db.insert_requests([req])
-    emit_event(emit,"plan_batch",primary=1,recovery=0)
-    return 1
+    ysize=scope["years_per_request"]
+    xsize=scope["members_per_request"]
+    years=scope["years"]
+    members=scope["members"]
+    total=math.ceil(len(years)/ysize)*math.ceil(len(members)/xsize)
+    batch=[]
+    index=0
+    for y in range(0,len(years),ysize):
+        for x in range(0,len(members),xsize):
+            index+=1
+            page=dict(scope,years=years[y:y+ysize],members=members[x:x+xsize],
+                      year_offset=y,member_offset=x,request_index=index,request_total=total,
+                      total_years=len(years),total_members=len(members))
+            batch.append(request_record(prep,job,cube,profile,page,scope["timeout"]))
+            if len(batch)>=128:
+                db.insert_requests(batch)
+                emit_event(emit,"plan_batch",primary=len(batch),recovery=0)
+                batch=[]
+    if batch:
+        db.insert_requests(batch)
+        emit_event(emit,"plan_batch",primary=len(batch),recovery=0)
+    return index
 
 
 def reset_legacy_plan(db,prep):
@@ -763,7 +793,8 @@ def reset_legacy_plan(db,prep):
         db.conn.execute("UPDATE oic_preparations SET status='PREPARING',summary_json='{}' WHERE id=?",(prep,))
 
 
-def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"):
+def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all",settings=None):
+    settings=plan_settings() if settings is None else plan_settings(settings["workers"],settings["years_per_request"],settings["members_per_request"],settings["timeout"],settings["delay"])
     if mode not in ("all","members","plan"):
         raise ValueError("Invalid preparation mode")
     if catalogs is None:
@@ -792,17 +823,27 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
     elif current["catalog_hash"]!=fingerprint:
         db.conn.execute("UPDATE oic_preparations SET catalog_hash=? WHERE id=?",(fingerprint,current["id"]))
     prep=current["id"]
-    old_policy=json.loads(current["summary_json"] or "{}").get("plan_policy")
+    old_summary=json.loads(current["summary_json"] or "{}")
+    old_policy=old_summary.get("plan_policy")
     if mode=="plan":
         snapshot=inventory_summary(db.conn,catalogs,prep)
         if any(c["available"] and (len(c["hierarchies"])!=c["total"] or any(h["status"] not in ("COMPLETE","EMPTY") for h in c["hierarchies"].values())) for c in snapshot["cubes"].values()):
             raise RuntimeError("Member inventory incomplete; Refresh Members first")
     version_changed=db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND error LIKE 'SOURCE_VERSION_CHANGED%' LIMIT 1",(prep,)).fetchone()
     if version_changed:
+        if mode=="plan":
+            raise RuntimeError("Source version changed; Refresh Members before Job Plan")
         db.conn.execute("UPDATE oic_preparations SET status='STALE' WHERE id=?",(prep,))
         current=db.preparation(fingerprint)
         prep=current["id"]
         log("Source update marker changed; preparing a new snapshot")
+    elif mode!="members" and (old_policy!=PLAN_POLICY or old_summary.get("plan_settings")!=settings) and db.conn.execute("SELECT 1 FROM oic_jobs WHERE prep=? LIMIT 1",(prep,)).fetchone():
+        # Preserve old plans, observations and raw XML; clone only the inventory.
+        current=db.clone_inventory(prep,fingerprint)
+        prep=current["id"]
+        old_policy=None
+        old_summary={}
+        log("Existing inventory copied locally for new paginated plan")
     elif current["status"]=="READY" and old_policy==PLAN_POLICY:
         # Refresh field labels/evidence without invalidating the executable plan.
         for cube,(profile,catalog,fields) in catalogs.items():
@@ -815,7 +856,7 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
         emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
         emit_event(emit,"phase",phase="REUSING",detail="Reusing prepared inventory and recovering failed requests")
         if mode!="members":
-            reprepare_failed_requests(db,prep,log)
+            db.retry_failed(prep)
         log("Existing READY inventory reused; failed scopes reprepared when possible")
         summary=json.loads(current["summary_json"])
         summary.update(requests=db.progress(prep),coverage=db.coverage(prep),
@@ -824,8 +865,7 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
         (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
         emit_event(emit,"summary",summary=summary)
         return not db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE' LIMIT 1",(prep,)).fetchone()
-    if old_policy!=PLAN_POLICY and mode!="members":
-        reset_legacy_plan(db,prep)
+    # New policy uses a separate preparation when an older plan exists.
     db.recover_preparation(prep)
     emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
     errors=[]
@@ -961,8 +1001,10 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
             if not members:
                 continue
             if mode!="members":
+                index=len(jobs)+1
                 scope={"hierarchy":h,"year_hierarchy":profile["year"],"members":members,
-                       "years":years,"measures":sorted(measures),"measure_group":"ALL","plan_policy":PLAN_POLICY}
+                       "years":years,"measures":sorted(measures),"measure_group":"ALL","plan_policy":PLAN_POLICY,
+                       "job_index":index,"worker_id":(index-1)%settings["workers"]+1,**settings}
                 job=digest([prep,cube,h,scope])
                 db.save_job(prep,job,cube,h,scope)
                 jobs.append((job,cube,profile,scope))
@@ -977,6 +1019,8 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
         log(f"PREPARE INCOMPLETE | {len(errors)} errors; rerun --prepare")
         return False
     if mode=="members":
+        if old_policy==PLAN_POLICY and old_summary.get("plan_settings"):
+            summary.update(plan_policy=PLAN_POLICY,plan_settings=old_summary["plan_settings"])
         summary["inventory_ready"]=True
         if old_policy==PLAN_POLICY:
             summary["plan_policy"]=PLAN_POLICY
@@ -987,17 +1031,18 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None,mode="all"
     # Mark the plan policy before creating requests so an interrupted local plan
     # can resume without deleting deterministic full-first requests.
     summary["plan_policy"]=PLAN_POLICY
+    summary["plan_settings"]=settings
     db.finalize_preparation(prep,"PREPARING",summary)
     for index,(job,cube,profile,scope) in enumerate(jobs,1):
         emit_event(emit,"plan_job",cube=cube,index=index,total=len(jobs),detail=scope["hierarchy"] or "YEAR ONLY")
         generate_request_plan(db,prep,job,cube,profile,scope,emit=emit)
         emit_event(emit,"plan_done")
     summary.update(plan_policy=PLAN_POLICY,inventory_ready=True,requests=db.progress(prep),coverage=db.coverage(prep),
-                   recommended_concurrency=4,estimated_extraction_seconds=None)
+                   recommended_concurrency=settings["workers"],estimated_extraction_seconds=None,plan_settings=settings)
     if summary["coverage"]["planned"]!=sum(potential(scope) for _,_,_,scope in jobs):
         raise RuntimeError("Prepared request coverage mismatch")
-    db.finalize_preparation(prep,"READY",summary,concurrency=4)
+    db.finalize_preparation(prep,"READY",summary,concurrency=settings["workers"])
     (output/"preparation_summary.json").write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding="utf-8")
     emit_event(emit,"summary",summary=summary)
-    log(f"PREPARE READY | {len(jobs)} full-first jobs")
+    log(f"PREPARE READY | {len(jobs)} round-robin paginated jobs")
     return True

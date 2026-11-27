@@ -3394,7 +3394,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.last_env_signature=signature
                     self.dirty=False
                     self.cookie_state="NOT CHECKED" if cookie else "MISSING"
-                if status.get("state") in ("REFRESHING","RELOGIN_RUNNING","WAITING_AUTH","ERROR"):
+                if status.get("state") in ("REFRESHING","RELOGIN_RUNNING","WAITING_AUTH","ERROR","STOPPED"):
                     self.auth_operation=status["state"]
                     self.cookie_state=status.get("cookie_status","NOT CHECKED")
                 elif status.get("cookie_status")=="VALID" and status.get("expires")==jwt_exp(self.token_value()):
@@ -3412,10 +3412,12 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.refresh_auth_cards()
 
         def watch_env_file(self) -> None:
-            if self.busy or self.catalog_running or self.auth_check_running or self.active_run is not None:
+            if self.auth_check_running:
+                return
+            if self.busy or self.catalog_running or self.active_run is not None:
                 self.sync_runtime_credentials()
                 return
-            if not self.dirty:
+            if not self.dirty and env_signature()==self.last_env_signature:
                 self.sync_runtime_credentials()
 
             current_signature = (
@@ -3652,10 +3654,13 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             client = None
             try:
-                from oic_all_dim import authentication_lock,credential_values,auth_event
+                from oic_all_dim import authentication_lock,credential_values,auth_event,publish_credentials,jwt_exp,auth_status
                 with authentication_lock():
+                    expected=credential_values()
                     client = OICClient(cookie=cookie,token="",timeout=45,retries=2)
                     token = client.request_token("AH")
+                    if cookie==expected[0] and publish_credentials(expected,client.cookie_header(),token):
+                        auth_event("IDLE",cookie_status="VALID",expires=jwt_exp(token),last_check=time.time(),last_refresh=time.time(),refresh_count=auth_status().get("refresh_count",0)+1)
 
                 updated_cookie = (
                     client.cookie_header()
@@ -5179,7 +5184,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                                         current=load_web_catalog(code,kind)
                                         if not current.get("web_scope_ready"):
                                             if cube_status(code,kind)["status"]=="NOT_AVAILABLE":
-                                                continue
+                                                break
                                             raise ValueError("Missing web catalog; refresh first")
                                         current=verify_saved_catalog(client,code,kind,current,
                                             stop=self.stop_event.is_set,
@@ -5198,7 +5203,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                                     error=safe_error(exc,(cookie,token,client.cookie,client.token))
                                     if cube_status(code,kind)["status"]=="NOT_AVAILABLE" and not any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
                                         self.call_from_thread(self.info,key+" | NOT AVAILABLE","warning")
-                                        continue
+                                        break
                                     errors.append(key+": "+error[:180])
                                     self.call_from_thread(self.catalog_discovery_event,code,kind,None,error[:180])
                                     if any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):

@@ -1387,6 +1387,7 @@ class OICClient:
             )
 
         self.token = token
+        self.cookie="; ".join(f"{c.name}={c.value}" for c in self.session.cookies)
 
         log(
             f"{code}: JWT refreshed successfully",
@@ -2439,6 +2440,9 @@ def verify_saved_catalog(client,code,kind,catalog,stop=lambda:False,progress=Non
                         field[name]=evidence[key].get(name)
                 elif field["type"]=="MEASURE" or anchor:
                     verify_one_field(client,code,report["cube"],field,anchor)
+                    error=str(field.get("error") or "").upper()
+                    if any(marker in error for marker in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403","AUTHENTICATION REJECTED")):
+                        raise RuntimeError("Session expired or authentication rejected during verification")
                     if field["status"]=="VERIFIED":
                         evidence[key]=field
                 field["mapping_status"]=field["status"]

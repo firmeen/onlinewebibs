@@ -2686,6 +2686,9 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             self.auth_sequence = 0
             self.auth_timer = None
+            self.auth_check_running = False
+            self.auth_operation = "IDLE"
+            self.prepare_unresolved = 0
 
             self.last_cookie_value = ""
             self.last_token_value = ""
@@ -3136,13 +3139,14 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.token_value()
             )
 
-            jwt_status = details["status"]
+            jwt_status = "RENEWING" if self.auth_operation == "REFRESHING" else details["status"]
 
             jwt_color = {
                 "VALID": "#79c7aa",
                 "EXPIRED": "#ed9898",
                 "INVALID": "#ed9898",
                 "MISSING": "#dfbf86",
+                "RENEWING": "#dfbf86",
             }.get(
                 jwt_status,
                 "#aebdc6",
@@ -3170,7 +3174,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "\n"
                 f"Time Left    {details['remaining']}"
                 "\n"
-                "Source       .env / editor"
+                f"Operation    {self.auth_operation}"
             )
 
             self.query_one(
@@ -3216,7 +3220,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 + "\n"
                 f"Last Check   {self.cookie_checked_at}"
                 "\n"
-                "Validation   GenToken endpoint"
+                f"Validation   {self.auth_operation}"
                 "\n"
                 "Expiry       Server controlled"
             )
@@ -3290,6 +3294,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             ).value = output
 
             self.active_token = ""
+            self.auth_operation = "IDLE"
 
             self.cookie_state = (
                 "NOT CHECKED"
@@ -3328,7 +3333,7 @@ def launch_terminal_ui(args, return_app: bool = False):
         # ====================================================
 
         def watch_env_file(self) -> None:
-            if self.busy:
+            if self.busy or self.catalog_running or self.auth_check_running:
                 return
 
             current_signature = (
@@ -3485,7 +3490,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             )
 
         def periodic_session_check(self) -> None:
-            if self.busy or self.catalog_running:
+            if self.busy or self.catalog_running or self.auth_check_running or self.active_run is not None:
                 return
 
             if not self.cookie_value():
@@ -3507,7 +3512,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             self.cancel_auth_timer()
 
-            if self.busy or self.catalog_running:
+            if self.busy or self.catalog_running or self.auth_check_running or self.active_run is not None:
                 return
 
             cookie = self.cookie_value()
@@ -3525,14 +3530,12 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             sequence = self.auth_sequence
 
+            self.auth_check_running = True
+            self.auth_operation = "CHECKING"
             self.cookie_state = "CHECKING"
             self.cookie_message = "Contacting GenToken..."
 
             self.refresh_auth_cards()
-
-            self.info(
-                "Checking OIC Session via GenToken..."
-            )
 
             self.validate_session_worker(
                 sequence,
@@ -3605,7 +3608,12 @@ def launch_terminal_ui(args, return_app: bool = False):
             # Discard stale results if the user edited
             # the Cookie while the request was running.
 
+            self.auth_check_running = False
+            self.auth_operation = "IDLE"
             if sequence != self.auth_sequence:
+                if not self.busy and self.cookie_value():
+                    self.schedule_auth_check(delay=0.3)
+                self.refresh_auth_cards()
                 return
 
             if self.busy:
@@ -3641,6 +3649,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 else:
                     self.cookie_state = "ERROR"
 
+                self.auth_operation = "ERROR"
                 message = str(error)
 
                 self.cookie_message = message[:80]
@@ -3667,6 +3676,7 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             # Session is accepted by GenToken.
 
+            self.auth_operation = "VALID"
             self.cookie_state = "VALID"
             self.cookie_message = "GenToken successful"
 
@@ -3708,11 +3718,8 @@ def launch_terminal_ui(args, return_app: bool = False):
 
                 self.dirty = False
 
-                self.info(
-                    "Session VALID / "
-                    "fresh JWT and Cookie saved to .env",
-                    "success",
-                )
+                self.cookie_message = "GenToken successful / saved to .env"
+                self.refresh_auth_cards()
 
             except OSError as exc:
                 self.info(
@@ -3721,9 +3728,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                     "warning",
                 )
 
-            self.query_one("#status", Static).update(
-                "READY / Session VALID / GenToken successful"
-            )
+            # Authentication status remains in the existing validation cards.
 
         # ====================================================
         # BUTTON EVENTS
@@ -3771,7 +3776,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             elif button_id == "prepare_all_dimensions":
                 self.action_prepare_all_dimensions()
             elif button_id == "refresh_all_catalogs":
-                if self.busy or self.active_run is not None or self.catalog_running:
+                if self.busy or self.active_run is not None or self.catalog_running or self.auth_check_running:
                     return
                 if self.cookie_state != "VALID":
                     self.info("Check Session before refreshing catalogs.", "warning")
@@ -3812,7 +3817,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             )
 
         def action_start_collection(self) -> None:
-            if self.busy or self.catalog_running or self.query_one("#export_verified_catalog", Button).disabled:
+            if self.busy or self.catalog_running or self.auth_check_running or self.query_one("#export_verified_catalog", Button).disabled:
                 return
             self.start_selected_query()
 
@@ -4087,7 +4092,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self,
             mode: str,
         ) -> None:
-            if self.busy or self.catalog_running or self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled:
+            if self.busy or self.catalog_running or self.auth_check_running or self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled:
                 return
 
             codes = self.selected_codes()
@@ -4190,17 +4195,14 @@ def launch_terminal_ui(args, return_app: bool = False):
             self,
             token: str,
             cookie: str,
+            persist: bool = True,
         ) -> None:
+            renewed = token != self.last_token_value
+            self.auth_operation = "VALID"
             self.cookie_state = "VALID"
-            self.cookie_message = (
-                "GenToken successful"
-            )
-
-            self.cookie_checked_at = (
-                datetime.now().strftime(
-                    "%H:%M:%S"
-                )
-            )
+            self.cookie_message = "GenToken successful" if renewed else "Cookie updated by server"
+            if renewed or persist:
+                self.cookie_checked_at = datetime.now().strftime("%H:%M:%S")
 
             self.active_token = token
 
@@ -4219,6 +4221,10 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             self.refresh_auth_cards()
 
+            if not persist:
+                self.last_env_signature = env_signature()
+                self.dirty = False
+                return
             try:
                 update_env({
                     "OIC_BEARER_TOKEN": token,
@@ -4726,6 +4732,9 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
 
         def action_prepare_all_dimensions(self) -> None:
+            if self.auth_check_running:
+                self.info("Session validation in progress; PREPARE not started.", "warning")
+                return
             if (self.busy or self.prepare_running or self.catalog_running or
                     self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled):
                 self.info("Another operation is running.", "warning")
@@ -4735,9 +4744,9 @@ def launch_terminal_ui(args, return_app: bool = False):
                 return
             missing = [key for key, (profile, catalog, fields) in self.catalog_snapshot.items()
                        if profile["availability"] != "NOT_AVAILABLE" and
-                       (profile["availability"] != "AVAILABLE" or catalog.get("source") == "PROFILE" or not fields)]
+                       (profile["availability"] != "AVAILABLE" or not catalog.get("web_scope_ready") or not fields)]
             if len(self.catalog_snapshot) != len(QUERY_PROFILES) * len(CUBE_TYPES) or missing:
-                self.info("Saved catalog incomplete; use REFRESH CATALOGS: " + ", ".join(missing), "warning")
+                self.info("GetStructure catalog missing; use REFRESH CATALOGS: " + ", ".join(missing), "warning")
                 return
             cookie, token = self.cookie_value(), self.token_value()
             try:
@@ -4752,6 +4761,9 @@ def launch_terminal_ui(args, return_app: bool = False):
                 return
             self.cancel_auth_timer()
             self.prepare_running = True
+            self.prepare_unresolved = 0
+            self.auth_operation = "VALID"
+            self.refresh_auth_cards()
             self.stop_event.clear()
             self.set_busy(True)
             self.query_one("#progress", ProgressBar).update(total=1, progress=0)
@@ -4765,18 +4777,38 @@ def launch_terminal_ui(args, return_app: bool = False):
             error = None
             failed = False
             try:
-                from oic_all_dim import prepare_from_collector
+                from oic_all_dim import (prepare_from_collector, authentication_lock,
+                                         credential_values, publish_credentials, CollectionError, log)
+                expected = credential_values()
+
+                def credentials_changed(jwt, cookies):
+                    nonlocal expected
+                    if (cookies, jwt) != expected:
+                        try:
+                            with authentication_lock(self.stop_event.is_set):
+                                if not publish_credentials(expected, cookies, jwt):
+                                    raise CollectionError("AUTH_ENDPOINT_ERROR",
+                                        "Credentials changed externally; stop and reload .env",
+                                        endpoint="LOCAL_CREDENTIALS")
+                                expected = (cookies, jwt)
+                        except OSError:
+                            raise CollectionError("AUTH_ENDPOINT_ERROR",
+                                "Could not persist renewed credentials",
+                                endpoint="LOCAL_CREDENTIALS") from None
+                    self.call_from_thread(self.collection_auth_updated, jwt, cookies, False)
+
+                def prepare_client_log(message, level="info"):
+                    # GenToken details remain available in the file log only.
+                    log("AUTH | " + message, auth=True)
+
                 client = OICClient(cookie=cookie, token=token, stop_event=self.stop_event,
-                    on_auth=lambda jwt, cookies: self.call_from_thread(
-                        self.collection_auth_updated, jwt, cookies),
-                    on_log=lambda message, level="info": self.call_from_thread(
-                        self.info, message, level))
+                    on_auth=credentials_changed, on_log=prepare_client_log)
                 result = prepare_from_collector(catalogs, client,
                     lambda event, **data: self.call_from_thread(self.prepare_progress, event, data),
                     self.stop_event)
             except Exception as exc:
                 failed = True
-                error = str(exc) if type(exc).__name__ == "CollectionError" else type(exc).__name__
+                error = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
             finally:
                 try:
                     if client is not None:
@@ -4785,7 +4817,24 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.call_from_thread(self.prepare_finished, result, error, failed)
 
         def prepare_progress(self, event, data) -> None:
-            if event == "inventory_snapshot":
+            if event == "auth_credentials":
+                if (data["token"], data["cookie"]) != (self.last_token_value, self.last_cookie_value):
+                    self.collection_auth_updated(data["token"], data["cookie"], False)
+            elif event == "auth_status":
+                state = data["state"]
+                if state != self.auth_operation:
+                    self.auth_operation = state
+                    if state in ("REFRESHING", "RETRYING"):
+                        self.cookie_state = "CHECKING"
+                        self.cookie_message = data.get("operation", state)
+                    elif state == "ERROR":
+                        self.cookie_state = "ERROR"
+                        self.cookie_message = data.get("operation", state)
+                    elif state == "VALID":
+                        self.cookie_state = "VALID"
+                        self.cookie_message = "Session active"
+                    self.refresh_auth_cards()
+            elif event == "inventory_snapshot":
                 self.member_inventory = data["snapshot"]
                 self.update_member_summary()
             elif event == "inventory":
@@ -4811,13 +4860,18 @@ def launch_terminal_ui(args, return_app: bool = False):
                     f"PREPARING / {data['cube']} / REQUEST PLAN {data['index']}/{data['total']}")
             elif event == "summary":
                 summary=data["summary"]
+                self.prepare_unresolved = summary.get("unresolved_fields", 0)
+                self.info(f"WEB FIELDS UNRESOLVED: {self.prepare_unresolved:,}", "warning" if self.prepare_unresolved else "info")
                 self.info(f"PREPARE SUMMARY | Members {summary.get('discovered_members',0):,} | Jobs {summary.get('jobs',0):,}")
 
         def prepare_finished(self, result, error, failed=False) -> None:
             self.prepare_running = False
             self.set_busy(False)
             status = "FAILED" if failed else "READY" if result == 0 else "STOPPED" if result == 130 else "INCOMPLETE"
-            self.query_one("#status", Static).update("PREPARE " + status)
+            label = "PREPARE " + status
+            if status == "READY" and self.prepare_unresolved:
+                label += f" / EXECUTABLE WEB FIELDS ONLY / UNRESOLVED {self.prepare_unresolved:,}"
+            self.query_one("#status", Static).update(label)
             self.info("PREPARE " + status + (f" / {error}" if error else ""),
                       "success" if status=="READY" else "error" if failed else "warning")
             if status=="READY":
@@ -4825,10 +4879,16 @@ def launch_terminal_ui(args, return_app: bool = False):
             # Benchmarks may have renewed the shared .env. Adopt the persisted
             # credentials through the existing watcher (no catalog reload).
             self.watch_env_file()
-            if failed and error and error.startswith(("AUTH_COOKIE_EXPIRED", "ACCESS_DENIED", "AUTH_TOKEN_EXPIRED")):
+            self.reload_member_summary()
+            if failed and error and error.startswith(("AUTH_COOKIE_EXPIRED", "ACCESS_DENIED", "AUTH_TOKEN_EXPIRED", "AUTH_ENDPOINT_ERROR")):
+                self.auth_operation = "ERROR"
+                self.cookie_state = "SESSION_EXPIRED" if error.startswith("AUTH_COOKIE_EXPIRED") else "NOT CHECKED"
+                self.cookie_message = "Check Session before retrying"
+            elif self.auth_operation in ("REFRESHING", "RETRYING"):
+                self.auth_operation = "IDLE"
                 self.cookie_state = "NOT CHECKED"
                 self.cookie_message = "Check Session before retrying"
-                self.refresh_auth_cards()
+            self.refresh_auth_cards()
 
         def reload_member_summary(self) -> None:
             try:
@@ -4845,16 +4905,18 @@ def launch_terminal_ui(args, return_app: bool = False):
                 panel.update("MEMBER INVENTORY | SUMMARY UNAVAILABLE\n" + snapshot["error"])
                 return
             total_saved = total_expected = total_dims = total_done = 0
-            counted = partial = failed = ready = available = 0
+            counted = partial = failed = ready = available = unresolved_views = unresolved_measures = 0
             lines = []
             for code in QUERY_PROFILES:
                 values = []
                 for kind in CUBE_TYPES:
                     cube = snapshot["cubes"].get(f"{code}/{kind}", {})
                     if not cube.get("available"):
-                        values.append(f"{kind}: {'N/A' if cube else '-'}")
+                        values.append(f"{kind}: {'N/A' if cube.get('availability') == 'NOT_AVAILABLE' else 'MISSING'}")
                         continue
                     available += 1
+                    unresolved_views += cube.get("unresolved_views", 0)
+                    unresolved_measures += cube.get("unresolved_measures", 0)
                     states = list(cube["hierarchies"].values())
                     saved = sum(v["saved"] for v in states)
                     expected = sum(v["expected"] for v in states if v["expected"] is not None)
@@ -4867,22 +4929,23 @@ def launch_terminal_ui(args, return_app: bool = False):
                     counted += sum(v["expected"] is not None for v in states)
                     partial += sum(v["status"] == "PARTIAL" for v in states)
                     failed += sum(v["status"] == "FAILED" or bool(v.get("error")) for v in states)
-                    ready += bool(n and done == n)
+                    ready += bool(n and done == n and not cube.get("unresolved_views", 0))
                     values.append(f"{kind}: {saved:,} ({done}/{n})")
                 lines.append(f"{code}  " + "  |  ".join(values))
-            title = "MEMBER INVENTORY | DISCOVERY COVERAGE"
+            title = "MEMBER INVENTORY | WEB DIMENSIONS ONLY"
             if not snapshot.get("prep"):
                 title += " / NOT PREPARED"
             panel.update(
                 title + "\n"
                 f"SAVED: {total_saved:,} | EXPECTED (COUNTED): {total_expected:,} | COUNTS: {counted:,}/{total_dims:,}\n"
                 f"HIERARCHIES: {total_done:,}/{total_dims:,} | PARTIAL: {partial:,} | FAILED: {failed:,} | READY CUBES: {ready}/{available}\n"
+                f"UNRESOLVED VIEWS: {unresolved_views:,} | MEASURES: {unresolved_measures:,}\n"
                 + "\n".join(lines))
 
         def update_catalog_summary(self) -> None:
             totals = dict(total=0, verified=0, mapped=0, unverified=0,
                           unsupported=0, selectable=0)
-            available = 0
+            available = views = measures = 0
             lines = []
             for code in QUERY_PROFILES:
                 values = []
@@ -4891,10 +4954,12 @@ def launch_terminal_ui(args, return_app: bool = False):
                     summary = catalog_verification_summary(catalog)
                     status = profile["availability"]
                     self.catalog_statuses[f"{code}/{kind}"] = status
-                    available += status == "AVAILABLE"
-                    if catalog.get("source") == "PROFILE":
-                        values.append(f"{kind}: {status} / NO SAVED CATALOG")
+                    available += status == "AVAILABLE" and bool(catalog.get("web_scope_ready"))
+                    if status == "NOT_AVAILABLE" or not catalog.get("web_scope_ready"):
+                        values.append(f"{kind}: {status} / NO WEB CATALOG")
                         continue
+                    views += catalog.get("view_count", 0)
+                    measures += catalog.get("data_count", 0)
                     for key in totals:
                         totals[key] += summary[key]
                     values.append(f"{kind}: {summary['verified']}/{summary['total']}"
@@ -4902,11 +4967,11 @@ def launch_terminal_ui(args, return_app: bool = False):
                 lines.append(f"{code}  " + "  |  ".join(values))
             coverage = 100 * totals["verified"] / totals["total"] if totals["total"] else 0
             self.query_one("#catalog_status", Static).update(
-                "FIELD CATALOG | REPORTED VERIFICATION\n"
+                "WEB FIELD CATALOG | GETSTRUCTURE ONLY\n"
                 f"FIELDS: {totals['total']:,} | VERIFIED: {totals['verified']:,} "
                 f"({coverage:.2f}%) | MAPPED: {totals['mapped']:,} | "
                 f"UNVERIFIED: {totals['unverified']:,} | UNSUPPORTED: {totals['unsupported']:,}\n"
-                f"SELECTABLE: {totals['selectable']:,} | CUBES AVAILABLE: "
+                f"VIEWS: {views:,} | MEASURES: {measures:,} | SELECTABLE: {totals['selectable']:,} | CUBES AVAILABLE: "
                 f"{available}/{len(QUERY_PROFILES) * len(CUBE_TYPES)}\n"
                 + "\n".join(lines))
 

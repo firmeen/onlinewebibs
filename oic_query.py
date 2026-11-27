@@ -658,6 +658,10 @@ def _merge_catalog_fields(base: dict, incoming: dict, *, report: bool = False) -
             if key not in result and f.get("source") == "XMLA_DISCOVER":
                 result[key] = f
     merged = dict(incoming, fields=list(result.values()))
+    # Preserve the last complete GetStructure membership across report merges.
+    if "web_fields" not in merged and "web_fields" in base:
+        merged["web_fields"] = base["web_fields"]
+        merged["web_refreshed_at"] = base.get("web_refreshed_at")
     if not report and base.get("verification_report_counts") and not merged.get("verification_report_counts"):
         for name in ("verification_report_counts", "report_updated_at"):
             if name in base:
@@ -717,6 +721,82 @@ def load_catalog(code: str, cube_type: str = "FY") -> dict:
                    or _catalog_time(report) > str(catalog.get("report_updated_at") or "")):
         catalog = merge_verification_catalog(catalog, report)
     return catalog
+
+
+def load_web_catalog(code: str, cube_type: str = "FY") -> dict:
+    """Use a saved GetStructure list as the scope; reports only enrich mappings."""
+    if code not in PROFILES or cube_type not in CUBE_TYPES:
+        raise ValueError("Unknown insurance category / cube type")
+    local = _read_catalog_json(cache_path(code, cube_type))
+    if local and not _catalog_matches(local, code, cube_type):
+        local = None
+    bundled = load_bundled_catalog(code, cube_type)
+    report = load_verification_report(code, cube_type)
+    general = load_catalog(code, cube_type)
+
+    # Prefer the last actual structure snapshot, not the time of verification.
+    snapshots = []
+    legacy = []
+    for candidate in (bundled, local):
+        if not candidate:
+            continue
+        fields = candidate.get("web_fields")
+        if isinstance(fields, list) and fields and all(
+                isinstance(f, dict) and f.get("source") == "GETSTRUCTURE"
+                and f.get("id") and f.get("type") in ("DIMENSION", "MEASURE")
+                for f in fields):
+            snapshots.append((str(candidate.get("web_refreshed_at") or ""), fields))
+        else:
+            fields = [f for f in candidate["fields"] if f.get("source") == "GETSTRUCTURE"]
+            if fields:
+                # Older LIVE caches preserve the original web list; reports
+                # and bundled catalogs are a fallback for existing installs.
+                if candidate.get("source") == "LIVE":
+                    snapshots.append((str(candidate.get("refreshed_at") or ""), fields))
+                else:
+                    legacy.append((_catalog_time(candidate), fields))
+    if report:
+        fields = [_normalize_report_field(code, cube_type, f) for f in report["fields"]
+                  if f.get("source") == "GETSTRUCTURE"]
+        if fields:
+            legacy.append((_catalog_time(report), fields))
+    candidates = snapshots or legacy
+    if not candidates:
+        return dict(general, source="WEB_SCOPE_MISSING", fields=[], view_count=0,
+                    data_count=0, verification_report_counts={},
+                    web_scope_ready=False)
+
+    stamp, web_fields = max(candidates, key=lambda item: item[0])
+    mapped = {_field_identity(code, cube_type, f): f for f in general["fields"]
+              if f.get("source") == "GETSTRUCTURE"}
+    fields = []
+    seen = set()
+    for raw in web_fields:
+        key = _field_identity(code, cube_type, raw)
+        if key in seen:
+            continue
+        seen.add(key)
+        field = dict(raw)
+        verified = mapped.get(key)
+        if verified:
+            # Retain the website identity, label, folder and calculation details.
+            for name in ("mdx", "status", "mapping_status", "reported_status",
+                         "mapping_reason", "verified_at", "verification_method"):
+                if name in verified:
+                    field[name] = verified[name]
+        fields.append(field)
+    counts = {status: 0 for status in ("VERIFIED", "MAPPED", "UNVERIFIED", "UNSUPPORTED")}
+    for field in fields:
+        status = field.get("status")
+        counts[status if status in counts else "UNVERIFIED"] += 1
+    # Return only stable web-scope data, not the unrelated full XMLA catalog.
+    return { "code": code, "web_class": general["web_class"], "cube_type": cube_type,
+             "catalog": general["catalog"], "cube": general["cube"],
+             "source": "WEB_CATALOG", "web_scope_ready": True,
+             "web_refreshed_at": stamp, "fields": fields,
+             "view_count": sum(f["type"] == "DIMENSION" for f in fields),
+             "data_count": sum(f["type"] == "MEASURE" for f in fields),
+             "verification_report_counts": counts, "errors": [] }
 
 
 def _replace_catalog_file(temporary: Path, destination: Path) -> None:
@@ -2046,6 +2126,8 @@ def discover_fields(
         raise ValueError(f"{code}/{cube_type}: incomplete XMLA metadata; saved catalog kept")
     catalog["errors"] = errors
     catalog["source"] = "LIVE"
+    catalog["web_fields"] = [dict(f) for f in catalog["fields"]]
+    catalog["web_refreshed_at"] = catalog["refreshed_at"]
     existing = load_catalog(code, cube_type)
     catalog = _merge_catalog_fields(existing, catalog)
     # Retain a confirmed mapping only when its identifier still exists in live XMLA.
@@ -2065,6 +2147,7 @@ def discover_fields(
         field for field in catalog["fields"]
         if field.get("source") != "XMLA_DISCOVER" or field.get("mdx") in identifiers
     ]
+    catalog["web_fields"] = [dict(f) for f in catalog["fields"] if f.get("source") == "GETSTRUCTURE"]
     catalog["view_count"] = sum(f["type"] == "DIMENSION" for f in catalog["fields"])
     catalog["data_count"] = sum(f["type"] == "MEASURE" for f in catalog["fields"])
     year = _year_from_fields(catalog["fields"], cube_type)

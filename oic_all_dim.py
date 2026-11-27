@@ -74,8 +74,8 @@ def configure_log(path=None, console_output=True):
         LOGGER.addHandler(handler)
 
 
-def log(message):
-    LOGGER.info(message)
+def log(message,auth=False):
+    LOGGER.info(message,extra={"auth_event":auth})
 
 
 class PrepareMonitor:
@@ -94,6 +94,7 @@ class PrepareMonitor:
         self.cubes={f"{c}/{y}":{"status":"PENDING","done":0,"total":None,"members":0}
                     for c in ("AH","FI","MR","MI","MV") for y in ("FY","UY","AY")}
         self.active={}
+        self.auth_state=None
         self.events=deque(maxlen=8)
         self.samples=deque(maxlen=4)
         self.concurrency_samples=deque(maxlen=3)
@@ -114,6 +115,9 @@ class PrepareMonitor:
             class ActivityHandler(logging.Handler):
                 def emit(self,record):
                     message=record.getMessage()
+                    # Keep auth diagnostics in prepare.log, not the collection activity feed.
+                    if getattr(record,"auth_event",False) or message.startswith("AUTH |"):
+                        return
                     monitor.add_event(message)
                     if monitor.on_progress is not None:
                         monitor.on_progress("log",message=message)
@@ -211,6 +215,14 @@ class PrepareMonitor:
                 "attempt":attempt,"started":now,"stage_at":now,"stage":"INITIALIZING","bytes":0}
         log(f"{cube} | {kind} | {detail} | attempt {attempt} | START")
 
+    def auth_status(self,state,operation):
+        with self.lock:
+            if self.auth_state==state:
+                return
+            self.auth_state=state
+        if self.on_progress is not None:
+            self.on_progress("auth_status",state=state,operation=operation)
+
     def request_updated(self,key,stage,**data):
         with self.lock:
             row=self.active.get(key)
@@ -220,11 +232,21 @@ class PrepareMonitor:
                 row["stage"]=stage
                 row["stage_at"]=time.monotonic()
             row.update(data)
+        auth_stage=stage in ("AUTH REFRESH","AUTH LOCK WAIT","REUSING VALID TOKEN","REUSING SHARED TOKEN","AUTH RETRY")
+        if self.on_progress is not None:
+            if stage in ("AUTH REFRESH","AUTH LOCK WAIT","AUTH RETRY"):
+                self.auth_status("REFRESHING" if stage!="AUTH RETRY" else "RETRYING",stage)
+            elif stage in ("REUSING VALID TOKEN","REUSING SHARED TOKEN","REQUEST IN FLIGHT"):
+                with self.lock:
+                    waiting=any(v["stage"] in ("AUTH REFRESH","AUTH LOCK WAIT","AUTH RETRY")
+                                for v in self.active.values())
+                if not waiting:
+                    self.auth_status("VALID","SESSION ACTIVE")
         if stage not in ("RECEIVING",):
             suffix=f" | HTTP {data['http_status']}" if "http_status" in data else ""
             if "remaining_seconds" in data:
                 suffix+=f" | JWT remaining {data['remaining_seconds']}s"
-            log(f"{key[:12]} | {stage}{suffix}")
+            log(f"{key[:12]} | {stage}{suffix}",auth=auth_stage)
 
     def request_finished(self,key,ok,metrics=None,error=None):
         metrics=metrics or {}
@@ -1334,7 +1356,7 @@ def supervisor_lock():
                 fcntl.flock(file.fileno(),fcntl.LOCK_UN)
 
 
-def execute_discovery_request(collector_client,profile,payload,timeout,observe,renew=False):
+def execute_discovery_request(collector_client,profile,payload,timeout,observe):
     """Send the prepared SOAP using the Main Collector's requests.Session/auth."""
     import requests
     code=profile["code"]
@@ -1347,6 +1369,8 @@ def execute_discovery_request(collector_client,profile,payload,timeout,observe,r
             observe("REUSING VALID TOKEN",remaining_seconds=int(jwt_exp(collector_client.token)-time.time()))
         try:
             collector_client.ensure_token(code,force=force)
+        except CollectionError:
+            raise
         except RuntimeError as exc:
             # The collector may be running as __main__; don't import a second
             # copy of its exception classes. Expose only safe error categories.
@@ -1368,7 +1392,7 @@ def execute_discovery_request(collector_client,profile,payload,timeout,observe,r
 
     auth_start=time.monotonic()
     check()
-    ensure(renew)
+    ensure()
     auth_seconds=time.monotonic()-auth_start
     for attempt in range(2):
         check()
@@ -1474,7 +1498,7 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
     try:
         monitor.start()
         if collector_client is None:
-            client=OICClient(periodic=True,stop=check_stop)
+            client=OICClient(periodic=False,stop=check_stop)
             if not client.cookie:
                 raise RuntimeError("Set OIC_COOKIE in local .env")
         elif not collector_client.cookie_header():
@@ -1482,15 +1506,13 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
 
         health_checks={}
         unknown_streak=0
-        log("AUTH | Cookie Jar active | reuse valid JWT | periodic renewal at safe request boundaries")
+        log("AUTH | Cookie Jar active | renewal on demand at safe request boundaries",auth=True)
         log("TRANSPORT | "+("Main Collector requests.Session" if collector_client is not None else "curl_cffi"))
         initial_token=collector_client.token if collector_client is not None else client.token
         log(f"AUTH | Initial JWT remaining {max(0,int(jwt_exp(initial_token)-time.time()))}s")
-        last_auth_check=time.monotonic()
         preflight_complete=False
 
         def monitored_call(profile,payload,timeout,phase,detail,attempt):
-            nonlocal last_auth_check
             ensure_running()
             cube=f"{profile['code']}/{profile['cube_type']}"
             key=uuid.uuid4().hex
@@ -1502,11 +1524,7 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                 if collector_client is None:
                     data,metrics=client.execute_once(profile,payload,timeout)
                 else:
-                    token_before=collector_client.token
-                    renew=time.monotonic()-last_auth_check>=SESSION_RECHECK_SECONDS
-                    data,metrics=execute_discovery_request(collector_client,profile,payload,timeout,observer,renew)
-                    if renew or collector_client.token!=token_before:
-                        last_auth_check=time.monotonic()
+                    data,metrics=execute_discovery_request(collector_client,profile,payload,timeout,observer)
                 # HTTP 200 can still carry a SOAP fault or session error.
                 diagnostic=extract_error_details(data)
                 if diagnostic:
@@ -1570,6 +1588,11 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                     return data
                 except CollectionError as exc:
                     kind=exc.kind
+                    if exc.endpoint=="LOCAL_CREDENTIALS":
+                        monitor.auth_status("ERROR",kind)
+                        raise
+                    if exc.endpoint=="GEN_TOKEN":
+                        monitor.auth_status("RETRYING" if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE","AUTH_ENDPOINT_ERROR","AUTH_TOKEN_EXPIRED") and attempt<MAX_ATTEMPTS else "ERROR",kind)
                     if kind in ("QUERY_SCOPE_ERROR","QUERY_FAULT","DISCOVER_NOT_SUPPORTED","RESPONSE_TOO_LARGE"):
                         raise
                     if kind in ("HTTP_500_UNKNOWN","RESPONSE_TIMEOUT","XMLA_FAULT_UNKNOWN") and exc.endpoint!="GEN_TOKEN":
@@ -1621,7 +1644,12 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                 monitor.request_started(key,req["cube"],detail,req["timeout"],kind="CONCURRENCY PROBE" if parallel else "SHAPE PROBE")
                 probe_client.observer=lambda stage,**data: monitor.request_updated(key,stage,**data)
                 claimed=probe_db.claim_probe(key)
+                before_credentials=credential_values() if on_progress is not None else None
                 result=execute_resilient(probe_db,probe_client,claimed,probe=True)
+                if before_credentials is not None:
+                    after_credentials=credential_values()
+                    if after_credentials!=before_credentials:
+                        on_progress("auth_credentials",cookie=after_credentials[0],token=after_credentials[1])
                 if result.get("pressure"):
                     delay=max(10,result.get("delay",0))
                     monitor.retry(key,delay)
@@ -1666,6 +1694,11 @@ def run_extraction(db,workers):
     prep=db.latest_preparation()
     if not prep or prep["status"]!="READY":
         raise RuntimeError("Run --prepare successfully before extraction")
+    from oic_all_dim_prepare import PLANNER_VERSION,load_all_catalogs
+    summary=json.loads(prep["summary_json"] or "{}")
+    if (summary.get("scope")!="WEB_ONLY" or summary.get("planner_version")!=PLANNER_VERSION
+            or prep["catalog_hash"]!=digest([PLANNER_VERSION,load_all_catalogs()])):
+        raise RuntimeError("Saved plan is not the current web-only scope; run --prepare first")
     if db.all_work_finished(prep["id"]):
         progress=db.progress(prep["id"])
         log(f"No pending work | {progress}")

@@ -128,7 +128,11 @@ class PrepareMonitor:
             self.live=Live(get_renderable=self.render,console=self.console,refresh_per_second=3,
                            transient=True,redirect_stdout=False,redirect_stderr=False,
                            vertical_overflow="ellipsis")
-            self.live.start(refresh=True)
+            try:
+                self.live.start(refresh=True)
+            except Exception as exc:
+                self.live=None
+                LOGGER.warning("Rich worker display unavailable: %s",type(exc).__name__)
 
     def add_event(self,message):
         with self.lock:
@@ -1130,6 +1134,8 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
         children=build_recovery_requests({**r,"scope":scope},db.profile(r["prep"],r["cube"]))
         if not children or not db.activate_recovery_requests(r,message,children):
             db.fail(r,message,"FAILED")
+        else:
+            log(f"{r['cube']} | {r['id'][:12]} | SPLIT X={len(scope['members'])} -> {len(scope['members'])//2} + {len(scope['members'])-len(scope['members'])//2} | Y/M unchanged")
     elif kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET","INVALID_XML","DATABASE_BUSY"):
         if kind in ("NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
             client.reconnect()
@@ -1290,9 +1296,17 @@ class WorkerMonitor:
             for k in ("stage_timeout","bytes","http_status","remaining_seconds"):
                 if k in data:
                     self.state[k]=data[k]
+            if "remaining_seconds" in data:
+                self.state["jwt_expires_at"]=time.time()+data["remaining_seconds"]
             if stage=="REQUEST IN FLIGHT":
                 self.state.pop("http_status",None)
+                self.state.pop("http_finished",None)
                 self.state["http_started"]=time.time()
+                self.state["http_attempts"]=self.state.get("http_attempts",0)+1
+            if stage in ("SAVING RAW XML","PARSING","COMMITTING") and self.state.get("http_started") and not self.state.get("http_finished"):
+                self.state["http_finished"]=time.time()
+            if self.state["request"] and changed:
+                self.state["request"].setdefault("stages",[]).append(stage)
             self.publish(force=changed)
 
     def event(self,message):
@@ -1308,7 +1322,7 @@ class WorkerMonitor:
                 "y":len(scope["years"]),"m":len(scope["measures"]),"cells":r["potential_cells"],
                 "attempt":r["attempts"],"timeout":r["timeout"],"parent":r["parent"],
                 "started":time.time()}
-            for k in ("http_status","http_started","stage_timeout"):
+            for k in ("http_status","http_started","http_finished","stage_timeout"):
                 self.state.pop(k,None)
             self.state["bytes"]=0
             self.observe("LOADING PAYLOAD")
@@ -1332,6 +1346,7 @@ class WorkerMonitor:
                 stats["failed"]+=1
             record={**q,"result":label,"duration":duration,"error":result.get("error",""),"time":time.time()}
             self.state["recent"]=(self.state["recent"]+[record])[-6:]
+            self.event(f"{q['cube']} | {q['caption']} | {label} | {duration:.1f}s"+(f" | {record['error']}" if record["error"] else ""))
             self.state["request"]={}
             self.observe(label)
             self.publish(True)
@@ -1357,8 +1372,11 @@ class WorkerMonitor:
         self.observe(final)
         self.publish(True)
         if self.live is not None:
-            self.live.stop()
-            self.live.console.print(self.render())
+            try:
+                self.live.stop()
+                self.live.console.print(self.render())
+            except Exception as exc:
+                LOGGER.warning("Rich final display unavailable: %s",type(exc).__name__)
         if self.handler:
             LOGGER.removeHandler(self.handler)
             self.handler.close()
@@ -1385,9 +1403,22 @@ class WorkerMonitor:
                       Text(f"Expected cells: {q.get('cells',0):,}  |  Timeout {q.get('timeout','-')}s"))
         stage=Text(f"{s['stage']}  |  Stage elapsed {elapsed_label(time.time()-s['stage_at'])}"
                    f"  |  HTTP {s.get('http_status','-')}  |  Received {s.get('bytes',0)/1048576:.2f} MiB")
-        http_elapsed=time.time()-s["http_started"] if q and s.get("http_started") else 0
+        http_elapsed=s.get("http_finished",time.time())-s["http_started"] if q and s.get("http_started") else 0
         budget=q.get("timeout",0)
-        lifecycle=Group(stage,Text("Auth status: "+(f"JWT remaining at last check {s['remaining_seconds']}s" if "remaining_seconds" in s else "not yet observed")),
+        visited=set(q.get("stages",[]))
+        phases=[("Payload",{"LOADING PAYLOAD","CHECKING RAW RESPONSE"}),
+                ("Auth",{"AUTH LOCK WAIT","AUTH REFRESH","REUSING VALID TOKEN","REUSING SHARED TOKEN"}),
+                ("HTTP",{"REQUEST IN FLIGHT","HEADERS RECEIVED"}),
+                ("XML",{"RECEIVING","SAVING RAW XML","REPLAYING SAVED XML"}),
+                ("Parse",{"PARSING"}),("Commit",{"COMMITTING"})]
+        flow=Text()
+        for label,stages in phases:
+            active=s["stage"] in stages
+            flow.append(label+(" *" if active else " + " if visited.intersection(stages) else " - "),
+                        style="bold yellow" if active else "green" if visited.intersection(stages) else "dim")
+            flow.append("  ")
+        jwt=f"JWT remaining {max(0,int(s['jwt_expires_at']-time.time()))}s" if s.get("jwt_expires_at") else "JWT expiry not yet observed"
+        lifecycle=Group(stage,flow,Text(jwt+" | Auth activity shown in stage"),
                         Text(f"HTTP elapsed {elapsed_label(http_elapsed)} / configured {budget}s (time, not download progress)"),
                         rich_progress(min(http_elapsed,budget),budget))
         recent=Table(expand=True)
@@ -1567,7 +1598,10 @@ def run_worker(rid,worker):
         if client:
             client.close()
         if monitor is not None:
-            monitor.stop(final)
+            try:
+                monitor.stop(final)
+            except Exception as exc:
+                LOGGER.warning("Worker monitor cleanup unavailable: %s",type(exc).__name__)
         if registered:
             # Supervisor fences and requeues remaining work if this process dies.
             db.finish_worker(owner,final)
@@ -1595,7 +1629,7 @@ def launch_worker_tabs(rid,workers,include_monitor=False):
     for index,worker in enumerate(tabs):
         if index:
             args.append(";")
-        args.extend(["new-tab","--startingDirectory",str(PROJECT_ROOT),"--title",("LIVE MONITOR" if worker is None else f"OIC W{worker:02}"),
+        args.extend(["new-tab","--startingDirectory",str(PROJECT_ROOT),"--suppressApplicationTitle","--title",("LIVE MONITOR" if worker is None else f"OIC W{worker:02}"),
                      ps,"-NoLogo","-NoProfile","-EncodedCommand",worker_command(rid,worker)])
     if include_monitor:
         args.extend([";","focus-tab","--target","0"])
@@ -2022,7 +2056,7 @@ def run_extraction(db,workers,stop_event=None,on_progress=None):
         log(f"No pending work | {progress}")
         return int(any(k in progress for k in ("FAILED","NEEDS_REPREPARE")))
     rid=db.start_run(prep["id"],workers,min(workers,prep["concurrency"]),os.getpid(),psutil.Process().create_time())
-    configure_log(OUTPUT/"runs"/rid/"run.log")
+    configure_log(OUTPUT/"runs"/rid/"run.log",console_output=on_progress is None)
     code=0
     state="FAILED"
     try:

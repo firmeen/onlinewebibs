@@ -40,6 +40,9 @@ Safety:
 
 from __future__ import annotations
 
+from curl_cffi import requests
+from curl_cffi.requests.exceptions import RequestException
+
 import hashlib
 import json
 import re
@@ -1031,7 +1034,6 @@ def extract_webform_authorizations(
 def create_webform_session(
     cookie: str,
 ):
-    import requests
 
     raw_cookie = normalize_cookie(cookie)
 
@@ -1204,7 +1206,7 @@ def discover_webform_authorizations(
                     if value not in auth[method]:
                         auth[method].append(value)
 
-        except requests.RequestException:
+        except RequestException:
             continue
 
     if not auth["GetStructure"]:
@@ -1926,7 +1928,6 @@ def discover_xmla_metadata(
     profile: dict | None = None,
     kinds=("MDSCHEMA_HIERARCHIES","MDSCHEMA_MEASURES"),
 ) -> tuple[list[dict], list[str]]:
-    import requests
 
     profile = profile or PROFILES[code]
 
@@ -2020,7 +2021,7 @@ def discover_xmla_metadata(
             if len(fields)==start:
                 raise ValueError("Empty XMLA metadata rowset")
         except (
-            requests.RequestException,
+            RequestException,
             ValueError,
             ET.ParseError,
         ) as exc:
@@ -2247,7 +2248,6 @@ def discover_fields(
 def verify_field(code: str, cube_type: str, field_id_value: str,
                  token: str, cookie: str, *, timeout: int = 30) -> dict:
     """Small real XMLA Execute. Only mapped identifiers can be verified."""
-    import requests
     catalog = load_catalog(code, cube_type)
     selected = next((f for f in catalog["fields"]
                      if f.get("id") == field_id_value), None)

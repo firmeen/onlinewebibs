@@ -1648,14 +1648,15 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
 
 
 def run_extraction(db,workers,stop_event=None):
-    prep=db.latest_preparation()
+    from oic_all_dim_prepare import PLANNER_VERSION,PLAN_POLICY,inventory_fingerprint,load_all_catalogs,matching_preparation
+    catalogs=load_all_catalogs()
+    prep=matching_preparation(db.conn,catalogs)
     if not prep or prep["status"]!="READY":
-        raise RuntimeError("Run --prepare successfully before extraction")
-    from oic_all_dim_prepare import PLANNER_VERSION,PLAN_POLICY,inventory_fingerprint,load_all_catalogs
+        raise RuntimeError("Generate Job Plan before collection")
     summary=json.loads(prep["summary_json"] or "{}")
     if (summary.get("scope")!="WEB_ONLY" or summary.get("planner_version")!=PLANNER_VERSION
             or summary.get("plan_policy")!=PLAN_POLICY
-            or prep["catalog_hash"]!=inventory_fingerprint(load_all_catalogs())):
+            or prep["catalog_hash"]!=inventory_fingerprint(catalogs)):
         raise RuntimeError("Saved plan is not the current web-only scope; run --prepare first")
     if db.all_work_finished(prep["id"]):
         progress=db.progress(prep["id"])

@@ -1120,7 +1120,10 @@ def export_request_excel(db,r):
         return False
     finally:
         if wb is not None:
-            wb.close()
+            try:
+                wb.close()
+            except Exception:
+                pass
         try:
             temp.unlink(missing_ok=True)
         except OSError:
@@ -1129,8 +1132,9 @@ def export_request_excel(db,r):
 
 def flush_pending_exports(db,prep):
     failed=0
-    for row in db.conn.execute("SELECT * FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')",(prep,)).fetchall():
-        if not export_request_excel(db,dict(row)):
+    rows=db.conn.execute("SELECT id FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')",(prep,)).fetchall()
+    for row in rows:
+        if not export_request_excel(db,db.get_request(row[0])):
             failed+=1
     return failed
 
@@ -1209,7 +1213,7 @@ def process_request(db,client,r,rid=None,owner=None):
     return metrics
 
 
-def handle_request_failure(db,client,r,exc,rid,probe=False):
+def handle_request_failure(db,client,r,exc,rid,probe=False,late_reset=False):
     kind=exc.kind if isinstance(exc,CollectionError) else "UNKNOWN_ERROR"
     message=str(exc) if isinstance(exc,CollectionError) else type(exc).__name__
     log(f"{r['cube']} | {r['id'][:12]} | {message}")
@@ -1229,7 +1233,7 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
         delay=max(minimum,exc.delay,2**r["attempts"])
         db.pressure(rid,delay)
         db.fail(r,message,"RETRY" if r["attempts"]<MAX_ATTEMPTS else "FAILED",delay)
-    elif kind in ("RESPONSE_TOO_LARGE","SOAP_FAULT","QUERY_FAULT","QUERY_SCOPE_ERROR","RESPONSE_TIMEOUT","INVALID_QUERY"):
+    elif kind in ("RESPONSE_TOO_LARGE","SOAP_FAULT","QUERY_FAULT","QUERY_SCOPE_ERROR","RESPONSE_TIMEOUT","INVALID_QUERY") or late_reset:
         scope=json.loads(r["scope_json"])
         children=build_recovery_requests({**r,"scope":scope},db.profile(r["prep"],r["cube"]))
         if not children or not db.activate_recovery_requests(r,message,children):
@@ -1255,10 +1259,12 @@ def execute_resilient(db,client,r,rid=None,owner=None,probe=False):
         metrics=process_request(db,client,r,rid,owner)
         return {"ok":True,**metrics}
     except (CollectionError,sqlite3.Error,OSError,ValueError) as exc:
-        if isinstance(exc,CollectionError) and exc.kind=="CONNECTION_RESET" and time.monotonic()-started>=45 and r["attempts"]>=2:
+        late_reset=(isinstance(exc,CollectionError) and exc.kind=="CONNECTION_RESET"
+                    and time.monotonic()-started>=45 and r["attempts"]>=2)
+        if late_reset:
             client.reconnect()
-            exc=CollectionError("RESPONSE_TIMEOUT","Repeated late connection reset; reduce member scope")
-        handle_request_failure(db,client,r,exc,rid,probe)
+            log("Repeated late connection reset; trying smaller member scope")
+        handle_request_failure(db,client,r,exc,rid,probe,late_reset=late_reset)
         return {"ok":False,"pressure":getattr(exc,"kind","") in ("RATE_LIMITED","SERVER_UNAVAILABLE","HTTP_500_UNKNOWN","AUTH_ENDPOINT_ERROR","RESPONSE_TIMEOUT"),
                 "error":getattr(exc,"kind",type(exc).__name__),"delay":getattr(exc,"delay",0)}
 
@@ -1331,6 +1337,15 @@ def collection_snapshot(conn,rid):
     totals["jobs"]=conn.execute("SELECT count(*) FROM oic_jobs WHERE prep=?",(prep,)).fetchone()[0]
     totals["jobs_done"]=sum(j["planned"]>0 and j["covered"]==j["planned"] and not j["failed"] for j in jobs.values())
     totals["jobs_failed"]=sum(j["failed"] for j in jobs.values())
+    assignments={}
+    for job,worker in conn.execute("SELECT id,json_extract(scope_json,'$.worker_id') FROM oic_jobs WHERE prep=?",(prep,)):
+        if worker is None:
+            continue
+        item=assignments.setdefault(worker,{"assigned":0,"done":0,"failed":0})
+        item["assigned"]+=1
+        j=jobs.get(job,{})
+        item["done"]+=int(bool(j.get("planned") and j.get("covered")==j.get("planned") and not j.get("failed")))
+        item["failed"]+=int(bool(j.get("failed")))
     metrics=conn.execute("""SELECT coalesce(sum(CASE WHEN json_valid(metrics_json)
             THEN json_extract(metrics_json,'$.response_bytes') ELSE 0 END),0),
             coalesce(sum(CASE WHEN committed_at>=? THEN potential_cells ELSE 0 END),0)
@@ -1345,7 +1360,7 @@ def collection_snapshot(conn,rid):
     totals["excel_failed"]=exports[1]
     totals["excel_pending"]=totals["committed"]-exports[0]-exports[1]
     workers=[dict(row) for row in conn.execute("SELECT * FROM oic_workers WHERE run=? ORDER BY worker",(rid,))]
-    return {"run":run,"totals":totals,"cubes":cubes,"workers":workers}
+    return {"run":run,"totals":totals,"cubes":cubes,"workers":workers,"assignments":assignments}
 
 
 def worker_state_path(rid,worker):
@@ -1586,7 +1601,7 @@ class CollectionMonitor:
             Text(f"Request attempts {t['attempts']} (plan lifetime)  |  {t['run_cells']/duration:,.0f} cells/s (this run)  |  Saved XML {t['committed_bytes']/1048576:.2f} MiB"),
             Text(f"Excel saved {t['excel_saved']} | Pending {t['excel_pending']} | Failed {t['excel_failed']}"))
         workers=Table(expand=True)
-        for col in ("Worker","Cube / Dimension","Stage","Elapsed","Saved","Cells"):
+        for col in ("Worker","Jobs","Cube / Dimension","Stage","Elapsed","Saved","Cells"):
             workers.add_column(col,overflow="fold")
         events=[]
         registered={w["worker"]:w for w in self.snapshot["workers"]}
@@ -1603,7 +1618,8 @@ class CollectionMonitor:
             elif w and time.time()-w["heartbeat"]>15:
                 stage="HEARTBEAT STALE"
             stats=s.get("stats",{})
-            workers.add_row(f"W{n:02}",Text(f"{q.get('cube','-')} / {q.get('caption','-')}"),
+            assigned=self.snapshot["assignments"].get(n,{})
+            workers.add_row(f"W{n:02}",f"{assigned.get('done',0)}/{assigned.get('assigned',0)}",Text(f"{q.get('cube','-')} / {q.get('caption','-')}"),
                             Text(stage),elapsed_label(time.time()-q.get("started",time.time())),
                             str(stats.get("committed",0)),f"{stats.get('cells',0):,}")
             events.extend((e["time"],n,e["text"]) for e in s.get("events",[]))

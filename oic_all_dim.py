@@ -628,11 +628,16 @@ def recover_session(stop=lambda:False,on_wait=None,expected=None):
     """Single-operation recovery, also used by supervisors after draining HTTP work."""
     expected=credential_values() if expected is None else expected
     AUTH_RETRY_PATH.unlink(missing_ok=True)
+    # An immediately rejected fresh browser session must not cause endless logins.
+    auto_attempt=time.time()-auth_status().get("last_login",0)>=60
     while not stop():
         try:
+            if not auto_attempt:
+                raise CollectionError("AUTH_COOKIE_EXPIRED","Recent login rejected; manual retry required")
             return run_auto_auth(stop,expected=expected)
         except (CollectionError,OSError) as exc:
             if stop() or getattr(exc,"kind",None)=="USER_STOP":
+                auth_event("STOPPED",cookie_status="NOT CHECKED")
                 raise CollectionError("USER_STOP") from None
             auth_event("WAITING_AUTH",cookie_status="REJECTED",last_error=getattr(exc,"kind",type(exc).__name__))
             log("AUTH | Login failed; waiting for AUTO AUTH or STOP",auth=True)
@@ -647,11 +652,13 @@ def recover_session(stop=lambda:False,on_wait=None,expected=None):
                 except CollectionError:
                     expected=current
             if auth_retry_requested():
+                auto_attempt=True
                 break
             time.sleep(.5)
+    auth_event("STOPPED",cookie_status="NOT CHECKED")
     raise CollectionError("USER_STOP")
 
-def ensure_shared_auth(code="AH",stop=lambda:False,validate=False,allow_login=True):
+def ensure_shared_auth(code="AH",stop=lambda:False,validate=False,allow_login=True,rejected_token=None):
     """Use the existing curl GenToken client for every workflow."""
     client=OICClient(stop=stop)
     try:
@@ -660,12 +667,15 @@ def ensure_shared_auth(code="AH",stop=lambda:False,validate=False,allow_login=Tr
             if not client.cookie:
                 raise CollectionError("AUTH_COOKIE_EXPIRED","Missing cookie")
             if validate:
-                client.refresh_token(rejected_token=client.token)
+                if rejected_token is None or client.token==rejected_token or jwt_exp(client.token)<=time.time()+60:
+                    client.refresh_token(rejected_token=client.token)
             else:
                 client.ensure_token()
             return client.cookie,client.token
         except CollectionError as exc:
             if not allow_login or not is_session_error(exc):
+                if not is_session_error(exc):
+                    auth_event("ERROR",cookie_status="NOT CHECKED",last_error=exc.kind)
                 raise
             return recover_session(stop,expected=credential_values())
     finally:
@@ -929,6 +939,8 @@ class OICClient:
                 self.reload_credentials(force=True)
                 if jwt_exp(self.token)<=time.time()+10:
                     raise CollectionError("AUTH_ENDPOINT_ERROR","Credential changed during refresh; retry with latest .env",5)
+            if not published and credential_values()==expected:
+                raise CollectionError("AUTH_ENDPOINT_ERROR","Could not publish renewed credentials",5)
             auth_event("IDLE",cookie_status="VALID",last_refresh=time.time(),last_check=time.time(),
                        expires=jwt_exp(self.token),refresh_count=auth_status().get("refresh_count",0)+1,last_error=None)
             log(f"AUTH | GenToken successful | JWT remaining {max(0,int(jwt_exp(self.token)-time.time()))}s | "+("shared .env updated" if published else "local credential retained"))
@@ -1482,6 +1494,8 @@ def process_request(db,client,r,rid=None,owner=None):
                     raise CollectionError("USER_STOP")
                 time.sleep(0.5)
         try:
+            if rid:
+                client.auth_generation=db.auth_state(rid).get("generation",0)
             log(f"{r['cube']} | {r['id'][:12]} | REQUESTING X={len(scope['members'])} Y={len(scope['years'])} M={len(scope['measures'])}")
             _,metrics=client.execute_once(profile,r["payload"],r["timeout"],path)
         finally:
@@ -1489,6 +1503,9 @@ def process_request(db,client,r,rid=None,owner=None):
                 db.release_slot(owner)
         client.observe("PARSING")
         data=path.read_bytes()
+        diagnostic=extract_error_details(data)
+        if diagnostic in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","ACCESS_DENIED"):
+            raise CollectionError(diagnostic,"XMLA authentication rejected",endpoint="XMLA")
         db.register_response(r,path,digest(data),metrics)
         t=time.monotonic()
         parsed=parse_xmla(data,scope)
@@ -1911,6 +1928,9 @@ class CollectionMonitor:
         pct=100*t["covered"]/max(1,t["planned"])
         status="STOPPING" if run["state"]=="RUNNING" and run["stop"] else "STARTING" if run["state"]=="RUNNING" and not run["barrier"] else run["state"]
         export=t["excel_export"]
+        auth=self.snapshot.get("auth",{})
+        if status=="RUNNING" and auth.get("state") in ("REFRESHING","RELOGIN_RUNNING","WAITING_AUTH"):
+            status=auth["state"]
         if export["status"]=="EXPORTING":
             status="EXPORTING"
         header=Text(f"OIC COLLECTION  |  LIVE MONITOR\n{status}  |  Run {self.rid[:12]}  |  Elapsed {elapsed_label(duration)}",
@@ -1918,6 +1938,7 @@ class CollectionMonitor:
         global_panel=Group(Text(f"Jobs {t['jobs_done']}/{t['jobs']}  |  Failed jobs {t['jobs_failed']}  |  Splits {t['splits']}"),
             Text(f"Cells {t['covered']:,}/{t['planned']:,}  |  {pct:.2f}%"),rich_progress(t["covered"],t["planned"]),
             Text(f"Saved requests {t['committed']}  |  Pending {t['pending']}  |  Running {t['running']}  |  Failed {t['failed']}"),
+            Text(f"AUTH {auth.get('state','IDLE')} | JWT remaining {max(0,int(jwt_exp(credential_values()[1])-time.time()))}s | Refreshes {auth.get('refresh_count',0)} | Re-logins {auth.get('relogin_count',0)}"),
             Text(f"Request attempts {t['attempts']} (plan lifetime)  |  {t['run_cells']/duration:,.0f} cells/s (this run)  |  Saved XML {t['committed_bytes']/1048576:.2f} MiB"),
             Text("Excel: deferred until collection stops" if export["status"]=="DEFERRED" else
                  f"Excel: {export['status']} | Requests {export['requests']}/{export['total_requests']} | Rows {export['rows']:,} | Files {export['files']}"+
@@ -2412,6 +2433,7 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                 raise RuntimeError("Set OIC_COOKIE in local .env")
         else:
             cookie,token=credential_values()
+            collector_client.session.cookies.clear()
             collector_client.load_cookie(cookie)
             collector_client.token=token
 

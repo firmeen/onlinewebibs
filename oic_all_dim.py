@@ -1032,6 +1032,109 @@ def wait_seconds(seconds,check=lambda:False):
         time.sleep(min(0.5,max(0,end-time.monotonic())))
 
 
+def request_excel_path(r):
+    scope=json.loads(r["scope_json"])
+    category,kind=r["cube"].split("/")
+    return OUTPUT/"excel"/r["prep"][:12]/category/kind/f"J{scope.get('job_index',0):04d}_{r['job'][:8]}"/(
+        f"Y{scope.get('year_offset',0):03d}_M{scope.get('member_offset',0):06d}_{r['id'][:20]}.xlsx")
+
+
+def export_request_excel(db,r):
+    """Export committed raw XML only; never repeat a network request."""
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    scope=json.loads(r["scope_json"])
+    path=request_excel_path(r)
+    metrics=json.loads(r.get("metrics_json") or "{}")
+    if metrics.get("excel_status")=="SAVED" and path.is_file():
+        return True
+    temp=path.with_name(uuid.uuid4().hex[:16]+".tmp.xlsx")
+    wb=None
+    try:
+        path.parent.mkdir(parents=True,exist_ok=True)
+        raw=Path(r["response_path"]) if r.get("response_path") else None
+        if not raw or not raw.is_file() or not r.get("response_hash"):
+            raise RuntimeError("Committed raw XML is unavailable")
+        data=raw.read_bytes()
+        if digest(data)!=r["response_hash"]:
+            raise RuntimeError("Raw response hash mismatch")
+        years,rows,cells,updated=parse_xmla(data,scope)
+        captions={}
+        for hierarchy in (scope["year_hierarchy"],scope["hierarchy"]):
+            if hierarchy:
+                captions.update({name:caption for name,caption in db.conn.execute(
+                    "SELECT unique_name,caption FROM oic_members WHERE prep=? AND cube=? AND hierarchy=?",
+                    (r["prep"],r["cube"],hierarchy))})
+        def value(raw):
+            if raw is None:
+                return None
+            try:
+                d=Decimal(raw)
+                if d.is_finite() and len(d.as_tuple().digits)<=15 and abs(d)<Decimal("1e15"):
+                    return int(d) if d==d.to_integral_value() else float(d)
+            except (InvalidOperation,OverflowError,ValueError):
+                pass
+            return str(raw)
+        def append(sheet,items):
+            result=[]
+            for item in items:
+                if isinstance(item,str):
+                    cell=WriteOnlyCell(sheet,value=item)
+                    cell.data_type="s"
+                    result.append(cell)
+                else:
+                    result.append(item)
+            sheet.append(result)
+        grouped={}
+        for i,(member,measure) in enumerate(rows):
+            for j,year in enumerate(years):
+                grouped.setdefault((year,member),{})[measure]=value(cells.get(i*len(years)+j,(None,None))[0])
+        wb=Workbook(write_only=True)
+        headers=["YEAR","YEAR_UNIQUE_NAME","HIERARCHY","MEMBER","MEMBER_UNIQUE_NAME",*scope["measures"]]
+        sheet=wb.create_sheet("DATA")
+        append(sheet,headers)
+        for idx,((year,member),values) in enumerate(grouped.items(),1):
+            if idx>1 and (idx-1)%1048575==0:
+                sheet=wb.create_sheet(f"DATA_{(idx-1)//1048575+1}")
+                append(sheet,headers)
+            append(sheet,[captions.get(year) or year,year,scope["hierarchy"],captions.get(member) or member,
+                          member,*[values.get(m) for m in scope["measures"]]])
+        info=wb.create_sheet("INFO")
+        for name,item in (("CUBE",r["cube"]),("JOB",r["job"]),("REQUEST",r["id"]),
+                          ("WORKER",scope.get("worker_id")),("YEAR_OFFSET",scope.get("year_offset",0)),
+                          ("MEMBER_OFFSET",scope.get("member_offset",0)),("EXPECTED_CELLS",r["potential_cells"]),
+                          ("ROWS",len(grouped)),("SOURCE_UPDATE",updated),("STATUS",r["status"]),
+                          ("DATA_TYPE","OLAP AGGREGATE"),("NOTICE","Do not sum All members with detail members")):
+            append(info,[name,item])
+        wb.save(temp)
+        os.replace(temp,path)
+        db.export_result(r["id"],path=path)
+        log(f"EXCEL SAVED | {r['cube']} | {r['id'][:12]} | {len(grouped):,} rows")
+        return True
+    except Exception as exc:
+        log(f"EXCEL ERROR | {r['id'][:12]} | {type(exc).__name__}")
+        try:
+            db.export_result(r["id"],error=type(exc).__name__)
+        except sqlite3.Error:
+            pass
+        return False
+    finally:
+        if wb is not None:
+            wb.close()
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def flush_pending_exports(db,prep):
+    failed=0
+    for row in db.conn.execute("SELECT * FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')",(prep,)).fetchall():
+        if not export_request_excel(db,dict(row)):
+            failed+=1
+    return failed
+
+
 def process_request(db,client,r,rid=None,owner=None):
     scope=json.loads(r["scope_json"])
     profile=db.profile(r["prep"],r["cube"])
@@ -1147,10 +1250,14 @@ def handle_request_failure(db,client,r,exc,rid,probe=False):
 
 
 def execute_resilient(db,client,r,rid=None,owner=None,probe=False):
+    started=time.monotonic()
     try:
         metrics=process_request(db,client,r,rid,owner)
         return {"ok":True,**metrics}
     except (CollectionError,sqlite3.Error,OSError,ValueError) as exc:
+        if isinstance(exc,CollectionError) and exc.kind=="CONNECTION_RESET" and time.monotonic()-started>=45 and r["attempts"]>=2:
+            client.reconnect()
+            exc=CollectionError("RESPONSE_TIMEOUT","Repeated late connection reset; reduce member scope")
         handle_request_failure(db,client,r,exc,rid,probe)
         return {"ok":False,"pressure":getattr(exc,"kind","") in ("RATE_LIMITED","SERVER_UNAVAILABLE","HTTP_500_UNKNOWN","AUTH_ENDPOINT_ERROR","RESPONSE_TIMEOUT"),
                 "error":getattr(exc,"kind",type(exc).__name__),"delay":getattr(exc,"delay",0)}
@@ -1528,7 +1635,14 @@ class CollectionMonitor:
                     live.update(self.render(),refresh=True)
                     if self.snapshot and self.snapshot["run"]["state"]!="RUNNING":
                         break
-                    time.sleep(1)
+                    try:
+                        time.sleep(1)
+                    except KeyboardInterrupt:
+                        control=OICDatabase(DB_PATH)
+                        try:
+                            control.stop(self.rid)
+                        finally:
+                            control.close()
             console.print(self.render())
             return 0
         finally:
@@ -1585,7 +1699,16 @@ def run_worker(rid,worker):
             monitor.begin(r,captions.get((r["cube"],scope["hierarchy"]),scope["hierarchy"] or "YEAR TOTALS"))
             result=execute_resilient(db,client,r,rid,owner)
             saved=db.get_request(r["id"])
+            if saved and saved["status"] in ("COMMITTED","EMPTY"):
+                monitor.observe("EXPORTING EXCEL")
+                result["excel_saved"]=export_request_excel(db,saved)
             monitor.finish(result,saved["status"] if saved else "UNKNOWN")
+            delay=json.loads(r["scope_json"]).get("delay",1.0)
+            try:
+                wait_seconds(delay,lambda:stopped(db,rid))
+            except CollectionError:
+                final="STOPPED"
+                return 0
             if result.get("error")=="AUTH_COOKIE_EXPIRED":
                 monitor.observe("WAITING FOR CREDENTIAL")
                 log("WAITING FOR CREDENTIAL | update local .env")
@@ -1596,6 +1719,7 @@ def run_worker(rid,worker):
         final="STOPPED"
         return 0
     except KeyboardInterrupt:
+        db.stop(rid)
         final="STOPPED"
         return 130
     finally:
@@ -1889,7 +2013,7 @@ def prepare_from_collector(catalogs,collector_client,on_progress,stop_event,mode
             db.close()
 
 
-def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_event=None,mode="all"):
+def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_event=None,mode="all",settings=None):
     monitor=PrepareMonitor(on_progress=on_progress)
     client=None
     status="FAILED"
@@ -1906,7 +2030,7 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
     try:
         monitor.start()
         if mode=="plan":
-            ready=prepare_all(db,None,None,OUTPUT,log,emit=emit,catalogs=catalogs,mode=mode)
+            ready=prepare_all(db,None,None,OUTPUT,log,emit=emit,catalogs=catalogs,mode=mode,settings=settings)
             status="READY" if ready else "INCOMPLETE"
             return 0 if ready else 1
         if collector_client is None:
@@ -2028,7 +2152,7 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                     cooldown(profile,max(2**attempt,exc.delay,minimum),str(exc))
             raise RuntimeError("Discovery retry budget exhausted")
 
-        ready=prepare_all(db,transport,None,OUTPUT,log,emit=emit,catalogs=catalogs,mode=mode)
+        ready=prepare_all(db,transport,None,OUTPUT,log,emit=emit,catalogs=catalogs,mode=mode,settings=settings)
         status="READY" if ready else "INCOMPLETE"
         return 0 if ready else 1
     except CollectionError as exc:
@@ -2055,7 +2179,7 @@ def notify_collection_progress(db,rid,on_progress):
             log(f"Monitor update unavailable: {type(exc).__name__}")
 
 
-def run_extraction(db,workers,stop_event=None,on_progress=None):
+def run_extraction(db,workers=None,stop_event=None,on_progress=None):
     from oic_all_dim_prepare import PLANNER_VERSION,PLAN_POLICY,inventory_fingerprint,load_all_catalogs,matching_preparation
     catalogs=load_all_catalogs()
     prep=matching_preparation(db.conn,catalogs)
@@ -2066,10 +2190,16 @@ def run_extraction(db,workers,stop_event=None,on_progress=None):
             or summary.get("plan_policy")!=PLAN_POLICY
             or prep["catalog_hash"]!=inventory_fingerprint(catalogs)):
         raise RuntimeError("Saved plan is not the current web-only scope; run --prepare first")
+    settings=summary.get("plan_settings") or {}
+    if workers is None:
+        workers=settings.get("workers",DEFAULT_WORKERS)
+    if workers!=settings.get("workers"):
+        raise RuntimeError("Worker count differs from saved Job Plan; generate a matching plan")
     if db.all_work_finished(prep["id"]):
+        failed_exports=flush_pending_exports(db,prep["id"])
         progress=db.progress(prep["id"])
         log(f"No pending work | {progress}")
-        return int(any(k in progress for k in ("FAILED","NEEDS_REPREPARE")))
+        return int(bool(failed_exports) or any(k in progress for k in ("FAILED","NEEDS_REPREPARE")))
     rid=db.start_run(prep["id"],workers,min(workers,prep["concurrency"]),os.getpid(),psutil.Process().create_time())
     configure_log(OUTPUT/"runs"/rid/"run.log",console_output=on_progress is None)
     code=0
@@ -2092,6 +2222,11 @@ def run_extraction(db,workers,stop_event=None,on_progress=None):
         code=130
     finally:
         if shutdown_workers(db,rid,on_progress):
+            log("EXPORTING | checking pending Excel files")
+            failed_exports=flush_pending_exports(db,prep["id"])
+            if failed_exports and state=="COMPLETED":
+                state="PARTIAL"
+                code=1
             db.finish_run(rid,state)
         else:
             log("Workers still stopping; resume only after their processes exit")
@@ -2107,7 +2242,12 @@ def build_parser():
     group.add_argument("--refresh-members",action="store_true")
     group.add_argument("--job-plan",action="store_true")
     group.add_argument("--status",action="store_true")
-    parser.add_argument("--workers",type=int,default=DEFAULT_WORKERS)
+    group.add_argument("--export-only",action="store_true")
+    parser.add_argument("--workers",type=int,default=None)
+    parser.add_argument("--years-per-request",type=int,default=1)
+    parser.add_argument("--members-per-request",type=int,default=20)
+    parser.add_argument("--timeout",type=int,default=60)
+    parser.add_argument("--delay",type=float,default=1.0)
     group.add_argument("--monitor",action="store_true",help=argparse.SUPPRESS)
     parser.add_argument("--worker-id",type=int,help=argparse.SUPPRESS)
     parser.add_argument("--run-id",help=argparse.SUPPRESS)
@@ -2117,7 +2257,7 @@ def build_parser():
 def main():
     args=build_parser().parse_args()
     configure_log()
-    if not 1<=args.workers<=16:
+    if args.workers is not None and not 1<=args.workers<=16:
         raise RuntimeError("Worker count must be between 1 and 16")
     if args.monitor:
         if not args.run_id or args.worker_id is not None:
@@ -2146,7 +2286,16 @@ def main():
         try:
             db.initialize_schema()
             recover_old_runs(db)
-            return run_prepare(db,mode="members" if args.refresh_members else "plan" if args.job_plan else "all") if (args.prepare or args.refresh_members or args.job_plan) else run_extraction(db,args.workers)
+            if args.export_only:
+                from oic_all_dim_prepare import load_all_catalogs,matching_preparation
+                prep=matching_preparation(db.conn,load_all_catalogs())
+                if not prep:
+                    raise RuntimeError("No matching preparation")
+                return int(bool(flush_pending_exports(db,prep["id"])))
+            from oic_all_dim_prepare import plan_settings
+            settings=plan_settings(args.workers or DEFAULT_WORKERS,args.years_per_request,
+                                   args.members_per_request,args.timeout,args.delay)
+            return run_prepare(db,mode="members" if args.refresh_members else "plan" if args.job_plan else "all",settings=settings) if (args.prepare or args.refresh_members or args.job_plan) else run_extraction(db,args.workers)
         finally:
             db.close()
 

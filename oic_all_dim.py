@@ -533,6 +533,154 @@ def publish_credentials(expected,cookie,token):
         temporary.unlink(missing_ok=True)
 
 
+AUTH_STATUS_PATH=OUTPUT/"auth_status.json"
+AUTH_RETRY_PATH=OUTPUT/"auth_retry.flag"
+
+def auth_status():
+    try:
+        return json.loads(AUTH_STATUS_PATH.read_text(encoding="utf-8"))
+    except (OSError,ValueError):
+        return {}
+
+def auth_event(state,**fields):
+    # Auth events are published by the lock owner or the operation supervisor.
+    # Never put credential values or exception bodies in this file.
+    try:
+        OUTPUT.mkdir(parents=True,exist_ok=True)
+        data=auth_status()
+        data.update(state=state,updated_at=time.time(),**fields)
+        path=AUTH_STATUS_PATH.with_name("auth_"+uuid.uuid4().hex+".tmp")
+        try:
+            path.write_text(json.dumps(data),encoding="utf-8")
+            os.replace(path,AUTH_STATUS_PATH)
+        finally:
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+def auth_retry_requested():
+    if AUTH_RETRY_PATH.exists():
+        AUTH_RETRY_PATH.unlink(missing_ok=True)
+        return True
+    return False
+
+def is_session_error(exc):
+    if isinstance(exc,CollectionError):
+        return exc.kind=="AUTH_COOKIE_EXPIRED"
+    return any(marker in str(exc).upper() for marker in (
+        "SESSION_EXPIRED","SESSION EXPIRED","COOKIE SESSION EXPIRED",
+        "REDIRECTED TO LOGIN","OIC_COOKIE IS MISSING"))
+
+def run_auto_auth(stop=lambda:False,force=False,expected=None):
+    """Run the existing browser login once. GenToken capture is validated by the script."""
+    expected=credential_values() if expected is None else expected
+    with authentication_lock(stop):
+        current=credential_values()
+        if not force and current!=expected and current[0] and jwt_exp(current[1])>time.time()+60 and auth_status().get("expires")==jwt_exp(current[1]) and auth_status().get("cookie_status")=="VALID":
+            return current
+        script=PROJECT_ROOT/"oic_auth.py"
+        config=read_env()
+        if not script.is_file() or not config.get("USER") or not config.get("PASSWORD"):
+            raise CollectionError("AUTH_COOKIE_EXPIRED","Configure USER/PASSWORD and oic_auth.py")
+        auth_event("RELOGIN_RUNNING",cookie_status="CHECKING",last_error=None)
+        log("AUTH | Starting existing browser authentication",auth=True)
+        proc=subprocess.Popen([sys.executable,str(script)],cwd=str(PROJECT_ROOT),
+                              stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                              creationflags=getattr(subprocess,"CREATE_NEW_PROCESS_GROUP",0))
+        deadline=time.monotonic()+300
+        try:
+            while proc.poll() is None:
+                if stop():
+                    raise CollectionError("USER_STOP")
+                if time.monotonic()>=deadline:
+                    raise CollectionError("AUTH_COOKIE_EXPIRED","Browser authentication timed out")
+                time.sleep(.25)
+            if proc.returncode!=0:
+                raise CollectionError("AUTH_COOKIE_EXPIRED",f"Browser authentication exit {proc.returncode}")
+            cookie,token=credential_values()
+            if not cookie or jwt_exp(token)<=time.time()+60 or (cookie,token)==current:
+                raise CollectionError("AUTH_COOKIE_EXPIRED","Browser authentication produced no fresh credentials")
+            auth_event("IDLE",cookie_status="VALID",last_login=time.time(),last_check=time.time(),
+                       expires=jwt_exp(token),relogin_count=auth_status().get("relogin_count",0)+1,last_error=None)
+            log("AUTH | Browser login succeeded; shared credentials updated",auth=True)
+            return cookie,token
+        except (Exception,KeyboardInterrupt):
+            if proc.poll() is None:
+                # Stop the script and its own browser/driver children, not unrelated Chrome.
+                try:
+                    children=psutil.Process(proc.pid).children(recursive=True)
+                    for child in reversed(children):
+                        try:
+                            child.terminate()
+                        except psutil.Error:
+                            pass
+                except psutil.Error:
+                    pass
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            raise
+
+def recover_session(stop=lambda:False,on_wait=None,expected=None):
+    """Single-operation recovery, also used by supervisors after draining HTTP work."""
+    expected=credential_values() if expected is None else expected
+    AUTH_RETRY_PATH.unlink(missing_ok=True)
+    # An immediately rejected fresh browser session must not cause endless logins.
+    auto_attempt=time.time()-auth_status().get("last_login",0)>=60
+    while not stop():
+        try:
+            if not auto_attempt:
+                raise CollectionError("AUTH_COOKIE_EXPIRED","Recent login rejected; manual retry required")
+            return run_auto_auth(stop,expected=expected)
+        except (CollectionError,OSError) as exc:
+            if stop() or getattr(exc,"kind",None)=="USER_STOP":
+                auth_event("STOPPED",cookie_status="NOT CHECKED")
+                raise CollectionError("USER_STOP") from None
+            auth_event("WAITING_AUTH",cookie_status="REJECTED",last_error=getattr(exc,"kind",type(exc).__name__))
+            log("AUTH | Login failed; waiting for AUTO AUTH or STOP",auth=True)
+        while not stop():
+            if on_wait:
+                on_wait()
+            current=credential_values()
+            if current!=expected and current[0] and jwt_exp(current[1])>time.time()+60:
+                # A manual script may have supplied a new session; validate through GenToken.
+                try:
+                    return ensure_shared_auth("AH",stop,validate=True,allow_login=False)
+                except CollectionError:
+                    expected=current
+            if auth_retry_requested():
+                auto_attempt=True
+                break
+            time.sleep(.5)
+    auth_event("STOPPED",cookie_status="NOT CHECKED")
+    raise CollectionError("USER_STOP")
+
+def ensure_shared_auth(code="AH",stop=lambda:False,validate=False,allow_login=True,rejected_token=None):
+    """Use the existing curl GenToken client for every workflow."""
+    client=OICClient(stop=stop)
+    try:
+        client.set_cube({"cls":"MO" if code=="MV" else code})
+        try:
+            if not client.cookie:
+                raise CollectionError("AUTH_COOKIE_EXPIRED","Missing cookie")
+            if validate:
+                if rejected_token is None or client.token==rejected_token or jwt_exp(client.token)<=time.time()+60:
+                    client.refresh_token(rejected_token=client.token)
+            else:
+                client.ensure_token()
+            return client.cookie,client.token
+        except CollectionError as exc:
+            if not allow_login or not is_session_error(exc):
+                if not is_session_error(exc):
+                    auth_event("ERROR",cookie_status="NOT CHECKED",last_error=exc.kind)
+                raise
+            return recover_session(stop,expected=credential_values())
+    finally:
+        client.close()
+
 def jwt_exp(token):
     try:
         payload=token.removeprefix("Bearer ").split(".")[1]
@@ -611,7 +759,9 @@ def bounded_error_body(response):
 def classify_http(status,headers,endpoint="XMLA",body=b""):
     delay=max(5,retry_after(headers.get("Retry-After")))
     diagnostic=extract_error_details(body)
-    if status in (301,302,303,307,308) and endpoint=="GEN_TOKEN":
+    if diagnostic=="AUTH_COOKIE_EXPIRED":
+        kind="AUTH_COOKIE_EXPIRED"
+    elif status in (301,302,303,307,308) and endpoint=="GEN_TOKEN":
         kind="AUTH_COOKIE_EXPIRED"
     elif status==401:
         kind="ACCESS_DENIED" if endpoint=="GEN_TOKEN" else "AUTH_TOKEN_EXPIRED"
@@ -741,6 +891,7 @@ class OICClient:
                     and time.monotonic()-self.last_auth_check<SESSION_RECHECK_SECONDS):
                 return
             self.observe("AUTH REFRESH",stage_timeout=45)
+            auth_event("REFRESHING",cookie_status="CHECKING")
             if not self.cookie:
                 raise CollectionError("AUTH_COOKIE_EXPIRED","Set OIC_COOKIE in .env")
             expected=(self.cookie,self.env_token)
@@ -788,6 +939,10 @@ class OICClient:
                 self.reload_credentials(force=True)
                 if jwt_exp(self.token)<=time.time()+10:
                     raise CollectionError("AUTH_ENDPOINT_ERROR","Credential changed during refresh; retry with latest .env",5)
+            if not published and credential_values()==expected:
+                raise CollectionError("AUTH_ENDPOINT_ERROR","Could not publish renewed credentials",5)
+            auth_event("IDLE",cookie_status="VALID",last_refresh=time.time(),last_check=time.time(),
+                       expires=jwt_exp(self.token),refresh_count=auth_status().get("refresh_count",0)+1,last_error=None)
             log(f"AUTH | GenToken successful | JWT remaining {max(0,int(jwt_exp(self.token)-time.time()))}s | "+("shared .env updated" if published else "local credential retained"))
 
     def ensure_token(self):
@@ -1339,6 +1494,8 @@ def process_request(db,client,r,rid=None,owner=None):
                     raise CollectionError("USER_STOP")
                 time.sleep(0.5)
         try:
+            if rid:
+                client.auth_generation=db.auth_state(rid).get("generation",0)
             log(f"{r['cube']} | {r['id'][:12]} | REQUESTING X={len(scope['members'])} Y={len(scope['years'])} M={len(scope['measures'])}")
             _,metrics=client.execute_once(profile,r["payload"],r["timeout"],path)
         finally:
@@ -1346,6 +1503,9 @@ def process_request(db,client,r,rid=None,owner=None):
                 db.release_slot(owner)
         client.observe("PARSING")
         data=path.read_bytes()
+        diagnostic=extract_error_details(data)
+        if diagnostic in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","ACCESS_DENIED"):
+            raise CollectionError(diagnostic,"XMLA authentication rejected",endpoint="XMLA",http_status=200)
         db.register_response(r,path,digest(data),metrics)
         t=time.monotonic()
         parsed=parse_xmla(data,scope)
@@ -1393,18 +1553,24 @@ def process_request(db,client,r,rid=None,owner=None):
 def handle_request_failure(db,client,r,exc,rid,probe=False,late_reset=False):
     kind=exc.kind if isinstance(exc,CollectionError) else "UNKNOWN_ERROR"
     message=str(exc) if isinstance(exc,CollectionError) else type(exc).__name__
+    if kind in ("AUTH_ENDPOINT_ERROR","ACCESS_DENIED","AUTH_TOKEN_EXPIRED") and auth_status().get("state")=="REFRESHING":
+        auth_event("ERROR",cookie_status="NOT CHECKED",last_error=kind)
     log(f"{r['cube']} | {r['id'][:12]} | {message}")
     if probe:
         db.fail(r,message,"PROBE" if kind=="USER_STOP" else "PROBE_FAILED")
         return
     if kind=="USER_STOP":
         db.fail(r,message,"RETRY")
-    elif kind=="AUTH_COOKIE_EXPIRED":
-        db.fail(r,message,"RETRY",5)
+    elif kind=="AUTH_COOKIE_EXPIRED" and rid:
+        db.request_relogin(rid,getattr(client,"auth_generation",0))
+        db.auth_retry(r,message)
+    elif kind=="AUTH_TOKEN_EXPIRED" and exc.http_status==200 and r["attempts"]<MAX_ATTEMPTS:
+        # A successful HTTP status can contain an explicit expired-token SOAP fault.
+        client.token=""
+        db.fail(r,message,"RETRY",1)
     elif kind in ("ACCESS_DENIED","AUTH_TOKEN_EXPIRED"):
-        # Persistent rejection after bounded refresh requires user action.
-        db.fail(r,message,"RETRY",5)
-        db.stop(rid)
+        # Rejection after GenToken retry does not prove that a browser login is needed.
+        db.fail(r,message,"FAILED")
     elif kind in ("RATE_LIMITED","SERVER_UNAVAILABLE","HTTP_500_UNKNOWN","AUTH_ENDPOINT_ERROR"):
         minimum=min(120,5*(2**r["attempts"])) if kind in ("RATE_LIMITED","SERVER_UNAVAILABLE") else 5
         delay=max(minimum,exc.delay,2**r["attempts"])
@@ -1536,7 +1702,7 @@ def collection_snapshot(conn,rid):
         export={"status":"DEFERRED","requests":0,"total_requests":totals["committed"],"rows":0,"files":0}
     totals["excel_export"]=export
     workers=[dict(row) for row in conn.execute("SELECT * FROM oic_workers WHERE run=? ORDER BY worker",(rid,))]
-    return {"run":run,"totals":totals,"cubes":cubes,"workers":workers,"assignments":assignments}
+    return {"run":run,"totals":totals,"cubes":cubes,"workers":workers,"assignments":assignments,"auth":auth_status()}
 
 
 def worker_state_path(rid,worker):
@@ -1768,6 +1934,9 @@ class CollectionMonitor:
         pct=100*t["covered"]/max(1,t["planned"])
         status="STOPPING" if run["state"]=="RUNNING" and run["stop"] else "STARTING" if run["state"]=="RUNNING" and not run["barrier"] else run["state"]
         export=t["excel_export"]
+        auth=self.snapshot.get("auth",{})
+        if status=="RUNNING" and auth.get("state") in ("REFRESHING","RELOGIN_RUNNING","WAITING_AUTH"):
+            status=auth["state"]
         if export["status"]=="EXPORTING":
             status="EXPORTING"
         header=Text(f"OIC COLLECTION  |  LIVE MONITOR\n{status}  |  Run {self.rid[:12]}  |  Elapsed {elapsed_label(duration)}",
@@ -1775,6 +1944,7 @@ class CollectionMonitor:
         global_panel=Group(Text(f"Jobs {t['jobs_done']}/{t['jobs']}  |  Failed jobs {t['jobs_failed']}  |  Splits {t['splits']}"),
             Text(f"Cells {t['covered']:,}/{t['planned']:,}  |  {pct:.2f}%"),rich_progress(t["covered"],t["planned"]),
             Text(f"Saved requests {t['committed']}  |  Pending {t['pending']}  |  Running {t['running']}  |  Failed {t['failed']}"),
+            Text(f"AUTH {auth.get('state','IDLE')} | JWT remaining {max(0,int(jwt_exp(credential_values()[1])-time.time()))}s | Refreshes {auth.get('refresh_count',0)} | Re-logins {auth.get('relogin_count',0)}"),
             Text(f"Request attempts {t['attempts']} (plan lifetime)  |  {t['run_cells']/duration:,.0f} cells/s (this run)  |  Saved XML {t['committed_bytes']/1048576:.2f} MiB"),
             Text("Excel: deferred until collection stops" if export["status"]=="DEFERRED" else
                  f"Excel: {export['status']} | Requests {export['requests']}/{export['total_requests']} | Rows {export['rows']:,} | Files {export['files']}"+
@@ -1896,6 +2066,12 @@ def run_worker(rid,worker):
                 return 0
             time.sleep(0.25)
         while not stopped(db,rid):
+            auth=db.auth_state(rid)
+            if auth.get("state","IDLE")!="IDLE":
+                monitor.observe("WAITING AUTH")
+                time.sleep(.5)
+                continue
+            client.auth_generation=auth.get("generation",0)
             r=db.claim_next_request(rid,owner)
             if r is None:
                 monitor.observe("WAITING FOR WORK")
@@ -1915,13 +2091,6 @@ def run_worker(rid,worker):
             except CollectionError:
                 final="STOPPED"
                 return 0
-            if result.get("error")=="AUTH_COOKIE_EXPIRED":
-                monitor.observe("WAITING FOR CREDENTIAL")
-                log("WAITING FOR CREDENTIAL | update local .env")
-                while not stopped(db,rid):
-                    if client.reload_credentials():
-                        break
-                    time.sleep(2)
         final="STOPPED"
         return 0
     except KeyboardInterrupt:
@@ -2012,6 +2181,7 @@ def supervise_workers(db,rid,count,stop_event=None,on_progress=None):
     launch_deadlines={}
     next_log=0
     next_progress=0
+    next_auth_check=0
     while not stopped(db,rid):
         if stop_event is not None and stop_event.is_set():
             db.stop(rid)
@@ -2040,6 +2210,36 @@ def supervise_workers(db,rid,count,stop_event=None,on_progress=None):
             next_log=time.monotonic()+10
         if db.all_work_finished(run["prep"]):
             return
+        auth=db.auth_state(rid)
+        check_stop=lambda:stopped(db,rid) or (stop_event is not None and stop_event.is_set())
+        if auth.get("state")=="RELOGIN_REQUIRED" and not db.active_http_slots(rid):
+            db.set_auth_state(rid,"RELOGIN_RUNNING")
+            expected=credential_values()
+            def waiting():
+                db.set_auth_state(rid,"WAITING_AUTH")
+                notify_collection_progress(db,rid,on_progress)
+            try:
+                recover_session(check_stop,on_wait=waiting,expected=expected)
+                db.set_auth_state(rid,"IDLE",generation=auth.get("generation",0)+1)
+            except CollectionError as exc:
+                if exc.kind=="USER_STOP":
+                    db.stop(rid)
+                    return
+                raise
+        elif auth.get("state","IDLE")=="IDLE" and time.monotonic()>=next_auth_check:
+            next_auth_check=time.monotonic()+5
+            if jwt_exp(credential_values()[1])<=time.time()+TOKEN_REFRESH_MARGIN:
+                try:
+                    ensure_shared_auth("AH",check_stop,allow_login=False)
+                except CollectionError as exc:
+                    if exc.kind=="USER_STOP":
+                        db.stop(rid)
+                        return
+                    if is_session_error(exc):
+                        db.request_relogin(rid,auth.get("generation",0))
+                    else:
+                        auth_event("ERROR",last_error=exc.kind)
+                        next_auth_check=time.monotonic()+15
         time.sleep(0.5)
 
 
@@ -2232,12 +2432,16 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
             ready=prepare_all(db,None,None,OUTPUT,log,emit=emit,catalogs=catalogs,mode=mode,settings=settings)
             status="READY" if ready else "INCOMPLETE"
             return 0 if ready else 1
+        ensure_shared_auth("AH",check_stop)
         if collector_client is None:
             client=OICClient(periodic=False,stop=check_stop)
             if not client.cookie:
                 raise RuntimeError("Set OIC_COOKIE in local .env")
-        elif not collector_client.cookie_header():
-            raise RuntimeError("Set OIC_COOKIE in Main Collector")
+        else:
+            cookie,token=credential_values()
+            collector_client.session.cookies.clear()
+            collector_client.load_cookie(cookie)
+            collector_client.token=token
 
         health_checks={}
         unknown_streak=0
@@ -2323,6 +2527,16 @@ def run_prepare(db,catalogs=None,collector_client=None,on_progress=None,stop_eve
                     return data
                 except CollectionError as exc:
                     kind=exc.kind
+                    if is_session_error(exc):
+                        monitor.auth_status("WAITING_AUTH",kind)
+                        cookie,token=recover_session(check_stop)
+                        if client is not None:
+                            client.reload_credentials(force=True)
+                        else:
+                            collector_client.session.cookies.clear()
+                            collector_client.load_cookie(cookie)
+                            collector_client.token=token
+                        continue
                     if exc.endpoint=="LOCAL_CREDENTIALS":
                         monitor.auth_status("ERROR",kind)
                         raise
@@ -2399,6 +2613,7 @@ def run_extraction(db,workers=None,stop_event=None,on_progress=None):
         progress=db.progress(prep["id"])
         log(f"No pending work | {progress}")
         return int(bool(failed_exports) or any(k in progress for k in ("FAILED","NEEDS_REPREPARE")))
+    ensure_shared_auth("AH",stop_event.is_set if stop_event is not None else lambda:False)
     rid=db.start_run(prep["id"],workers,min(workers,prep["concurrency"]),os.getpid(),psutil.Process().create_time())
     configure_log(OUTPUT/"runs"/rid/"run.log",console_output=on_progress is None)
     code=0

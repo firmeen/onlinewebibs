@@ -1112,6 +1112,8 @@ def discover_webform_authorizations(
         allow_redirects=False,
     )
 
+    if response.status_code in (301,302,303,307,308) and "login" in response.headers.get("Location","").lower():
+        raise RuntimeError("SESSION_EXPIRED: redirected to login")
     if response.status_code in (
         301, 302, 303, 307, 308, 401, 403
     ):
@@ -1305,6 +1307,8 @@ def parse_webform_response(
         )
 
     payload = wrapper["d"]
+    if isinstance(payload,str) and payload.strip('" ')=="SESSION_EXPIRED":
+        raise RuntimeError("SESSION_EXPIRED")
 
     for _ in range(3):
         if not isinstance(payload, str):
@@ -1963,6 +1967,9 @@ def discover_xmla_metadata(
                 allow_redirects=False,
             )
 
+            from oic_all_dim import extract_error_details,CollectionError
+            if extract_error_details(response.content)=="AUTH_COOKIE_EXPIRED":
+                raise CollectionError("AUTH_COOKIE_EXPIRED","XMLA metadata session expired")
             if response.status_code != 200:
                 raise ValueError(
                     f"HTTP {response.status_code}"
@@ -2137,6 +2144,9 @@ def discover_fields(
             )
 
         except Exception as exc:
+            from oic_all_dim import is_session_error
+            if is_session_error(exc):
+                raise
             errors.append(
                 f"GET_MENUTEMPLATE_LIST: {exc}"
             )
@@ -2161,6 +2171,9 @@ def discover_fields(
             )
 
         except Exception as exc:
+            from oic_all_dim import is_session_error
+            if is_session_error(exc):
+                raise
             errors.append(
                 f"BindChangeTemplate: {exc}"
             )

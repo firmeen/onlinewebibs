@@ -3,3 +3,5 @@ rich>=13.7
 openpyxl>=3.1,<4
 curl_cffi>=0.11,<1
 psutil>=6,<8
+selenium
+python-dotenv

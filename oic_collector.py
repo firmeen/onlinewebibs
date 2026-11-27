@@ -2834,6 +2834,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                         id="save",
                     )
 
+                    yield Button("AUTO AUTH", id="auto_auth")
                     yield Button("QUERY DESIGNER", id="open_designer")
                     yield Button("LOAD ALL", id="load_all")
                     yield Button("REFRESH CATALOG", id="refresh_all_catalogs")
@@ -3186,6 +3187,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "\n"
                 f"Operation    {self.auth_operation}"
             )
+            from oic_all_dim import auth_status
+            auth=auth_status()
+            stamp=lambda key: datetime.fromtimestamp(auth[key]).strftime("%H:%M:%S") if auth.get(key) else "—"
+            jwt_content.append(f"\nAuto Refresh ENABLED | Count {auth.get('refresh_count',0)} | Last {stamp('last_refresh')}")
 
             self.query_one(
                 "#jwt_status",
@@ -3234,6 +3239,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "\n"
                 "Expiry       Server controlled"
             )
+            cookie_content.append(f"\nAuto Auth ENABLED | Re-logins {auth.get('relogin_count',0)} | Last {stamp('last_login')}")
 
             if self.cookie_message:
                 cookie_content.append(
@@ -3342,9 +3348,77 @@ def launch_terminal_ui(args, return_app: bool = False):
         # EXTERNAL .ENV WATCHER
         # ====================================================
 
-        def watch_env_file(self) -> None:
-            if self.busy or self.catalog_running or self.auth_check_running:
+        def action_auto_auth(self):
+            from oic_all_dim import AUTH_RETRY_PATH,auth_status
+            if self.busy or self.active_run is not None:
+                if auth_status().get("state")=="WAITING_AUTH":
+                    AUTH_RETRY_PATH.touch()
+                    self.info("AUTH | Retry requested")
                 return
+            if self.auth_check_running:
+                return
+            self.cancel_auth_timer()
+            self.stop_event.clear()
+            self.set_busy(True)
+            self.auto_auth_worker()
+
+        @work(thread=True,group="auto-auth",exclusive=True)
+        def auto_auth_worker(self):
+            from oic_all_dim import run_auto_auth,auth_event
+            error=None
+            try:
+                run_auto_auth(self.stop_event.is_set,force=True)
+            except Exception as exc:
+                error=getattr(exc,"kind",type(exc).__name__)
+                auth_event("ERROR",last_error=error,cookie_status="NOT CHECKED")
+            self.call_from_thread(self.auto_auth_finished,error)
+
+        def auto_auth_finished(self,error):
+            self.set_busy(False)
+            self.sync_runtime_credentials()
+            self.info("AUTH | "+("Login completed" if not error else error),"success" if not error else "warning")
+
+        def sync_runtime_credentials(self):
+            from oic_all_dim import credential_values,auth_status,jwt_exp
+            status=auth_status()
+            active=self.busy or self.active_run is not None or self.catalog_running
+            if active or not self.dirty:
+                signature=env_signature()
+                if signature!=self.last_env_signature:
+                    cookie,token=credential_values()
+                    self.last_cookie_value=cookie
+                    self.last_token_value=token
+                    self.active_token=token
+                    self.query_one("#cookie",Input).value=cookie
+                    self.query_one("#token",Input).value=token
+                    self.last_env_signature=signature
+                    self.dirty=False
+                    self.cookie_state="NOT CHECKED" if cookie else "MISSING"
+                if status.get("state") in ("REFRESHING","RELOGIN_RUNNING","WAITING_AUTH","ERROR","STOPPED"):
+                    self.auth_operation=status["state"]
+                    self.cookie_state=status.get("cookie_status","NOT CHECKED")
+                elif status.get("cookie_status")=="VALID" and status.get("expires")==jwt_exp(self.token_value()):
+                    self.cookie_state="VALID"
+                    self.auth_operation="IDLE"
+                    if status.get("last_check"):
+                        self.cookie_checked_at=datetime.fromtimestamp(status["last_check"]).strftime("%H:%M:%S")
+                    self.cookie_message="Shared authentication validated"
+                event=status.get("updated_at")
+                if event and event!=getattr(self,"last_auth_event",None):
+                    self.last_auth_event=event
+                    self.info("AUTH | "+status.get("state","IDLE"))
+            self.query_one("#auto_auth",Button).disabled=(self.auth_check_running or
+                (active and status.get("state")!="WAITING_AUTH"))
+            self.refresh_auth_cards()
+
+        def watch_env_file(self) -> None:
+            if self.auth_check_running:
+                return
+            if self.busy or self.catalog_running or self.active_run is not None:
+                self.sync_runtime_credentials()
+                return
+            if not self.dirty and env_signature()==self.last_env_signature:
+                self.sync_runtime_credentials()
 
             current_signature = (
                 env_signature()
@@ -3374,9 +3448,11 @@ def launch_terminal_ui(args, return_app: bool = False):
         # ====================================================
 
         def save_credentials(self) -> None:
-            if self.busy:
+            if self.busy or self.active_run is not None:
                 return
 
+            if not self.dirty:
+                self.sync_runtime_credentials()
             try:
                 token = self.token_value()
                 cookie = self.cookie_value()
@@ -3530,6 +3606,12 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             if not cookie:
                 self.auth_sequence += 1
+                from oic_all_dim import read_env as shared_env
+                config=shared_env()
+                if config.get("USER") and config.get("PASSWORD") and not getattr(self,"auto_start_attempted",False):
+                    self.auto_start_attempted=True
+                    self.action_auto_auth()
+                    return
 
                 self.cookie_state = "MISSING"
                 self.cookie_message = "Enter OIC_COOKIE"
@@ -3572,10 +3654,13 @@ def launch_terminal_ui(args, return_app: bool = False):
 
             client = None
             try:
-                client = OICClient(cookie=cookie,token="",timeout=45,retries=2)
-                token = client.request_token(
-                    "AH"
-                )
+                from oic_all_dim import authentication_lock,credential_values,auth_event,publish_credentials,jwt_exp,auth_status
+                with authentication_lock():
+                    expected=credential_values()
+                    client = OICClient(cookie=cookie,token="",timeout=45,retries=2)
+                    token = client.request_token("AH")
+                    if cookie==expected[0] and publish_credentials(expected,client.cookie_header(),token):
+                        auth_event("IDLE",cookie_status="VALID",expires=jwt_exp(token),last_check=time.time(),last_refresh=time.time(),refresh_count=auth_status().get("refresh_count",0)+1)
 
                 updated_cookie = (
                     client.cookie_header()
@@ -3680,8 +3765,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                     "Edit Cookie and retry"
                 )
 
-                # Intentionally do not exit.
-                # All editor controls stay enabled.
+                # A confirmed expired session can use the existing browser login once.
+                if isinstance(error,OICSessionExpired) and not getattr(self,"auto_start_attempted",False):
+                    self.auto_start_attempted=True
+                    self.action_auto_auth()
                 return
 
             # Session is accepted by GenToken.
@@ -3771,6 +3858,8 @@ def launch_terminal_ui(args, return_app: bool = False):
                 field=self.query_one("#"+button_id.split("_",1)[1],Input)
                 field.password=not field.password
                 event.button.label="SHOW" if field.password else "HIDE"
+            elif button_id=="auto_auth":
+                self.action_auto_auth()
             elif button_id=="run_queries":
                 if not self.busy and not self.catalog_running and not self.auth_check_running:
                     self.start_selected_query()
@@ -3826,8 +3915,8 @@ def launch_terminal_ui(args, return_app: bool = False):
         def action_start_collection(self) -> None:
             if self.busy or self.catalog_running or self.auth_check_running or self.query_one("#export_verified_catalog", Button).disabled:
                 return
-            if self.active_run is not None or self.cookie_state!="VALID":
-                self.info("Finish the active operation or enter a valid Cookie first.","warning")
+            if self.active_run is not None:
+                self.info("Finish the active operation first.","warning")
                 return
             self.save_credentials()
             self.cancel_auth_timer()
@@ -3868,6 +3957,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             state="STOPPING" if self.stop_event.is_set() or run["stop"] else "RUNNING" if run["barrier"] else "STARTING"
             if run["state"]!="RUNNING":
                 state=run["state"]
+            elif snapshot.get("auth",{}).get("state") in ("REFRESHING","RELOGIN_RUNNING","WAITING_AUTH"):
+                state=snapshot["auth"]["state"]
             export=t.get("excel_export",{})
             if export.get("status")=="EXPORTING":
                 state="EXPORTING"
@@ -4004,6 +4095,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 "refresh_all_catalogs",
                 "export_verified_catalog",
                 "open_designer",
+                "auto_auth",
                 "resume_run",
             ):
                 self.query_one(
@@ -4822,9 +4914,6 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.active_run is not None or self.query_one("#export_verified_catalog", Button).disabled):
                 self.info("Another operation is running.", "warning")
                 return
-            if mode!="plan" and self.cookie_state != "VALID":
-                self.info("Enter a valid Cookie before refreshing members.", "warning")
-                return
             missing = [key for key, (profile, catalog, fields) in self.catalog_snapshot.items()
                        if profile["availability"] != "NOT_AVAILABLE" and
                        (profile["availability"] != "AVAILABLE" or not catalog.get("web_scope_ready") or not fields)]
@@ -4835,8 +4924,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             try:
                 # The curl benchmark/extraction clients read the same existing
                 # .env. Persist the current UI credentials before the handoff.
-                update_env({"OIC_COOKIE": cookie, "OIC_BEARER_TOKEN": token,
-                            "OIC_OUTPUT_DIR": self.output_value()})
+                if mode!="plan":
+                    self.save_credentials()
                 self.last_env_signature = env_signature()
                 self.dirty = False
             except OSError:
@@ -4864,31 +4953,8 @@ def launch_terminal_ui(args, return_app: bool = False):
             try:
                 from oic_all_dim import (prepare_from_collector, authentication_lock,
                                          credential_values, publish_credentials, CollectionError, log)
-                expected = credential_values()
-
-                def credentials_changed(jwt, cookies):
-                    nonlocal expected
-                    if (cookies, jwt) != expected:
-                        try:
-                            with authentication_lock(self.stop_event.is_set):
-                                if not publish_credentials(expected, cookies, jwt):
-                                    raise CollectionError("AUTH_ENDPOINT_ERROR",
-                                        "Credentials changed externally; stop and reload .env",
-                                        endpoint="LOCAL_CREDENTIALS")
-                                expected = (cookies, jwt)
-                        except OSError:
-                            raise CollectionError("AUTH_ENDPOINT_ERROR",
-                                "Could not persist renewed credentials",
-                                endpoint="LOCAL_CREDENTIALS") from None
-                    self.call_from_thread(self.collection_auth_updated, jwt, cookies, False)
-
-                def prepare_client_log(message, level="info"):
-                    # GenToken details remain available in the file log only.
-                    log("AUTH | " + message, auth=True)
-
-                if mode!="plan":
-                    client = OICClient(cookie=cookie, token=token, stop_event=self.stop_event,
-                        on_auth=credentials_changed, on_log=prepare_client_log)
+                # Use the existing native curl discovery client; it publishes credentials under the shared lock.
+                # Plan-only mode remains fully offline.
                 result = prepare_from_collector(catalogs, client,
                     lambda event, **data: self.call_from_thread(self.prepare_progress, event, data),
                     self.stop_event,mode=mode)
@@ -5077,9 +5143,6 @@ def launch_terminal_ui(args, return_app: bool = False):
             if self.busy or self.active_run is not None or self.catalog_running or self.auth_check_running:
                 self.info("Another operation is running.","warning")
                 return
-            if self.cookie_state!="VALID":
-                self.info("Enter a valid Cookie; session validation is automatic.","warning")
-                return
             self.save_credentials()
             self.cancel_auth_timer()
             self.stop_event.clear()
@@ -5094,45 +5157,58 @@ def launch_terminal_ui(args, return_app: bool = False):
             snapshot=None
             try:
                 from oic_verify_fields import OICClient as VerifyClient, verify_saved_catalog, safe_error
+                from oic_all_dim import ensure_shared_auth,recover_session,is_session_error,credential_values
+                cookie,token=ensure_shared_auth("AH",self.stop_event.is_set)
                 client=VerifyClient(cookie,token)
+                client.shared_auth=True
+                client.auth_stop=self.stop_event.is_set
                 for phase in (("catalog","verify") if mode=="all" else (mode,)):
                     for code in QUERY_PROFILES:
                         for kind in CUBE_TYPES:
                             if self.stop_event.is_set():
                                 return
                             key=f"{code}/{kind}"
-                            try:
-                                if phase=="catalog":
-                                    self.call_from_thread(self.catalog_phase,"REFRESH CATALOG",key)
-                                    if jwt_info(client.token)["status"]!="VALID" or int(decode_jwt_payload(client.token).get("exp",0))<=time.time()+120:
-                                        client.refresh_token(code)
-                                    catalog=discover_fields(code,client.token,client.cookie,cube_type=kind)
-                                    current=load_web_catalog(code,kind)
-                                    self.call_from_thread(self.catalog_discovery_event,code,kind,current,None)
-                                    if any("incomplete XMLA metadata" in str(e) for e in catalog.get("errors",[])):
-                                        errors.append(key+" incomplete metadata")
-                                else:
-                                    self.call_from_thread(self.catalog_phase,"CHECK VERIFIED",key)
-                                    current=load_web_catalog(code,kind)
-                                    if not current.get("web_scope_ready"):
-                                        if cube_status(code,kind)["status"]=="NOT_AVAILABLE":
-                                            continue
-                                        raise ValueError("Missing web catalog; refresh first")
-                                    current=verify_saved_catalog(client,code,kind,current,
-                                        stop=self.stop_event.is_set,
-                                        progress=lambda n,total: self.call_from_thread(self.catalog_field_progress,key,n,total) if n==total or n%25==0 else None)
-                                    self.call_from_thread(self.catalog_discovery_event,code,kind,current,None)
-                            except Exception as exc:
-                                if self.stop_event.is_set():
-                                    return
-                                error=safe_error(exc,(cookie,token,client.cookie,client.token))
-                                if cube_status(code,kind)["status"]=="NOT_AVAILABLE" and not any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
-                                    self.call_from_thread(self.info,key+" | NOT AVAILABLE","warning")
-                                    continue
-                                errors.append(key+": "+error[:180])
-                                self.call_from_thread(self.catalog_discovery_event,code,kind,None,error[:180])
-                                if any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
-                                    return
+                            while not self.stop_event.is_set():
+                                try:
+                                    if phase=="catalog":
+                                        self.call_from_thread(self.catalog_phase,"REFRESH CATALOG",key)
+                                        if jwt_info(client.token)["status"]!="VALID" or int(decode_jwt_payload(client.token).get("exp",0))<=time.time()+120:
+                                            client.refresh_token(code)
+                                        catalog=discover_fields(code,client.token,client.cookie,cube_type=kind)
+                                        current=load_web_catalog(code,kind)
+                                        self.call_from_thread(self.catalog_discovery_event,code,kind,current,None)
+                                        if any("incomplete XMLA metadata" in str(e) for e in catalog.get("errors",[])):
+                                            errors.append(key+" incomplete metadata")
+                                    else:
+                                        self.call_from_thread(self.catalog_phase,"CHECK VERIFIED",key)
+                                        current=load_web_catalog(code,kind)
+                                        if not current.get("web_scope_ready"):
+                                            if cube_status(code,kind)["status"]=="NOT_AVAILABLE":
+                                                break
+                                            raise ValueError("Missing web catalog; refresh first")
+                                        current=verify_saved_catalog(client,code,kind,current,
+                                            stop=self.stop_event.is_set,
+                                            progress=lambda n,total: self.call_from_thread(self.catalog_field_progress,key,n,total) if n==total or n%25==0 else None)
+                                        self.call_from_thread(self.catalog_discovery_event,code,kind,current,None)
+                                except Exception as exc:
+                                    if self.stop_event.is_set():
+                                        return
+                                    if is_session_error(exc):
+                                        cookie,token=recover_session(self.stop_event.is_set)
+                                        client.close()
+                                        client=VerifyClient(cookie,token)
+                                        client.shared_auth=True
+                                        client.auth_stop=self.stop_event.is_set
+                                        continue
+                                    error=safe_error(exc,(cookie,token,client.cookie,client.token))
+                                    if cube_status(code,kind)["status"]=="NOT_AVAILABLE" and not any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
+                                        self.call_from_thread(self.info,key+" | NOT AVAILABLE","warning")
+                                        break
+                                    errors.append(key+": "+error[:180])
+                                    self.call_from_thread(self.catalog_discovery_event,code,kind,None,error[:180])
+                                    if any(x in error.upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
+                                        return
+                                break
                     if errors:
                         break
                 if mode in ("all","verify") and not self.stop_event.is_set() and not errors:
@@ -5146,7 +5222,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 if client is not None:
                     try:
                         if client.token and (client.token!=token or client.cookie!=cookie) and not any(x in " ".join(errors).upper() for x in ("SESSION_EXPIRED","SESSION EXPIRED","HTTP 401","HTTP 403")):
-                            self.call_from_thread(self.collection_auth_updated,client.token,client.cookie)
+                            self.call_from_thread(self.collection_auth_updated,client.token,client.cookie,False)
                     finally:
                         client.close()
                 try:
@@ -5252,6 +5328,10 @@ def launch_terminal_ui(args, return_app: bool = False):
                 )
             self.active_run = path
             self.last_run_path = path
+            for name in ("token","cookie","output"):
+                self.query_one("#"+name,Input).disabled=True
+            for name in ("save","reload","clear_token","clear_cookie"):
+                self.query_one("#"+name,Button).disabled=True
             self.query_one("#start", Button).disabled = True
             self.query_one("#stop", Button).disabled = False
             self.query_one("#force_stop", Button).disabled = False
@@ -5262,9 +5342,6 @@ def launch_terminal_ui(args, return_app: bool = False):
                 return
             if self.active_run is not None:
                 self.info("A batch is active. Stop or finish it before restarting.", "warning")
-                return
-            if self.cookie_state != "VALID" or jwt_info(self.token_value())["status"] != "VALID":
-                self.info("Validate Cookie and JWT before START.", "error")
                 return
             if not self.applied_queries:
                 self.info("APPLY at least one query before START.", "warning")
@@ -5310,9 +5387,6 @@ def launch_terminal_ui(args, return_app: bool = False):
                 return
             if self.active_run is not None:
                 self.info("Stop or finish the active batch before RESUME.", "warning")
-                return
-            if self.cookie_state != "VALID":
-                self.info("Validate Cookie session before RESUME.", "warning")
                 return
             root = resolve_output_path(self.output_value()).resolve()
             runs_dir = root / "Runs"
@@ -5383,6 +5457,7 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.info(f"Batch ended: {self.active_run.name} / {status}.", "success" if status == "COMPLETED" else "warning")
                 self.active_run = None
                 self.batch_process = None
+                self.set_busy(False)
                 self.query_one("#start", Button).disabled = False
                 self.query_one("#stop", Button).disabled = True
                 self.query_one("#force_stop", Button).disabled = True

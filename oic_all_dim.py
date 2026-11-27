@@ -1092,7 +1092,10 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
             counts=Counter(bases.values())
             for key,field in fields.items():
                 label=bases[key]
-                if not label or label==clean_caption((field.get("details") or {}).get("DATAFIELD")):
+                # A real source CAPTION may equal DATAFIELD (e.g. an acronym).
+                # Reject only a technical fallback when the source caption is absent.
+                if not label or (not clean_caption((field.get("details") or {}).get("CAPTION"))
+                                 and label==clean_caption((field.get("details") or {}).get("DATAFIELD"))):
                     raise RuntimeError("Missing display caption in saved OIC catalog")
                 if counts[label]>1:
                     folder=clean_caption(field.get("dimension"))

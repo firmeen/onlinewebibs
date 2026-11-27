@@ -1227,7 +1227,7 @@ class OICClient:
 
     def refresh_token(self) -> None:
         from oic_all_dim import ensure_shared_auth
-        ensure_shared_auth(self.auth_code,self.auth_stop,validate=True,allow_login=False)
+        ensure_shared_auth(self.auth_code,self.auth_stop,validate=True,allow_login=False,rejected_token=self.token)
         self.reload_shared()
 
     def execute(
@@ -4119,7 +4119,7 @@ def selected_worker(args) -> int:
                                         http=client.execute(req_path.read_bytes(),resp_path)
                                         break
                                     except Exception as auth_exc:
-                                        if not is_session_error(auth_exc):
+                                        if not is_session_error(auth_exc) or not attempt_id:
                                             raise
                                         state.update(status="WAITING_AUTH",auth_required=generation,auth_inflight=False)
                                         save_state()

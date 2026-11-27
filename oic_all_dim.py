@@ -128,11 +128,7 @@ class PrepareMonitor:
             self.live=Live(get_renderable=self.render,console=self.console,refresh_per_second=3,
                            transient=True,redirect_stdout=False,redirect_stderr=False,
                            vertical_overflow="ellipsis")
-            try:
-                self.live.start(refresh=True)
-            except Exception as exc:
-                self.live=None
-                LOGGER.warning("Rich worker display unavailable: %s",type(exc).__name__)
+            self.live.start(refresh=True)
 
     def add_event(self,message):
         with self.lock:
@@ -1244,7 +1240,8 @@ def worker_state_path(rid,worker):
 
 def read_worker_state(rid,worker):
     try:
-        return json.loads(worker_state_path(rid,worker).read_text(encoding="utf-8"))
+        state=json.loads(worker_state_path(rid,worker).read_text(encoding="utf-8"))
+        return state if isinstance(state,dict) else {}
     except (OSError,ValueError):
         return {}
 
@@ -1358,7 +1355,7 @@ class WorkerMonitor:
         monitor=self
         class Activity(logging.Handler):
             def emit(self,record):
-                if not getattr(record,"auth_event",False):
+                if not getattr(record,"auth_event",False) and not record.getMessage().startswith("AUTH |"):
                     monitor.event(record.getMessage())
         self.handler=Activity()
         LOGGER.addHandler(self.handler)
@@ -1366,7 +1363,11 @@ class WorkerMonitor:
         if console.is_terminal:
             self.live=Live(console=console,get_renderable=self.render,refresh_per_second=2,
                            screen=True,vertical_overflow="crop")
-            self.live.start(refresh=True)
+            try:
+                self.live.start(refresh=True)
+            except Exception as exc:
+                self.live=None
+                LOGGER.warning("Rich worker display unavailable: %s",type(exc).__name__)
 
     def stop(self,final):
         self.observe(final)
@@ -1493,7 +1494,9 @@ class CollectionMonitor:
                 values.append(f"{100*v['covered']/max(1,v['planned']):.1f}%" if v else "-")
             grid.add_row(c,*values)
         activity=Group(*(Text(f"{time.strftime('%H:%M:%S',time.localtime(ts))}  W{n:02}  {msg}") for ts,n,msg in sorted(events,reverse=True)[:5]))
-        footer=Text(f"Registered {len(registered)}/{run['workers']}  |  HTTP slots {sum(w['slot'] for w in registered.values())}/{run['allowed']}  |  Read-only SQLite / 1s refresh"
+        jwt_known=[s["jwt_expires_at"] for n,s in self.states.items() if s.get("jwt_expires_at") and n in registered and s.get("owner")==registered[n]["owner"]]
+        auth_note=f"JWT min remaining {max(0,int(min(jwt_known)-time.time()))}s" if jwt_known else "JWT expiry not observed"
+        footer=Text(f"Registered {len(registered)}/{run['workers']}  |  HTTP slots {sum(w['slot'] for w in registered.values())}/{run['allowed']}  |  {auth_note}  |  Read-only SQLite / 1s refresh"
                     +(f"  |  {self.error}" if self.error else ""))
         return Group(Panel(header,border_style="cyan"),Panel(global_panel,title="01 / GLOBAL PROGRESS"),
                      Panel(workers,title="02 / ACTIVE WORKERS"),Panel(grid,title="03 / CUBE COVERAGE"),
@@ -1638,12 +1641,16 @@ def launch_worker_tabs(rid,workers,include_monitor=False):
         raise RuntimeError(f"Windows Terminal launcher exited {result.returncode}")
 
 
-def wait_workers_ready(db,rid,count,stop_event=None):
+def wait_workers_ready(db,rid,count,stop_event=None,on_progress=None):
     end=time.monotonic()+STARTUP_TIMEOUT
+    next_progress=0
     while time.monotonic()<end:
         if stop_event is not None and stop_event.is_set():
             db.stop(rid)
             return
+        if on_progress is not None and time.monotonic()>=next_progress:
+            notify_collection_progress(db,rid,on_progress)
+            next_progress=time.monotonic()+1
         rows=db.workers(rid)
         if len(rows)==count and all(w["status"]=="READY" and process_alive(w["pid"],w["created"]) for w in rows):
             db.barrier(rid)
@@ -1702,10 +1709,14 @@ def supervise_workers(db,rid,count,stop_event=None,on_progress=None):
         time.sleep(0.5)
 
 
-def shutdown_workers(db,rid):
+def shutdown_workers(db,rid,on_progress=None):
     db.stop(rid)
     deadline=time.monotonic()+630
+    next_progress=0
     while time.monotonic()<deadline:
+        if on_progress is not None and time.monotonic()>=next_progress:
+            notify_collection_progress(db,rid,on_progress)
+            next_progress=time.monotonic()+1
         live=[w for w in db.workers(rid) if process_alive(w["pid"],w["created"])]
         if not live:
             break
@@ -2062,7 +2073,7 @@ def run_extraction(db,workers,stop_event=None,on_progress=None):
     try:
         notify_collection_progress(db,rid,on_progress)
         launch_worker_tabs(rid,list(range(1,workers+1)),include_monitor=True)
-        wait_workers_ready(db,rid,workers,stop_event)
+        wait_workers_ready(db,rid,workers,stop_event,on_progress)
         supervise_workers(db,rid,workers,stop_event,on_progress)
         progress=db.progress(prep["id"])
         if stopped(db,rid):
@@ -2076,7 +2087,7 @@ def run_extraction(db,workers,stop_event=None,on_progress=None):
         state="STOPPED"
         code=130
     finally:
-        if shutdown_workers(db,rid):
+        if shutdown_workers(db,rid,on_progress):
             db.finish_run(rid,state)
         else:
             log("Workers still stopping; resume only after their processes exit")

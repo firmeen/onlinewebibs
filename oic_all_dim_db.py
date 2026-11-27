@@ -453,11 +453,17 @@ class OICDatabase:
                 owner=NULL,lease=NULL,expires=NULL WHERE id=?""",
                 (status,str(error)[:500],time.time()+delay,r["id"]))
 
-    def activate_recovery_requests(self,r,error):
+    def activate_recovery_requests(self,r,error,children=None):
         with self.transaction():
             self._fence(r)
-            children=self.conn.execute("SELECT count(*) FROM oic_requests WHERE parent=? AND status='STANDBY'",(r["id"],)).fetchone()[0]
-            if children!=2:
+            if children:
+                self.conn.executemany("""INSERT OR IGNORE INTO oic_requests
+                    (id,prep,job,cube,parent,scope_json,mdx,payload,payload_hash,timeout,potential_cells,status)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?, 'STANDBY')""",
+                    [(c["id"],c["prep"],c["job"],c["cube"],c["parent"],canonical(c["scope"]),
+                      c["mdx"],c["payload"],digest(c["payload"]),c["timeout"],c["potential_cells"]) for c in children])
+            rows=self.conn.execute("SELECT potential_cells FROM oic_requests WHERE parent=? AND status='STANDBY'",(r["id"],)).fetchall()
+            if len(rows)!=2 or sum(row[0] for row in rows)!=r["potential_cells"]:
                 return False
             self.conn.execute("UPDATE oic_requests SET status='PENDING' WHERE parent=? AND status='STANDBY'",(r["id"],))
             self.conn.execute("UPDATE oic_requests SET status='REPLACED',error=?,owner=NULL,lease=NULL,expires=NULL WHERE id=?",

@@ -1048,6 +1048,8 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
     files=[]
     wb=sheet=None
     part_rows=0
+    current_cube=None
+    missing_members=0
     last_report=0.0
 
     def report(status,error=None):
@@ -1070,14 +1072,93 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
         from openpyxl.cell import WriteOnlyCell
         root.mkdir(parents=True,exist_ok=True)
         staging.mkdir()
-        measures=sorted({m for (raw,) in db.conn.execute("SELECT scope_json FROM oic_jobs WHERE prep=?",(prep,))
-                         for m in json.loads(raw)["measures"]})
-        headers=["CATEGORY","YEAR_TYPE","CUBE","HIERARCHY","YEAR","YEAR_UNIQUE_NAME",
-                 "MEMBER","MEMBER_UNIQUE_NAME","REQUEST_ID","SOURCE_UPDATE",*measures]
-        if len(headers)>16384:
-            raise RuntimeError("Combined measure columns exceed Excel column limit")
-        captions={(cube,hierarchy,name):caption for cube,hierarchy,name,caption in db.conn.execute(
-            "SELECT cube,hierarchy,unique_name,caption FROM oic_members WHERE prep=?",(prep,))}
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from oic_all_dim_prepare import classify_fields
+        from collections import Counter
+
+        # Resolve display labels from the saved web catalog only, never expose MDX.
+        def clean_caption(value):
+            text=str(value or "").strip()
+            if not text or text=="(unnamed)" or re.search(r"\]\s*\.\s*&?\[",text):
+                return ""
+            return " ".join(text.split())
+
+        def field_labels(fields,reserved=()):
+            labels={}
+            used=set(reserved)
+            bases={key:clean_caption((field.get("details") or {}).get("CAPTION"))
+                   or clean_caption(field.get("caption")) or clean_caption(field.get("display"))
+                   for key,field in fields.items()}
+            counts=Counter(bases.values())
+            for key,field in fields.items():
+                label=bases[key]
+                # A real source CAPTION may equal DATAFIELD (e.g. an acronym).
+                # Reject only a technical fallback when the source caption is absent.
+                if not label or (not clean_caption((field.get("details") or {}).get("CAPTION"))
+                                 and label==clean_caption((field.get("details") or {}).get("DATAFIELD"))):
+                    raise RuntimeError("Missing display caption in saved OIC catalog")
+                if counts[label]>1:
+                    folder=clean_caption(field.get("dimension"))
+                    if folder and re.search(r"[\u0e00-\u0e7f]",folder):
+                        label=f"{label} ({folder})"
+                base=label
+                n=2
+                while label in used:
+                    label=f"{base} ({n})"
+                    n+=1
+                used.add(label)
+                labels[key]=label
+            return labels
+
+        # Preserve catalog sequence; include only measures present in the plan.
+        fields_by_cube={}
+        for cube,raw in db.conn.execute("SELECT cube,field_json FROM oic_fields WHERE prep=? ORDER BY cube,field_id",(prep,)):
+            fields_by_cube.setdefault(cube,[]).append(json.loads(raw))
+        planned={}
+        for cube,raw in db.conn.execute("SELECT cube,scope_json FROM oic_jobs WHERE prep=?",(prep,)):
+            scope=json.loads(raw)
+            item=planned.setdefault(cube,{"measures":set(),"dimensions":set()})
+            item["measures"].update(scope["measures"])
+            if scope["hierarchy"]:
+                item["dimensions"].add(scope["hierarchy"])
+        active={row[0] for row in db.conn.execute("SELECT DISTINCT cube FROM oic_requests WHERE prep=? AND status IN ('COMMITTED','EMPTY')",(prep,))}
+        cube_schema={}
+        def order(field):
+            try:
+                return int(field.get("seq") or (field.get("details") or {}).get("SEQ") or 0)
+            except (ValueError,TypeError):
+                return 0
+        for cube in sorted(active):
+            dims,measures=classify_fields(fields_by_cube.get(cube,[]))
+            requested=planned[cube]
+            if not requested["measures"].issubset(measures) or not requested["dimensions"].issubset(dims):
+                raise RuntimeError(f"Saved catalog is incomplete for {cube}")
+            selected={m:measures[m] for m in sorted(requested["measures"],key=lambda m:(order(measures[m]),m))}
+            dimensions={h:dims[h] for h in sorted(requested["dimensions"],key=lambda h:(order(dims[h]),h))}
+            columns=field_labels(selected,("ปี","มุมมอง","รายการ"))
+            headers=["ปี","มุมมอง","รายการ",*columns.values()]
+            if len(headers)>16384:
+                raise RuntimeError(f"Excel column limit exceeded for {cube}")
+            cube_schema[cube]=(list(selected),field_labels(dimensions,("ภาพรวม",)),headers)
+        captions={}
+        for cube,hierarchy,name,caption,metadata in db.conn.execute(
+                "SELECT cube,hierarchy,unique_name,caption,metadata_json FROM oic_members WHERE prep=?",(prep,)):
+            item=json.loads(metadata)
+            captions[(cube,hierarchy,name)]="รวมทั้งหมด" if item.get("is_all_member") else clean_caption(caption)
+
+        def member_caption(cube,hierarchy,name,axis_captions):
+            nonlocal missing_members
+            label=captions.get((cube,hierarchy,name)) or axis_captions.get(name)
+            if not label:
+                missing_members+=1
+                return "ไม่ระบุ"
+            return label
+
+        def raw_captions(data):
+            # XMLA captions are a display-only fallback when inventory lacks one.
+            return {node.findtext(f"{{{MD_NS}}}UName"):clean_caption(node.findtext(f"{{{MD_NS}}}Caption"))
+                    for node in ET.fromstring(data).iter(f"{{{MD_NS}}}Member")
+                    if node.findtext(f"{{{MD_NS}}}UName")}
 
         def value(raw):
             if raw is None:
@@ -1092,35 +1173,62 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
                         return number
             except (InvalidOperation,OverflowError,ValueError):
                 pass
+            # Preserve values beyond Excel's 15-digit precision as plain text.
+            try:
+                if d.is_finite() and abs(d.adjusted())<300:
+                    return format(d,"f")
+            except (NameError,ValueError,OverflowError):
+                pass
             return str(raw)
 
-        def append(target,items):
+        def append(target,items,header=False):
             cells=[]
             for item in items:
+                if item is None:
+                    cells.append(None)
+                    continue
+                cell=WriteOnlyCell(target,value=item)
                 if isinstance(item,str):
-                    cell=WriteOnlyCell(target,value=item)
                     cell.data_type="s"
-                    cells.append(cell)
-                else:
-                    cells.append(item)
+                elif isinstance(item,(int,float)) and not header:
+                    cell.number_format="0.###############" if isinstance(item,float) else "0"
+                if header:
+                    cell.font=Font(bold=True,color="FFFFFF")
+                    cell.fill=PatternFill("solid",fgColor="17365D")
+                    cell.alignment=Alignment(vertical="center",wrap_text=True)
+                cells.append(cell)
             target.append(cells)
 
-        def begin_part():
-            nonlocal wb,sheet,part_rows
-            wb=Workbook(write_only=True)
-            sheet=wb.create_sheet("DATA")
-            append(sheet,headers)
+        from openpyxl.utils import get_column_letter
+        year_types={"FY":"ปีบัญชี","UY":"ปีรับประกัน","AY":"ปีอุบัติเหตุ"}
+
+        def finish_sheet():
+            nonlocal sheet
+            if sheet is not None:
+                last_col=get_column_letter(len(cube_schema[current_cube][2]))
+                sheet.auto_filter.ref=f"A1:{last_col}{part_rows+1}"
+                sheet.close()
+                sheet=None
+
+        def begin_sheet(cube):
+            nonlocal wb,sheet,part_rows,current_cube
+            if wb is None:
+                wb=Workbook(write_only=True)
+            category,kind=cube.split("/")
+            sheet=wb.create_sheet(f"{category} {year_types[kind]}")
+            current_cube=cube
             part_rows=0
+            sheet.freeze_panes="A2"
+            sheet.row_dimensions[1].height=34
+            headers=cube_schema[cube][2]
+            for idx,label in enumerate(headers,1):
+                sheet.column_dimensions[get_column_letter(idx)].width=12 if idx==1 else 28 if idx<=3 else min(36,max(18,len(label)*0.85))
+            append(sheet,headers,header=True)
 
         def save_part():
             nonlocal wb,sheet
+            finish_sheet()
             path=staging/f"OIC_DATA_{len(files)+1:03d}.xlsx"
-            info=wb.create_sheet("INFO")
-            for key,item in (("PREPARATION",prep),("PART",len(files)+1),("ROWS",part_rows),
-                             ("COMMITTED_REQUESTS",total),("DATA_TYPE","OLAP AGGREGATE"),
-                             ("NOTICE","Do not sum All members with detail members"),
-                             ("SCOPE","Committed requests only; may be partial collection")):
-                append(info,[key,item])
             wb.save(path)
             wb.close()
             wb=sheet=None
@@ -1129,7 +1237,9 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
         requests=db.conn.execute("""SELECT r.id,r.cube,r.scope_json,r.response_path,r.response_hash
             FROM oic_requests r JOIN oic_jobs j ON j.prep=r.prep AND j.id=r.job
             WHERE r.prep=? AND r.status IN ('COMMITTED','EMPTY')
-            ORDER BY json_extract(j.scope_json,'$.job_index'),
+            ORDER BY CASE substr(r.cube,1,2) WHEN 'AH' THEN 1 WHEN 'FI' THEN 2 WHEN 'MR' THEN 3 WHEN 'MI' THEN 4 WHEN 'MV' THEN 5 ELSE 6 END,
+                     CASE substr(r.cube,4) WHEN 'FY' THEN 1 WHEN 'UY' THEN 2 WHEN 'AY' THEN 3 ELSE 4 END,
+                     json_extract(j.scope_json,'$.job_index'),
                      json_extract(r.scope_json,'$.year_offset'),
                      json_extract(r.scope_json,'$.member_offset'),r.id""",(prep,))
         for r in requests:
@@ -1146,17 +1256,28 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
             for idx,(member,measure) in enumerate(axes):
                 for yi,year in enumerate(years):
                     grouped.setdefault((year,member),{})[measure]=value(cells.get(idx*len(years)+yi,(None,None))[0])
-            category,kind=r["cube"].split("/")
+            cube=r["cube"]
+            measures,dimensions,_=cube_schema[cube]
+            hierarchy=scope["hierarchy"]
+            axis_captions={}
+            if any(not captions.get((cube,scope["year_hierarchy"],year)) for year in years) or (
+                    hierarchy and any(not captions.get((cube,hierarchy,member)) for member in scope["members"])):
+                axis_captions=raw_captions(data)
             for (year,member),values in grouped.items():
                 if wb is None:
-                    begin_part()
+                    begin_sheet(cube)
+                elif current_cube!=cube:
+                    finish_sheet()
+                    begin_sheet(cube)
                 elif part_rows>=EXCEL_DATA_ROWS:
                     save_part()
-                    begin_part()
-                append(sheet,[category,kind,r["cube"],scope["hierarchy"],
-                    captions.get((r["cube"],scope["year_hierarchy"],year)) or year,year,
-                    captions.get((r["cube"],scope["hierarchy"],member)) or member,member,
-                    r["id"],updated,*[values.get(m) for m in measures]])
+                    begin_sheet(cube)
+                year_label=member_caption(cube,scope["year_hierarchy"],year,axis_captions)
+                if re.fullmatch(r"[0-9]{4}",year_label):
+                    year_label=int(year_label)
+                view=dimensions[hierarchy] if hierarchy else "ภาพรวม"
+                member_label=member_caption(cube,hierarchy,member,axis_captions) if hierarchy else "รวมทั้งหมด"
+                append(sheet,[year_label,view,member_label,*[values.get(m) for m in measures]])
                 part_rows+=1
                 rows_written+=1
             done+=1
@@ -1174,6 +1295,8 @@ def export_consolidated_excel(db,prep,rid=None,on_progress=None):
         for path in root.glob("OIC_DATA_*.xlsx"):
             if re.fullmatch(r"OIC_DATA_\d{3,}\.xlsx",path.name) and path.name not in names:
                 path.unlink()
+        if missing_members:
+            log(f"EXCEL | {missing_members:,} missing display captions shown as ไม่ระบุ")
         report("SAVED")
         log(f"EXCEL SAVED | {len(files)} file(s) | {rows_written:,} rows | {root}")
         return 0

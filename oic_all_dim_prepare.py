@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import itertools
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import json
 import math
@@ -214,7 +215,7 @@ def deduplicate_members(rows, hierarchy):
 
 
 def raise_if_fatal(exc):
-    if getattr(exc,"kind","") in ("AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","AUTH_ENDPOINT_ERROR",
+    if getattr(exc,"kind","") in ("USER_STOP","AUTH_COOKIE_EXPIRED","AUTH_TOKEN_EXPIRED","AUTH_ENDPOINT_ERROR",
                                   "ACCESS_DENIED","TLS_ERROR","RATE_LIMITED","SERVER_UNAVAILABLE",
                                   "DISK_FULL","STORAGE_ERROR","NETWORK_ERROR","DNS_ERROR","CONNECTION_RESET"):
         raise exc
@@ -671,8 +672,17 @@ def generate_request_plan(db,prep,job,cube,profile,scope,adaptive,emit=None):
     return n
 
 
-def prepare_all(db,transport,probe,output,log,emit=None):
-    catalogs=load_all_catalogs(emit=emit)
+def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
+    if catalogs is None:
+        catalogs=load_all_catalogs(emit=emit)
+    else:
+        # The caller owns a stable local catalog snapshot. Resolve mutable
+        # year/profile fields on a private copy, never on the UI's cache.
+        catalogs=deepcopy(catalogs)
+        for cube,(profile,catalog,fields) in catalogs.items():
+            emit_event(emit,"catalog",cube=cube,source=catalog.get("source") or "UNKNOWN",
+                       fields=len(fields),availability=profile["availability"])
+        log("CATALOG | Existing in-memory snapshot reused")
     emit_event(emit,"phase",phase="CATALOG",detail="Checking preparation snapshot")
     fingerprint=digest([PLANNER_VERSION,catalogs])
     current=db.preparation(fingerprint)
@@ -775,6 +785,8 @@ def prepare_all(db,transport,probe,output,log,emit=None):
                         hierarchy_meta.get(h.casefold(),{}),levels_by_h.get(h.casefold(),[]),count,emit)
                     log(f"{cube} {h} | MEMBERS {len(members)}")
                 except (ValueError,RuntimeError) as exc:
+                    if getattr(exc,"kind","")=="USER_STOP":
+                        raise
                     db.mark_discovery_failure(prep,cube,h,str(exc)[:300])
                     raise_if_fatal(exc)
                     errors.append(f"{cube} {h}: {str(exc)[:200]}")

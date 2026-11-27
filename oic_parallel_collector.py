@@ -1159,6 +1159,8 @@ class OICClient:
     ):
 
         self.profile = QUERY_PROFILES[code]
+        self.auth_code = code
+        self.auth_stop = lambda: False
         self.worker_id = worker_id
 
         self.token = token.removeprefix(
@@ -1186,6 +1188,7 @@ class OICClient:
             "Cookie:"
         ).strip()
 
+        self.shared_cookie=cookie
         for part in cookie.split(";"):
 
             name, separator, value = (
@@ -1209,90 +1212,23 @@ class OICClient:
             f"?Class={self.profile['cls']}"
         )
 
+    def reload_shared(self):
+        from oic_all_dim import credential_values
+        cookie,token=credential_values()
+        if cookie!=self.shared_cookie:
+            self.session.cookies.clear()
+            hostname=urlparse(BASE_URL).hostname
+            for part in cookie.split(";"):
+                name,sep,value=part.strip().partition("=")
+                if sep and name:
+                    self.session.cookies.set(name.strip(),value.strip(),domain=hostname,path="/",secure=True)
+            self.shared_cookie=cookie
+        self.token=token
+
     def refresh_token(self) -> None:
-
-        log(
-            "Refreshing Bearer JWT via GenToken",
-            self.worker_id,
-        )
-
-        payload = {
-            "_tk": "Init",
-            "_pageUrl": (
-                f"{PAGE_PATH}"
-                f"?Class={self.profile['cls']}"
-            ),
-        }
-
-        response = self.session.post(
-            TOKEN_URL,
-            json=payload,
-            headers={
-                "Accept": (
-                    "application/json, text/javascript, "
-                    "*/*; q=0.01"
-                ),
-                "Content-Type": (
-                    "application/json; charset=UTF-8"
-                ),
-                "X-Requested-With": "XMLHttpRequest",
-                "Origin": BASE_URL,
-                "Referer": self.referer(),
-            },
-            timeout=(15, 45),
-            allow_redirects=False,
-        )
-
-        if response.status_code != 200:
-
-            raise RuntimeError(
-                f"GenToken HTTP {response.status_code}"
-            )
-
-        try:
-            token = response.json().get(
-                "d",
-                "",
-            )
-
-        except ValueError as exc:
-
-            raise RuntimeError(
-                "Invalid GenToken JSON response"
-            ) from exc
-
-        if token == "SESSION_EXPIRED":
-
-            raise RuntimeError(
-                "Cookie session expired"
-            )
-
-        if not isinstance(token, str):
-
-            raise RuntimeError(
-                "GenToken did not return a JWT"
-            )
-
-        token = token.removeprefix(
-            "Bearer "
-        ).strip()
-
-        if (
-            jwt_exp(token)
-            <= int(time.time()) + 30
-        ):
-
-            raise RuntimeError(
-                "GenToken returned expired or invalid JWT"
-            )
-
-        self.token = token
-
-        log(
-            "Bearer JWT refreshed successfully",
-            self.worker_id,
-            "OK",
-        )
+        from oic_all_dim import ensure_shared_auth
+        ensure_shared_auth(self.auth_code,self.auth_stop,validate=True,allow_login=False)
+        self.reload_shared()
 
     def execute(
         self,
@@ -1300,6 +1236,7 @@ class OICClient:
         destination: Path,
     ) -> dict:
 
+        self.reload_shared()
         if (
             jwt_exp(self.token)
             <= int(time.time()) + 60
@@ -1375,6 +1312,11 @@ class OICClient:
                         missing_ok=True
                     )
 
+                from oic_all_dim import extract_error_details,CollectionError
+                with destination.open("rb") as raw:
+                    diagnostic=extract_error_details(raw.read(65536))
+                if diagnostic=="AUTH_COOKIE_EXPIRED":
+                    raise CollectionError(diagnostic,"XMLA session expired")
                 return {
                     "http_status": response.status_code,
                     "content_type": response.headers.get(
@@ -4036,6 +3978,7 @@ def selected_worker(args) -> int:
         return (stop_file.exists() or batch_stop.exists()
                 or bool(cancel_file and cancel_file.exists()))
     shared_cooldown = run_dir.parent / "cooldown.json"
+    auth_path=run_dir/"auth.json"
     def wait_for_server():
         while not stop_requested():
             info = read_json(shared_cooldown, {}) or {}
@@ -4109,6 +4052,7 @@ def selected_worker(args) -> int:
         client = OICClient(cookie=cookie, token=env.get("OIC_BEARER_TOKEN", ""),
                            timeout=int(config.get("timeout", 60)),
                            max_response_mb=100, worker_id=worker_id, code=code)
+        client.auth_stop=stop_requested
         state["status"] = "RUNNING"
         state["last_message"] = "HTTP session ready"
         save_state()
@@ -4156,7 +4100,36 @@ def selected_worker(args) -> int:
                                          last_http=None, requests_total=state["requests_total"] + 1)
                             save_state()
                             try:
-                                http = client.execute(req_path.read_bytes(), resp_path)
+                                from oic_all_dim import is_session_error,CollectionError
+                                while not stop_requested():
+                                    auth=read_json(auth_path,{}) or {}
+                                    generation=auth.get("generation",0)
+                                    if auth.get("state","IDLE")!="IDLE":
+                                        state.update(status="WAITING_AUTH",auth_inflight=False)
+                                        save_state()
+                                        time.sleep(.5)
+                                        continue
+                                    state.update(status="RUNNING",auth_inflight=True,auth_required=None)
+                                    save_state()
+                                    if (read_json(auth_path,{}) or {}).get("state","IDLE")!="IDLE":
+                                        state["auth_inflight"]=False
+                                        save_state()
+                                        continue
+                                    try:
+                                        http=client.execute(req_path.read_bytes(),resp_path)
+                                        break
+                                    except Exception as auth_exc:
+                                        if not is_session_error(auth_exc):
+                                            raise
+                                        state.update(status="WAITING_AUTH",auth_required=generation,auth_inflight=False)
+                                        save_state()
+                                        while not stop_requested() and (read_json(auth_path,{}) or {}).get("generation",0)==generation:
+                                            time.sleep(.5)
+                                    finally:
+                                        state["auth_inflight"]=False
+                                        save_state()
+                                if stop_requested():
+                                    break
                             finally:
                                 duration = (time.monotonic() - request_started) * 1000
                                 state["last_request_ms"] = round(duration, 2)
@@ -4419,6 +4392,7 @@ def prepare_worker_tabs(config: dict, run_dir: Path, config_path: Path,
                     raise RuntimeError(f"Worker {wid:02d} from a prior attempt is still running")
             finally:
                 proc.close()
+    write_json(run_dir/"auth.json",{"state":"IDLE","generation":0})
     for wid in range(1, worker_count + 1):
         directory = run_dir / f"worker_{wid:02d}"
         directory.mkdir(parents=True, exist_ok=True)
@@ -4436,6 +4410,9 @@ def prepare_worker_tabs(config: dict, run_dir: Path, config_path: Path,
 def wait_for_query_workers(config: dict, run_dir: Path, attempt_id: str, *,
                            control_dir: Path, on_tick=None, on_stopping=None) -> None:
     """Supervise actual Python process handles, never the wt.exe launcher."""
+    from oic_all_dim import recover_session,ensure_shared_auth,is_session_error,credential_values,CollectionError,auth_event
+    auth_path=run_dir/"auth.json"
+    next_auth_check=0
     pending = set(range(1, int(config["workers"]) + 1))
     handles = {}
     launch_deadline = time.monotonic() + 60
@@ -4501,6 +4478,42 @@ def wait_for_query_workers(config: dict, run_dir: Path, attempt_id: str, *,
                         continue  # registration raced cancellation; supervise its exit
                     finish(wid, state, "Worker cancelled before startup" if stopping else
                            "Worker tab did not register within 60s", stopped=stopping)
+            if not stopping and pending:
+                auth=read_json(auth_path,{}) or {}
+                generation=auth.get("generation",0)
+                states=[read_json(run_dir/f"worker_{wid:02d}"/"state.json",{}) or {} for wid in pending]
+                if auth.get("state","IDLE")=="IDLE" and any(w.get("auth_required")==generation for w in states):
+                    auth["state"]="RELOGIN_REQUIRED"
+                    write_json(auth_path,auth)
+                stop_check=lambda:stop.exists() or force.exists()
+                if auth.get("state")=="RELOGIN_REQUIRED" and not any(w.get("auth_inflight") for w in states):
+                    auth["state"]="RELOGIN_RUNNING"
+                    write_json(auth_path,auth)
+                    def waiting():
+                        auth["state"]="WAITING_AUTH"
+                        write_json(auth_path,auth)
+                        if on_tick:
+                            on_tick()
+                    try:
+                        recover_session(stop_check,on_wait=waiting)
+                        write_json(auth_path,{"state":"IDLE","generation":generation+1})
+                    except CollectionError as exc:
+                        if exc.kind!="USER_STOP":
+                            raise
+                        stop.touch()
+                elif auth.get("state","IDLE")=="IDLE" and time.monotonic()>=next_auth_check:
+                    next_auth_check=time.monotonic()+5
+                    if jwt_exp(credential_values()[1])<=time.time()+60:
+                        try:
+                            ensure_shared_auth(config["code"],stop_check,allow_login=False)
+                        except CollectionError as exc:
+                            if is_session_error(exc):
+                                write_json(auth_path,{"state":"RELOGIN_REQUIRED","generation":generation})
+                            elif exc.kind=="USER_STOP":
+                                stop.touch()
+                            else:
+                                auth_event("ERROR",last_error=exc.kind)
+                                next_auth_check=time.monotonic()+15
             if on_tick:
                 on_tick()
             if pending:
@@ -4555,6 +4568,8 @@ def selected_monitor(config: dict, run_dir: Path, attempt_id: str | None = None)
 
 
 def selected_launch(config: dict, run_dir: Path, config_path: Path) -> int:
+    from oic_all_dim import ensure_shared_auth
+    ensure_shared_auth(config["code"],lambda:(run_dir/"stop.flag").exists())
     attempt_id = uuid.uuid4().hex
     commands, titles = prepare_worker_tabs(config, run_dir, config_path, attempt_id)
     monitor = [str(Path(sys.executable).resolve()), str(Path(__file__).resolve()),
@@ -4610,6 +4625,9 @@ def render_batch_monitor(manifest: dict, config: dict, workers: list, totals: di
     if not entry and entries:
         entry = next((e for e in reversed(entries) if e.get("started_at")), {})
     status = manifest.get("status", "STARTING")
+    from oic_all_dim import auth_status
+    if status=="RUNNING" and auth_status().get("state") in ("WAITING_AUTH","RELOGIN_RUNNING","REFRESHING"):
+        status=auth_status()["state"]
     colors = dict(COMPLETED="green", RUNNING="bright_cyan", RETRYING="yellow",
                   PAUSED="yellow", STALE="yellow", FAILED="red", PARTIAL="yellow",
                   SESSION_EXPIRED="red", STOPPED="yellow", STOPPING="yellow",
@@ -4780,6 +4798,13 @@ def run_batch(batch_dir: Path) -> int:
                 continue
             if stop.exists() or force.exists():
                 break
+            from oic_all_dim import ensure_shared_auth,CollectionError
+            try:
+                ensure_shared_auth(config["code"],lambda:stop.exists() or force.exists())
+            except CollectionError as exc:
+                if exc.kind=="USER_STOP":
+                    break
+                raise
             (qdir / "stop.flag").unlink(missing_ok=True)
             entry.update(status="RUNNING", error="", started_at=utc_now())
             _batch_snapshot(batch_dir, status="RUNNING", current=qid, entries=entries)

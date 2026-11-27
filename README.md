@@ -227,3 +227,25 @@ Existing per-request Excel files from older versions are not deleted.
 No new job plan, member refresh or HTTP request is needed for this export.
 The original oic_parallel.py script is available in Git history at 6c17a7e;
 the current CLI delegates to oic_all_dim.py instead of maintaining a second engine.
+
+
+## Phase 1 — shared automatic authentication
+
+Install dependencies using `python -m pip install -r requirements.txt` and configure
+`USER` and `PASSWORD` in the local ignored .env (never commit credentials).
+Chrome must be installed. START_OIC_AUTH.bat remains a manual launcher; use
+AUTO AUTH in the collector instead of launching the batch while workers run.
+
+The collector uses the existing GenToken endpoint before JWT expiry (60-second
+margin), with a shared process lock and atomic .env updates. A confirmed expired
+session pauses new requests and lets active HTTP requests drain. The supervisor
+runs the existing oic_auth.py once and resumes from existing checkpoints.
+If login fails, WAITING_AUTH allows manual AUTO AUTH retry or STOP. Network
+errors and permission errors are not reasons to repeatedly log in.
+The UI reads shared credentials during collection; authentication status contains
+timestamps and counters, not secrets. STOP/Ctrl+C retain the existing final Excel
+export behavior. JOB PLAN remains offline.
+
+Phase 1 does not change worker defaults, request size, scopes, plan IDs, raw XML,
+or the clean Thai collection Excel. Phase 2 designer/catalog export is excluded.
+Authentication needs verification against the actual OIC session and Windows Chrome.

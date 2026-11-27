@@ -20,7 +20,7 @@ Authentication (.env):
     OIC_BEARER_TOKEN=...
 
 Install:
-    pip install requests rich
+    pip install curl_cffi rich
 
 Commands:
     python oic_verify_fields.py
@@ -72,11 +72,12 @@ from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
 try:
-    import requests
+    from curl_cffi import requests
+    from curl_cffi.requests.exceptions import RequestException
 except ImportError:
     print(
-        "Missing dependency: requests\n"
-        "Install: python -m pip install requests"
+        "Missing dependency: curl_cffi\n"
+        "Install: python -m pip install curl_cffi"
     )
     raise SystemExit(1)
 
@@ -1387,7 +1388,7 @@ class OICClient:
             )
 
         self.token = token
-        self.cookie="; ".join(f"{c.name}={c.value}" for c in self.session.cookies)
+        self.cookie="; ".join(f"{c.name}={c.value}" for c in self.session.cookies.jar)
 
         log(
             f"{code}: JWT refreshed successfully",
@@ -1436,7 +1437,7 @@ class OICClient:
                     allow_redirects=False,
                 )
 
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 last_error = exc
 
                 if attempt < 2:
@@ -1629,7 +1630,7 @@ class OICClient:
                             if token not in auth[method]:
                                 auth[method].append(token)
 
-                except requests.RequestException:
+                except RequestException:
                     continue
 
         self.webform_auth[code] = auth
@@ -2329,7 +2330,7 @@ def verify_one_field(
         field["error"] = None
 
     except (
-        requests.RequestException,
+        RequestException,
         ValueError,
         ET.ParseError,
     ) as exc:

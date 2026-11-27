@@ -163,6 +163,25 @@ class OICDatabase:
                               (pid, fingerprint, time.time()))
             return dict(self.conn.execute("SELECT * FROM oic_preparations WHERE id=?", (pid,)).fetchone())
 
+    def clone_inventory(self, source, fingerprint):
+        """Copy only catalog/member inventory, leaving original extraction intact."""
+        prep=uuid.uuid4().hex
+        with self.transaction():
+            self.conn.execute("INSERT INTO oic_preparations(id,catalog_hash,status,created_at) VALUES(?,?,'PREPARING',?)",
+                              (prep,fingerprint,time.time()))
+            for table,columns in (
+                ("oic_cubes","cube,profile_json"),
+                ("oic_fields","cube,field_id,field_json"),
+                ("oic_dimensions","cube,hierarchy,status,metadata_json"),
+                ("oic_levels","cube,hierarchy,level,metadata_json"),
+                ("oic_members","cube,hierarchy,unique_name,caption,parent,level,metadata_json"),
+                ("oic_measures","cube,measure,metadata_json"),
+                ("oic_profiles","cube,profile,metadata_json"),
+            ):
+                where=" AND profile LIKE 'DISCOVERY_METADATA:%'" if table=="oic_profiles" else ""
+                self.conn.execute(f"INSERT INTO {table}(prep,{columns}) SELECT ?,{columns} FROM {table} WHERE prep=?"+where,(prep,source))
+            return dict(self.conn.execute("SELECT * FROM oic_preparations WHERE id=?",(prep,)).fetchone())
+
     def latest_preparation(self):
         row = self.conn.execute("SELECT * FROM oic_preparations ORDER BY created_at DESC LIMIT 1").fetchone()
         return dict(row) if row else None
@@ -385,11 +404,25 @@ class OICDatabase:
             run=self.run(rid)
             if not run or run["stop"] or not run["barrier"]:
                 return None
-            if not self.conn.execute("SELECT 1 FROM oic_workers WHERE run=? AND owner=? AND status='READY'",(rid,owner)).fetchone():
+            worker=self.conn.execute("SELECT worker FROM oic_workers WHERE run=? AND owner=? AND status='READY'",(rid,owner)).fetchone()
+            if not worker:
                 return None
-            row=self.conn.execute("""SELECT * FROM oic_requests WHERE prep=? AND
-                status IN ('PENDING','RETRY') AND available_at<=? ORDER BY available_at,id LIMIT 1""",
-                (run["prep"],time.time())).fetchone()
+            # Select the earliest unfinished assigned job, even if its retry is cooling down.
+            job=self.conn.execute("""SELECT j.id FROM oic_jobs j
+                WHERE j.prep=? AND json_extract(j.scope_json,'$.worker_id')=?
+                AND EXISTS (SELECT 1 FROM oic_requests r WHERE r.prep=j.prep AND r.job=j.id
+                    AND r.status IN ('PENDING','RETRY','RUNNING'))
+                ORDER BY json_extract(j.scope_json,'$.job_index') LIMIT 1""",
+                (run["prep"],worker[0])).fetchone()
+            if not job:
+                return None
+            row=self.conn.execute("""SELECT * FROM oic_requests WHERE prep=? AND job=?
+                AND status IN ('PENDING','RETRY','RUNNING')
+                ORDER BY json_extract(scope_json,'$.year_offset'),
+                         json_extract(scope_json,'$.member_offset'),id LIMIT 1""",
+                (run["prep"],job[0])).fetchone()
+            if row and (row["status"]=="RUNNING" or row["available_at"]>time.time()):
+                return None
             if not row:
                 return None
             lease=uuid.uuid4().hex
@@ -460,6 +493,8 @@ class OICDatabase:
         with self.transaction():
             self._fence(r)
             if children:
+                if len(children)!=2 or sum(c["potential_cells"] for c in children)!=r["potential_cells"]:
+                    return False
                 self.conn.executemany("""INSERT OR IGNORE INTO oic_requests
                     (id,prep,job,cube,parent,scope_json,mdx,payload,payload_hash,timeout,potential_cells,status)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?, 'STANDBY')""",
@@ -499,6 +534,11 @@ class OICDatabase:
     def pressure(self,rid,seconds):
         self.conn.execute("UPDATE oic_runs SET cooldown=max(cooldown,?),allowed=max(1,allowed-1) WHERE id=?",
                           (time.time()+seconds,rid))
+
+    def export_result(self,rid,path=None,error=None):
+        self.conn.execute("""UPDATE oic_requests SET metrics_json=json_set(coalesce(metrics_json,'{}'),
+            '$.excel_path',?,'$.excel_error',?,'$.excel_status',?) WHERE id=? AND status IN ('COMMITTED','EMPTY')""",
+            (str(path) if path else None,error,"SAVED" if path and not error else "FAILED",rid))
 
     def reprepare_request(self, parent, children):
         with self.transaction():

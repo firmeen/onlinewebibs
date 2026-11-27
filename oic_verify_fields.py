@@ -1318,7 +1318,7 @@ class OICClient:
     def refresh_token(self, code: str) -> None:
         if getattr(self,"shared_auth",False):
             from oic_all_dim import ensure_shared_auth
-            cookie,token=ensure_shared_auth(code,getattr(self,"auth_stop",lambda:False),validate=True,allow_login=False)
+            cookie,token=ensure_shared_auth(code,getattr(self,"auth_stop",lambda:False),validate=True,allow_login=False,rejected_token=self.token)
             if cookie!=self.cookie:
                 self.session.cookies.clear()
                 self.webform_auth.clear()

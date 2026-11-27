@@ -191,7 +191,7 @@ class PrepareMonitor:
             # Logging handler acquires the monitor lock only after it is released.
             # File logging remains independent of the live renderer.
             log(message)
-        if self.on_progress is not None and event in ("phase","cube","plan_job","summary"):
+        if self.on_progress is not None and event in ("phase","cube","plan_job","summary","inventory_snapshot","inventory"):
             if event=="phase" and "cube" not in data:
                 data=dict(data,cube=self.context_cube())
             self.on_progress(event,**data)
@@ -1428,6 +1428,19 @@ def execute_discovery_request(collector_client,profile,payload,timeout,observe,r
         except requests.RequestException:
             raise CollectionError("NETWORK_ERROR","XMLA requests transport failure",endpoint="XMLA") from None
     raise CollectionError("ACCESS_DENIED","Authentication retry exhausted",endpoint="XMLA")
+
+
+def load_member_inventory_summary(catalogs):
+    """Read the matching saved snapshot without opening a writable DB."""
+    from oic_all_dim_prepare import inventory_summary
+    if not DB_PATH.is_file():
+        return inventory_summary(None,catalogs)
+    conn=sqlite3.connect(DB_PATH.resolve().as_uri()+"?mode=ro",uri=True,timeout=2)
+    try:
+        conn.execute("BEGIN")
+        return inventory_summary(conn,catalogs)
+    finally:
+        conn.close()
 
 
 def prepare_from_collector(catalogs,collector_client,on_progress,stop_event):

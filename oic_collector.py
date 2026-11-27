@@ -2630,8 +2630,10 @@ def launch_terminal_ui(args, return_app: bool = False):
         #applied_actions { height: 3; }
         #applied_actions Button { min-width: 12; margin-right: 1; }
         #selected_query_summary { height: 2; padding: 0 1; color: #9fb0ba; }
-        #catalog_status { height: auto; min-height: 3; margin-top: 1; padding: 0 2;
+        #inventory_row { height: auto; margin-top: 1; }
+        #catalog_status, #member_status { width: 1fr; height: auto; min-height: 3; padding: 0 2;
                            border: solid #293c49; color: #9fb0ba; }
+        #member_status { margin-left: 1; }
         #activity_panel { height: 1fr; min-height: 8; }
         #designer_area { height: 1fr; min-height: 12; }
         #field_panel { width: 1fr; padding: 0 1; }
@@ -2654,6 +2656,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.config = {}
             self.selected_code = "MV"
             self.catalog_snapshot = {}
+            self.member_inventory = {"prep": None, "cubes": {}}
             self.prepare_running = False
             self.field_catalog = {}
             self.selected_field = None
@@ -2915,7 +2918,9 @@ def launch_terminal_ui(args, return_app: bool = False):
                         yield Button("MOVE DOWN", id="move_applied_down")
                     yield Static("No applied queries. Open Query Designer.",
                                  id="selected_query_summary")
-                yield Static("FIELD CATALOG / Local caches", id="catalog_status")
+                with Horizontal(id="inventory_row"):
+                    yield Static("FIELD CATALOG / Local caches", id="catalog_status")
+                    yield Static("MEMBER INVENTORY / NOT PREPARED", id="member_status")
 
                 # PROGRESS
 
@@ -3001,6 +3006,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             self.catalog_snapshot = load_all_catalogs()
             self.field_catalog = self.catalog_snapshot["MV/FY"][1]
             self.update_catalog_summary()
+            self.reload_member_summary()
 
             # Load local configuration without making
             # any network requests.
@@ -4779,7 +4785,17 @@ def launch_terminal_ui(args, return_app: bool = False):
                     self.call_from_thread(self.prepare_finished, result, error, failed)
 
         def prepare_progress(self, event, data) -> None:
-            if event == "log":
+            if event == "inventory_snapshot":
+                self.member_inventory = data["snapshot"]
+                self.update_member_summary()
+            elif event == "inventory":
+                if data["prep"] != self.member_inventory.get("prep"):
+                    return
+                cube = self.member_inventory["cubes"].get(data["cube"])
+                if cube is not None:
+                    cube["hierarchies"][data["hierarchy"]] = data["checkpoint"]
+                    self.update_member_summary()
+            elif event == "log":
                 self.info(data["message"])
             elif event == "phase":
                 self.query_one("#status", Static).update(
@@ -4813,6 +4829,55 @@ def launch_terminal_ui(args, return_app: bool = False):
                 self.cookie_state = "NOT CHECKED"
                 self.cookie_message = "Check Session before retrying"
                 self.refresh_auth_cards()
+
+        def reload_member_summary(self) -> None:
+            try:
+                from oic_all_dim import load_member_inventory_summary
+                self.member_inventory = load_member_inventory_summary(self.catalog_snapshot)
+            except Exception as exc:
+                self.member_inventory = {"prep": None, "cubes": {}, "error": type(exc).__name__}
+            self.update_member_summary()
+
+        def update_member_summary(self) -> None:
+            snapshot = self.member_inventory
+            panel = self.query_one("#member_status", Static)
+            if snapshot.get("error"):
+                panel.update("MEMBER INVENTORY | SUMMARY UNAVAILABLE\n" + snapshot["error"])
+                return
+            total_saved = total_expected = total_dims = total_done = 0
+            counted = partial = failed = ready = available = 0
+            lines = []
+            for code in QUERY_PROFILES:
+                values = []
+                for kind in CUBE_TYPES:
+                    cube = snapshot["cubes"].get(f"{code}/{kind}", {})
+                    if not cube.get("available"):
+                        values.append(f"{kind}: {'N/A' if cube else '-'}")
+                        continue
+                    available += 1
+                    states = list(cube["hierarchies"].values())
+                    saved = sum(v["saved"] for v in states)
+                    expected = sum(v["expected"] for v in states if v["expected"] is not None)
+                    done = sum(v["status"] in ("COMPLETE", "EMPTY") for v in states)
+                    n = cube["total"]
+                    total_saved += saved
+                    total_expected += expected
+                    total_dims += n
+                    total_done += done
+                    counted += sum(v["expected"] is not None for v in states)
+                    partial += sum(v["status"] == "PARTIAL" for v in states)
+                    failed += sum(v["status"] == "FAILED" or bool(v.get("error")) for v in states)
+                    ready += bool(n and done == n)
+                    values.append(f"{kind}: {saved:,} ({done}/{n})")
+                lines.append(f"{code}  " + "  |  ".join(values))
+            title = "MEMBER INVENTORY | DISCOVERY COVERAGE"
+            if not snapshot.get("prep"):
+                title += " / NOT PREPARED"
+            panel.update(
+                title + "\n"
+                f"SAVED: {total_saved:,} | EXPECTED (COUNTED): {total_expected:,} | COUNTS: {counted:,}/{total_dims:,}\n"
+                f"HIERARCHIES: {total_done:,}/{total_dims:,} | PARTIAL: {partial:,} | FAILED: {failed:,} | READY CUBES: {ready}/{available}\n"
+                + "\n".join(lines))
 
         def update_catalog_summary(self) -> None:
             totals = dict(total=0, verified=0, mapped=0, unverified=0,
@@ -4919,6 +4984,7 @@ def launch_terminal_ui(args, return_app: bool = False):
             for button_id in ("refresh_all_catalogs","prepare_all_dimensions","export_verified_catalog"):
                 self.query_one(f"#{button_id}", Button).disabled = self.busy
             self.update_catalog_summary()
+            self.reload_member_summary()
 
         def catalog_discovery_event(self, code: str, cube_type: str,
                                     catalog: dict | None, error: str | None) -> None:

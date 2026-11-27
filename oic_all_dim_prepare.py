@@ -160,10 +160,13 @@ def discover_rows(transport,profile,kind,restrictions=None,emit=None):
 
 
 def mdx_set(values):
-    # Accept only bracketed unique names returned by the server, not captions.
-    pattern=r"(?:\[(?:[^\]\r\n]|\]\])+\])(?:\.(?:&?\[(?:[^\]\r\n]|\]\])+\])(?:&\[(?:[^\]\r\n]|\]\])+\])*)*"
-    if not values or any(not re.fullmatch(pattern,v) for v in values):
-        raise ValueError("Invalid or empty MDX unique-name set")
+    # Allow empty *key* components (&[]) and escaped closing brackets,
+    # not empty identifiers or arbitrary MDX expressions.
+    identifier=r"\[(?:[^\]\x00-\x1f]|\]\])+\]"
+    key=r"&\[(?:[^\]\x00-\x1f]|\]\])*\]"
+    pattern=identifier+r"(?:\.(?:"+identifier+r"|"+key+r"(?:"+key+r")*))*"
+    if not values or any(not isinstance(v,str) or not re.fullmatch(pattern,v) for v in values):
+        raise ValueError("INVALID_MEMBER_UNIQUE_NAME: invalid bracketed identifier/key")
     return "{" + ",".join(values) + "}"
 
 
@@ -190,7 +193,7 @@ def build_soap(profile,mdx):
 def normalize_member(row):
     name=row.get("MEMBER_UNIQUE_NAME")
     if not name:
-        raise ValueError("Member without unique name")
+        raise ValueError("MISSING_MEMBER_UNIQUE_NAME")
     mdx_set([name])
     return {"unique_name":name,"caption":row.get("MEMBER_CAPTION") or row.get("MEMBER_NAME"),
             "parent":row.get("PARENT_UNIQUE_NAME") or None,
@@ -208,8 +211,11 @@ def deduplicate_members(rows, hierarchy):
     for row in rows:
         actual=row.get("HIERARCHY_UNIQUE_NAME")
         if not actual or actual.casefold()!=hierarchy.casefold():
-            raise ValueError("Member restriction not honored by server")
+            raise ValueError("Member restriction not honored by server: missing or mismatched hierarchy")
         member=normalize_member(row)
+        previous=result.get(member["unique_name"])
+        if previous is not None and (previous["parent"],previous["level"])!=(member["parent"],member["level"]):
+            raise ValueError("CONFLICTING_MEMBER_METADATA: duplicate unique name")
         result[member["unique_name"]]=member
     return sorted(result.values(),key=lambda m:m["unique_name"])
 
@@ -296,24 +302,28 @@ def exact_member_count(transport,profile,hierarchy,emit=None):
 def read_member_page(transport,profile,hierarchy,offset,size,emit=None):
     cube=profile["cube"].replace("]","]]")
     mdx=(f"SELECT Subset({hierarchy}.AllMembers,{offset},{size}) "
-         f"DIMENSION PROPERTIES MEMBER_TYPE,PARENT_UNIQUE_NAME,CHILDREN_CARDINALITY ON COLUMNS FROM [{cube}]")
+         f"DIMENSION PROPERTIES MEMBER_TYPE,PARENT_UNIQUE_NAME,CHILDREN_CARDINALITY,HIERARCHY_UNIQUE_NAME ON COLUMNS FROM [{cube}]")
     root=checked_root(transport(profile,build_soap(profile,mdx),90))
     axis=root.find(f".//{{{MD_NS}}}Axis[@name='Axis0']")
     if axis is None:
         raise ValueError("Missing member enumeration axis")
     page=axis.findall(f"./{{{MD_NS}}}Tuples/{{{MD_NS}}}Tuple")
     if len(page)!=size:
-        raise ValueError("Truncated member enumeration")
+        raise ValueError(f"Truncated member enumeration: requested={size}, returned={len(page)}")
     result=[]
     for item in page:
         nodes=item.findall(f"{{{MD_NS}}}Member")
         if len(nodes)!=1:
             raise ValueError("Unexpected member tuple")
         node=nodes[0]
-        actual=node.get("Hierarchy")
-        if actual and actual.casefold()!=hierarchy.casefold():
-            raise ValueError("Unexpected member hierarchy")
         props={local(e.tag):e.text for e in node}
+        actual=props.get("HIERARCHY_UNIQUE_NAME") or node.get("Hierarchy")
+        if actual and actual.casefold()!=hierarchy.casefold():
+            raise ValueError("Unexpected member hierarchy: mismatched XMLA identity")
+        if not actual:
+            name=props.get("UName") or ""
+            if not (name.casefold()==hierarchy.casefold() or name.casefold().startswith(hierarchy.casefold()+".")):
+                raise ValueError("Unexpected member hierarchy: cannot establish XMLA identity")
         row={"MEMBER_UNIQUE_NAME":props.get("UName"),"MEMBER_CAPTION":props.get("Caption"),
              "LEVEL_UNIQUE_NAME":props.get("LName"),"LEVEL_NUMBER":props.get("LNum"),
              "PARENT_UNIQUE_NAME":props.get("PARENT_UNIQUE_NAME"),"MEMBER_TYPE":props.get("MEMBER_TYPE"),
@@ -324,10 +334,54 @@ def read_member_page(transport,profile,hierarchy,offset,size,emit=None):
     return result
 
 
+def inventory_checkpoint(conn,prep,cube,hierarchy):
+    row=conn.execute("SELECT status,metadata_json FROM oic_dimensions WHERE prep=? AND cube=? AND hierarchy=?",
+                     (prep,cube,hierarchy)).fetchone()
+    if row is None:
+        return {"status":"PENDING","saved":0,"expected":None,"error":None}
+    status,raw=row
+    state=json.loads(raw)
+    saved=state.get("next_offset",state.get("discovered_cardinality"))
+    if saved is None:
+        saved=conn.execute("SELECT count(*) FROM oic_members WHERE prep=? AND cube=? AND hierarchy=?",
+                           (prep,cube,hierarchy)).fetchone()[0]
+    expected=state.get("expected_count")
+    if expected is None and status in ("COMPLETE","EMPTY"):
+        expected=saved
+    return {"status":status,"saved":saved,"expected":expected,"error":state.get("error")}
+
+
+def inventory_summary(conn,catalogs,prep=None):
+    """Checkpoint-only snapshot; no materialization of the member table."""
+    fingerprint=digest([PLANNER_VERSION,catalogs])
+    if prep is None and conn is not None:
+        row=conn.execute("SELECT id,status FROM oic_preparations WHERE catalog_hash=? ORDER BY created_at DESC LIMIT 1",
+                         (fingerprint,)).fetchone()
+        if row and row[1] in ("READY","PREPARING"):
+            prep=row[0]
+    cubes={}
+    eligible={}
+    for cube,(profile,catalog,fields) in catalogs.items():
+        dims,_=classify_fields(fields)
+        available=profile["availability"]=="AVAILABLE" and catalog.get("source")!="PROFILE"
+        eligible[cube]=set(dims) if available else set()
+        cubes[cube]={"available":available,"total":len(eligible[cube]),"hierarchies":{}}
+    if conn is not None and prep:
+        for cube,hierarchy in conn.execute("SELECT cube,hierarchy FROM oic_dimensions WHERE prep=?",(prep,)):
+            if hierarchy in eligible.get(cube,()):
+                cubes[cube]["hierarchies"][hierarchy]=inventory_checkpoint(conn,prep,cube,hierarchy)
+    return {"prep":prep,"cubes":cubes}
+
+
+def emit_inventory(db,prep,cube,hierarchy,emit):
+    emit_event(emit,"inventory",prep=prep,cube=cube,hierarchy=hierarchy,
+               checkpoint=inventory_checkpoint(db.conn,prep,cube,hierarchy))
+
+
 def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=None):
     state=db.load_discovery_checkpoint(prep,cube,hierarchy)
     offset=state.get("next_offset",0)
-    size=max(MIN_DISCOVERY_PAGE,min(MAX_DISCOVERY_PAGE,state.get("page_size",DISCOVERY_PAGE)))
+    size=max(1,min(MAX_DISCOVERY_PAGE,state.get("page_size",DISCOVERY_PAGE)))
     last=state.get("last_member")
     # Resume validates the cached boundary against the live member ordering.
     # This is best effort: the provider does not expose a guaranteed immutable snapshot.
@@ -336,6 +390,7 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
         boundary=read_member_page(transport,profile,hierarchy,offset-1,1,emit)
         if boundary[0]["unique_name"]!=last:
             db.reset_partial_inventory(prep,cube,hierarchy)
+            emit_inventory(db,prep,cube,hierarchy,emit)
             offset,last,size=0,None,DISCOVERY_PAGE
             emit_event(emit,"activity",message=f"{cube} | source order changed; reset only {hierarchy}")
     pages=0
@@ -343,7 +398,7 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
     while offset<count:
         pages+=1
         if pages>MAX_DISCOVERY_PAGES:
-            raise ValueError("Inventory exceeds discovery safety budget")
+            raise ValueError(f"Discovery page safety budget reached; resume retained at {offset:,}/{count:,}")
         take=min(size,count-offset)
         overlap=1 if offset else 0
         emit_event(emit,"phase",phase="MEMBER_DISCOVERY",detail=f"MDX page | {hierarchy} | offset {offset:,} | size {take}")
@@ -356,11 +411,15 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
             page=page[overlap:]
         except (RuntimeError,ValueError) as exc:
             raise_if_fatal(exc)
-            if "ordering changed" in str(exc) or size<=MIN_DISCOVERY_PAGE:
+            reason=str(exc)[:240]
+            emit_event(emit,"activity",message=f"{cube} | MDX PAGE FAILED | offset {offset:,} | requested {take+overlap} | {reason}")
+            # Only scope/length failures can benefit from smaller requests.
+            shrink=getattr(exc,"kind","") in ("QUERY_SCOPE_ERROR","DISCOVERY_SCOPE_UNCONFIRMED","RESPONSE_TOO_LARGE","RESPONSE_TIMEOUT") or reason.startswith("Truncated member enumeration")
+            if not shrink or take<=1:
                 raise
-            size=max(MIN_DISCOVERY_PAGE,size//2)
+            size=max(1,take//2)
             previous_rate=None
-            emit_event(emit,"discovery",message=f"Page reduced to {size} | unchanged offset {offset:,} | {type(exc).__name__}")
+            emit_event(emit,"discovery",message=f"Page reduced {take} -> {size} | unchanged offset {offset:,} | {reason}")
             continue
         elapsed=max(.001,time.monotonic()-start)
         rate=len(page)/elapsed
@@ -368,8 +427,9 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
         if elapsed<25 and (previous_rate is None or rate>=previous_rate*.9):
             next_size=min(MAX_DISCOVERY_PAGE,math.ceil(size*1.5))
         elif previous_rate is not None and rate<previous_rate*.7:
-            next_size=max(MIN_DISCOVERY_PAGE,size//2)
+            next_size=max(1,size//2)
         db.append_member_page(prep,cube,hierarchy,offset,page,next_size)
+        emit_inventory(db,prep,cube,hierarchy,emit)
         offset+=len(page)
         last=page[-1]["unique_name"]
         size=next_size
@@ -377,8 +437,10 @@ def discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit=Non
         emit_event(emit,"discovery",message=f"CHECKPOINT | {hierarchy} | {offset:,}/{count:,} committed | next size {size}")
     if offset and exact_member_count(transport,profile,hierarchy,emit)!=count:
         db.reset_partial_inventory(prep,cube,hierarchy)
+        emit_inventory(db,prep,cube,hierarchy,emit)
         raise ValueError("Member cardinality changed during discovery")
     db.finalize_inventory(prep,cube,hierarchy,count)
+    emit_inventory(db,prep,cube,hierarchy,emit)
     return db.inventory(prep,cube,hierarchy)
 
 
@@ -397,6 +459,7 @@ def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata
         raise ValueError("Exact cardinality not available")
     if count==0:
         db.finalize_inventory(prep,cube,hierarchy,0)
+        emit_inventory(db,prep,cube,hierarchy,emit)
         return []
     strategy=select_discovery_strategy(count,levels)
     capability=db.load_profile(prep,cube,"DISCOVERY_METADATA:MEMBER_CAPABILITY") or {}
@@ -419,7 +482,7 @@ def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata
                     rows.extend(part)
             members=deduplicate_members(rows,hierarchy)
             if len(members)!=count:
-                raise ValueError("Restricted member count mismatch")
+                raise ValueError(f"Restricted member count mismatch: expected={count:,}, unique={len(members):,}, rows={len(rows):,}")
             names={m["unique_name"] for m in members}
             for m in members:
                 m["parent_present"]=m["parent"] in names if m["parent"] else None
@@ -430,6 +493,7 @@ def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata
                 {"metadata":metadata,"reported_cardinality":integer(metadata.get("HIERARCHY_CARDINALITY")),
                  "discovered_cardinality":count,"expected_count":count,"next_offset":count,
                  "source":"XMLA_COUNT_VALIDATED","method":strategy},levels,members)
+            emit_inventory(db,prep,cube,hierarchy,emit)
             emit_event(emit,"discovery",message=f"CHECKPOINT | {hierarchy} | {count:,}/{count:,} committed")
             return members
         except (RuntimeError,ValueError) as exc:
@@ -442,7 +506,7 @@ def discover_dimension_members(db,prep,cube,transport,profile,hierarchy,metadata
                                 {"failures":failures,"prefer_mdx":prefer,"reason":kind or "RESTRICTION_NOT_HONORED"})
                 if prefer:
                     emit_event(emit,"activity",message=f"{cube} | restricted Discover unreliable; prefer paged MDX")
-            emit_event(emit,"activity",message=f"{hierarchy} | {strategy} failed; fallback to paged MDX")
+            emit_event(emit,"activity",message=f"{hierarchy} | {strategy} failed | {str(exc)[:240]} | fallback to paged MDX")
     return discover_members_mdx(db,prep,cube,transport,profile,hierarchy,count,emit)
 
 
@@ -694,6 +758,7 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
         prep=current["id"]
         log("Source update marker changed; preparing a new snapshot")
     elif current["status"]=="READY":
+        emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
         emit_event(emit,"phase",phase="REUSING",detail="Reusing prepared inventory and recovering failed requests")
         reprepare_failed_requests(db,prep,log)
         log("Existing READY inventory reused; failed scopes reprepared when possible")
@@ -704,6 +769,7 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
         emit_event(emit,"summary",summary=summary)
         return not db.conn.execute("SELECT 1 FROM oic_requests WHERE prep=? AND status='NEEDS_REPREPARE' LIMIT 1",(prep,)).fetchone()
     db.recover_preparation(prep)
+    emit_event(emit,"inventory_snapshot",snapshot=inventory_summary(db.conn,catalogs,prep))
     errors=[]
     jobs=[]
     total_members=0
@@ -777,7 +843,21 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
         # Revalidate counts for partial pages on resume, rather than trusting a stale count.
         for counts in discover_member_counts(transport,profile,pending,emit):
             for h,count in counts.items():
-                db.save_cardinality(prep,cube,h,hierarchy_meta.get(h.casefold(),{}),levels_by_h.get(h.casefold(),[]),count)
+                meta=hierarchy_meta.get(h.casefold(),{})
+                if count is not None and count>MAX_DISCOVERY_PAGES*MAX_DISCOVERY_PAGE:
+                    reported=integer(meta.get("HIERARCHY_CARDINALITY"))
+                    try:
+                        confirmed=exact_member_count(transport,profile,h,emit)
+                    except (RuntimeError,ValueError) as exc:
+                        raise_if_fatal(exc)
+                        confirmed=None
+                        log(f"{cube} | {h} | individual cardinality failed: {str(exc)[:200]}")
+                    log(f"{cube} | LARGE CARDINALITY | {h} | batch={count:,} | individual={confirmed} | metadata={reported} | page budget may require resume")
+                    if confirmed!=count:
+                        counts[h]=count=None
+                        log(f"{cube} | {h} | unconfirmed cardinality; retaining previous checkpoint")
+                db.save_cardinality(prep,cube,h,meta,levels_by_h.get(h.casefold(),[]),count)
+                emit_inventory(db,prep,cube,h,emit)
             for h,count in counts.items():
                 emit_event(emit,"phase",phase="MEMBER_DISCOVERY",detail=f"Hierarchy | {h}")
                 try:
@@ -788,9 +868,10 @@ def prepare_all(db,transport,probe,output,log,emit=None,catalogs=None):
                     if getattr(exc,"kind","")=="USER_STOP":
                         raise
                     db.mark_discovery_failure(prep,cube,h,str(exc)[:300])
+                    emit_inventory(db,prep,cube,h,emit)
                     raise_if_fatal(exc)
                     errors.append(f"{cube} {h}: {str(exc)[:200]}")
-                    emit_event(emit,"activity",message=f"{cube} | hierarchy incomplete | {h} | {type(exc).__name__}")
+                    emit_event(emit,"activity",message=f"{cube} | hierarchy incomplete | {h} | {str(exc)[:240]}")
                     continue
                 inventory[h]=members
                 total_members+=len(members)

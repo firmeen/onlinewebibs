@@ -24,7 +24,7 @@ Authentication:
         OIC_BEARER_TOKEN=...
 
 Installation:
-    pip install requests rich
+    pip install curl_cffi rich
 
 Usage:
     python oic_verify_unsupported.py
@@ -87,10 +87,11 @@ from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
 try:
-    import requests
+    from curl_cffi import requests
+    from curl_cffi.requests.exceptions import RequestException
 except ImportError:
-    print("Missing dependency: requests")
-    print("Install: python -m pip install requests rich")
+    print("Missing dependency: curl_cffi")
+    print("Install: python -m pip install curl_cffi rich")
     raise SystemExit(1)
 
 try:
@@ -1576,7 +1577,7 @@ class OICClient:
 
         values.extend(
             cookie.value
-            for cookie in self.session.cookies
+            for cookie in self.session.cookies.jar
         )
 
         for authorization in self.webform_auth.values():
@@ -1712,7 +1713,7 @@ class OICClient:
                     allow_redirects=False,
                 )
 
-            except requests.RequestException:
+            except RequestException:
                 if attempt == 2:
                     raise
 
@@ -1924,7 +1925,7 @@ class OICClient:
                         if value not in auth[method]:
                             auth[method].append(value)
 
-            except requests.RequestException:
+            except RequestException:
                 continue
 
         self.webform_auth[code] = auth
@@ -3419,7 +3420,7 @@ def execute_native_measure(
 
         except (
             XMLAError,
-            requests.RequestException,
+            RequestException,
         ) as exc:
             attempts.append({
                 "mdx": statement,
@@ -3503,7 +3504,7 @@ def execute_calculated_measure(
 
         except (
             XMLAError,
-            requests.RequestException,
+            RequestException,
         ) as exc:
             attempts.append({
                 "mdx": statement,
